@@ -28,7 +28,7 @@ import { Identity } from "../components/Identity";
 import { timeAgo } from "../lib/timeAgo";
 import { cn, formatCents } from "../lib/utils";
 import { SHOW_TASK_PRIORITY_UI } from "../lib/ui-flags";
-import { Bot, CircleDot, DollarSign, ShieldCheck, LayoutDashboard, PauseCircle } from "lucide-react";
+import { AlertTriangle, ArrowRight, Bot, CircleDot, DollarSign, ShieldCheck, LayoutDashboard, PauseCircle } from "lucide-react";
 import { ActiveAgentsPanel } from "../components/ActiveAgentsPanel";
 import { ChartCard, RunActivityChart, PriorityChart, IssueStatusChart, SuccessRateChart } from "../components/ActivityCharts";
 import { PageSkeleton } from "../components/PageSkeleton";
@@ -206,6 +206,9 @@ export function Dashboard() {
   );
 
   const recentIssues = issues ? getRecentIssues(issues) : [];
+  const attentionIssues = recentIssues
+    .filter((issue) => issue.status === "blocked" || issue.status === "in_review")
+    .slice(0, 4);
   const recentActivity = useMemo(() => (activity ?? []).slice(0, 10), [activity]);
 
   useEffect(() => {
@@ -367,8 +370,6 @@ export function Dashboard() {
         </div>
       )}
 
-      <ActiveAgentsPanel companyId={selectedCompanyId!} />
-
       {data && (
         <>
           {data.budgets.activeIncidents > 0 ? (
@@ -388,6 +389,50 @@ export function Dashboard() {
                 Open budgets
               </Link>
             </div>
+          ) : null}
+
+          {(attentionIssues.length > 0 || data.pendingApprovals + data.budgets.pendingApprovals > 0) ? (
+            <section aria-labelledby="dashboard-attention-heading">
+              <div className="mb-3 flex items-center justify-between gap-3">
+                <div className="flex items-center gap-2">
+                  <AlertTriangle className="h-4 w-4 text-destructive" aria-hidden />
+                  <h2 id="dashboard-attention-heading" className="text-sm font-semibold uppercase tracking-wide">
+                    Needs attention
+                  </h2>
+                </div>
+                <Link to="/issues" className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground">
+                  View tasks
+                  <ArrowRight className="h-3 w-3" aria-hidden />
+                </Link>
+              </div>
+              <Card className="block overflow-hidden py-0 divide-y divide-border">
+                {attentionIssues.map((issue) => (
+                  <Link
+                    key={issue.id}
+                    to={`/issues/${issue.identifier ?? issue.id}`}
+                    className="flex min-h-11 items-center gap-3 px-4 py-3 text-sm no-underline text-inherit transition-colors hover:bg-accent/50"
+                  >
+                    <StatusIcon status={issue.status} blockerAttention={issue.blockerAttention} />
+                    <span className="min-w-0 flex-1 truncate">{issue.title}</span>
+                    <span className="shrink-0 font-mono text-xs text-muted-foreground">
+                      {issue.identifier ?? issue.id.slice(0, 8)}
+                    </span>
+                  </Link>
+                ))}
+                {data.pendingApprovals + data.budgets.pendingApprovals > 0 ? (
+                  <Link
+                    to="/approvals"
+                    className="flex min-h-11 items-center gap-3 px-4 py-3 text-sm no-underline text-inherit transition-colors hover:bg-accent/50"
+                  >
+                    <ShieldCheck className="h-4 w-4 text-muted-foreground" aria-hidden />
+                    <span className="min-w-0 flex-1">Approvals awaiting board review</span>
+                    <span className="shrink-0 text-xs font-semibold tabular-nums">
+                      {data.pendingApprovals + data.budgets.pendingApprovals}
+                    </span>
+                  </Link>
+                ) : null}
+              </Card>
+            </section>
           ) : null}
 
           <div className="grid grid-cols-2 xl:grid-cols-4 gap-1 sm:gap-2">
@@ -446,24 +491,6 @@ export function Dashboard() {
 
           <SmokeLabDashboardCard companyId={selectedCompanyId!} />
 
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-            <ChartCard title="Run Activity" subtitle="Last 14 days">
-              <RunActivityChart activity={data.runActivity} />
-            </ChartCard>
-            {/* PAP-411: "Tasks by Priority" chart hidden behind SHOW_TASK_PRIORITY_UI. */}
-            {SHOW_TASK_PRIORITY_UI && (
-              <ChartCard title="Tasks by Priority" subtitle="Last 14 days">
-                <PriorityChart issues={issues ?? []} />
-              </ChartCard>
-            )}
-            <ChartCard title="Tasks by Status" subtitle="Last 14 days">
-              <IssueStatusChart issues={issues ?? []} />
-            </ChartCard>
-            <ChartCard title="Success Rate" subtitle="Last 14 days">
-              <SuccessRateChart activity={data.runActivity} />
-            </ChartCard>
-          </div>
-
           <PluginSlotOutlet
             slotTypes={["dashboardWidget"]}
             context={{ companyId: selectedCompanyId }}
@@ -473,28 +500,6 @@ export function Dashboard() {
           />
 
           <div className="grid md:grid-cols-2 gap-4">
-            {/* Recent Activity */}
-            {recentActivity.length > 0 && (
-              <div className="min-w-0">
-                <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide mb-3">
-                  Recent Activity
-                </h3>
-                <Card className="block py-0 divide-y divide-border overflow-hidden">
-                  {recentActivity.map((event) => (
-                    <ActivityRow
-                      key={event.id}
-                      event={event}
-                      agentMap={agentMap}
-                      userProfileMap={userProfileMap}
-                      entityNameMap={entityNameMap}
-                      entityTitleMap={entityTitleMap}
-                      className={animatedActivityIds.has(event.id) ? "activity-row-enter" : undefined}
-                    />
-                  ))}
-                </Card>
-              </div>
-            )}
-
             {/* Recent Tasks */}
             <div className="min-w-0">
               <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide mb-3">
@@ -546,7 +551,54 @@ export function Dashboard() {
                 </Card>
               )}
             </div>
+
+            {/* Recent Activity */}
+            {recentActivity.length > 0 && (
+              <div className="min-w-0">
+                <h3 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide mb-3">
+                  Recent Activity
+                </h3>
+                <Card className="block py-0 divide-y divide-border overflow-hidden">
+                  {recentActivity.map((event) => (
+                    <ActivityRow
+                      key={event.id}
+                      event={event}
+                      agentMap={agentMap}
+                      userProfileMap={userProfileMap}
+                      entityNameMap={entityNameMap}
+                      entityTitleMap={entityTitleMap}
+                      className={animatedActivityIds.has(event.id) ? "activity-row-enter" : undefined}
+                    />
+                  ))}
+                </Card>
+              </div>
+            )}
           </div>
+
+          <ActiveAgentsPanel companyId={selectedCompanyId!} title="Recent agent runs" />
+
+          <section aria-labelledby="dashboard-analytics-heading">
+            <h2 id="dashboard-analytics-heading" className="mb-3 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+              Analytics
+            </h2>
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2 xl:grid-cols-3">
+              <ChartCard title="Run Activity" subtitle="Last 14 days">
+                <RunActivityChart activity={data.runActivity} />
+              </ChartCard>
+              {/* PAP-411: "Tasks by Priority" chart hidden behind SHOW_TASK_PRIORITY_UI. */}
+              {SHOW_TASK_PRIORITY_UI && (
+                <ChartCard title="Tasks by Priority" subtitle="Last 14 days">
+                  <PriorityChart issues={issues ?? []} />
+                </ChartCard>
+              )}
+              <ChartCard title="Tasks by Status" subtitle="Last 14 days">
+                <IssueStatusChart issues={issues ?? []} />
+              </ChartCard>
+              <ChartCard title="Success Rate" subtitle="Last 14 days">
+                <SuccessRateChart activity={data.runActivity} />
+              </ChartCard>
+            </div>
+          </section>
 
         </>
       )}

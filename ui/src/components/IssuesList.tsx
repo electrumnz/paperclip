@@ -1665,11 +1665,11 @@ export function IssuesList({
       ) : null}
 
       {/* Toolbar */}
-      <div className="flex items-center justify-between gap-2 sm:gap-3">
-        <div className="flex min-w-0 items-center gap-2 sm:gap-3">
-          <Button size="sm" variant="outline" onClick={() => openCreateIssueDialog()}>
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
+        <div className="flex w-full min-w-0 items-center gap-2 sm:w-auto sm:gap-3">
+          <Button size="sm" variant="outline" className="h-11 shrink-0 sm:h-8" onClick={() => openCreateIssueDialog()}>
             <Plus className="h-4 w-4 sm:mr-1" />
-            <span className="hidden sm:inline">{createButtonLabel}</span>
+            <span className="sr-only sm:not-sr-only">{createButtonLabel}</span>
           </Button>
           <IssueSearchInput
             value={issueSearch}
@@ -1680,26 +1680,28 @@ export function IssuesList({
           />
         </div>
 
-        <div className="flex items-center gap-0.5 sm:gap-1 shrink-0">
+        <div className="flex w-full items-center justify-between gap-2 sm:w-auto sm:justify-start sm:gap-1 shrink-0">
           {/* View mode toggle */}
-          <div className="flex items-center border border-border rounded-md overflow-hidden mr-1" role="group" aria-label="View mode">
+          <div className="flex items-center border border-border rounded-md overflow-hidden sm:mr-1" role="group" aria-label="View mode">
             <button
-              className={`flex h-8 w-8 items-center justify-center transition-colors ${viewState.viewMode === "list" ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+              className={`flex h-11 items-center justify-center gap-1.5 px-3 text-xs font-medium transition-colors sm:h-8 sm:w-8 sm:px-0 ${viewState.viewMode === "list" ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
               onClick={() => updateView({ viewMode: "list" })}
               title="List view"
               aria-label="List view"
               aria-pressed={viewState.viewMode === "list"}
             >
               <List className="h-3.5 w-3.5" />
+              <span className="sm:hidden">List</span>
             </button>
             <button
-              className={`flex h-8 w-8 items-center justify-center transition-colors ${viewState.viewMode === "board" ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+              className={`flex h-11 items-center justify-center gap-1.5 px-3 text-xs font-medium transition-colors sm:h-8 sm:w-8 sm:px-0 ${viewState.viewMode === "board" ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
               onClick={() => updateView({ viewMode: "board" })}
               title="Board view"
               aria-label="Board view"
               aria-pressed={viewState.viewMode === "board"}
             >
               <SquareKanban className="h-3.5 w-3.5" />
+              <span className="sm:hidden">Board</span>
             </button>
           </div>
 
@@ -1722,7 +1724,7 @@ export function IssuesList({
                 type="button"
                 variant="outline"
                 size="icon"
-                className={cn("h-8 w-8 shrink-0", boardCompactCards && "bg-accent")}
+                className={cn("hidden h-8 w-8 shrink-0 sm:inline-flex", boardCompactCards && "bg-accent")}
                 onClick={() => updateView({ boardCardDensity: boardCompactCards ? "comfortable" : "compact" })}
                 title={boardCompactCards ? "Use comfortable cards" : "Use compact cards"}
               >
@@ -1732,7 +1734,7 @@ export function IssuesList({
                 type="button"
                 variant="outline"
                 size="icon"
-                className={cn("h-8 w-8 shrink-0", boardCollapsedStatuses.length > 0 && "bg-accent")}
+                className={cn("hidden h-8 w-8 shrink-0 sm:inline-flex", boardCollapsedStatuses.length > 0 && "bg-accent")}
                 onClick={() => updateView({ boardColdLaneMode: boardCollapsedStatuses.length > 0 ? "expanded" : "collapsed" })}
                 title={boardCollapsedStatuses.length > 0 ? "Expand cold lanes" : "Collapse cold lanes"}
               >
@@ -1745,7 +1747,7 @@ export function IssuesList({
                     variant="outline"
                     size="sm"
                     className={cn(
-                      "h-8 shrink-0 gap-1.5 px-2",
+                      "hidden h-8 shrink-0 gap-1.5 px-2 sm:inline-flex",
                       viewState.boardColumnPageSize !== KANBAN_COLUMN_DEFAULT_PAGE_SIZE && "bg-accent",
                     )}
                     title="Cards per column"
@@ -1779,7 +1781,7 @@ export function IssuesList({
                 type="button"
                 variant="outline"
                 size="icon"
-                className="h-8 w-8 shrink-0"
+                className="hidden h-8 w-8 shrink-0 sm:inline-flex"
                 onClick={() => updateView({
                   boardCardDensity: "auto",
                   boardColdLaneMode: "expanded",
@@ -1793,14 +1795,16 @@ export function IssuesList({
             </>
           )}
 
-          <IssueColumnPicker
-            availableColumns={availableIssueColumns}
-            visibleColumnSet={visibleIssueColumnSet}
-            onToggleColumn={toggleIssueColumn}
-            onResetColumns={() => setIssueColumns(DEFAULT_INBOX_ISSUE_COLUMNS)}
-            title="Choose which task columns stay visible"
-            iconOnly
-          />
+          <div className="hidden sm:block">
+            <IssueColumnPicker
+              availableColumns={availableIssueColumns}
+              visibleColumnSet={visibleIssueColumnSet}
+              onToggleColumn={toggleIssueColumn}
+              onResetColumns={() => setIssueColumns(DEFAULT_INBOX_ISSUE_COLUMNS)}
+              title="Choose which task columns stay visible"
+              iconOnly
+            />
+          </div>
 
           <IssueFiltersPopover
             state={viewState}
@@ -1814,7 +1818,8 @@ export function IssuesList({
             currentUserId={currentUserId}
             enableExternalObjectFilters={externalObjectsEnabled}
             enableRoutineVisibilityFilter={enableRoutineVisibilityFilter}
-            iconOnly
+            iconOnly={false}
+            showLabelOnMobile
             workspaces={isolatedWorkspacesEnabled ? workspaceOptions : undefined}
           />
 
@@ -1822,7 +1827,7 @@ export function IssuesList({
           {viewState.viewMode === "list" && (
             <Popover>
               <PopoverTrigger asChild>
-                <Button variant="outline" size="icon" className="h-8 w-8 shrink-0" title="Sort">
+                <Button variant="outline" size="icon" className="hidden h-8 w-8 shrink-0 sm:inline-flex" title="Sort">
                   <ArrowUpDown className="h-3.5 w-3.5" />
                 </Button>
               </PopoverTrigger>
@@ -1869,7 +1874,7 @@ export function IssuesList({
           {viewState.viewMode === "list" && (
             <Popover>
               <PopoverTrigger asChild>
-                <Button variant="outline" size="icon" className="h-8 w-8 shrink-0" title="Group">
+                <Button variant="outline" size="icon" className="hidden h-8 w-8 shrink-0 sm:inline-flex" title="Group">
                   <Layers className="h-3.5 w-3.5" />
                 </Button>
               </PopoverTrigger>

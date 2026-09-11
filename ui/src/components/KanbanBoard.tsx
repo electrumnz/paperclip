@@ -28,6 +28,7 @@ import { collectSubtreeLiveCounts } from "../lib/liveIssueIds";
 import { cn } from "../lib/utils";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { useSidebar } from "../context/SidebarContext";
 
 export const KANBAN_BOARD_HIGH_VOLUME_THRESHOLD = 100;
 export const KANBAN_COLUMN_PAGE_SIZE_OPTIONS = [10, 25, 50] as const;
@@ -170,6 +171,7 @@ function KanbanColumn({
   visibleCount,
   revealIncrement,
   onShowMore,
+  mobileFullWidth = false,
 }: {
   status: IssueStatus;
   issues: Issue[];
@@ -181,6 +183,7 @@ function KanbanColumn({
   visibleCount: number;
   revealIncrement: number;
   onShowMore: () => void;
+  mobileFullWidth?: boolean;
 }) {
   const { setNodeRef, isOver } = useDroppable({ id: status });
 
@@ -213,7 +216,10 @@ function KanbanColumn({
   }
 
   return (
-    <div className="flex flex-col shrink-0 min-w-(--sz-260px) w-(--sz-260px)">
+    <div className={cn(
+      "flex flex-col shrink-0",
+      mobileFullWidth ? "min-w-0 w-full" : "min-w-(--sz-260px) w-(--sz-260px)",
+    )}>
       <div className="flex items-center gap-2 px-3 py-2 mb-1">
         <StatusIcon status={status} />
         <span className={cn("text-xs font-semibold uppercase tracking-wide", tone.header)}>
@@ -392,7 +398,14 @@ export function KanbanBoard({
   revealIncrement = KANBAN_COLUMN_REVEAL_INCREMENT,
   onUpdateIssue,
 }: KanbanBoardProps) {
+  const { isMobile } = useSidebar();
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [mobileStatus, setMobileStatus] = useState<IssueStatus>(() => {
+    const firstPopulated = boardStatuses.find((status) =>
+      issues.some((issue) => issue.status === status),
+    );
+    return firstPopulated ?? "backlog";
+  });
   const paginationKey = `${initialVisibleCount}:${revealIncrement}`;
   const [visibleState, setVisibleState] = useState<{
     paginationKey: string;
@@ -461,7 +474,66 @@ export function KanbanBoard({
       onDragOver={handleDragOver}
       onDragEnd={handleDragEnd}
     >
-      <div className="flex gap-3 overflow-x-auto pb-4 -mx-2 px-2">
+      {isMobile ? (
+      <div data-testid="kanban-mobile-board" className="space-y-3">
+        <div
+          className="flex gap-2 overflow-x-auto pb-1"
+          role="tablist"
+          aria-label="Task status"
+        >
+          {boardStatuses.map((status) => {
+            const selected = status === mobileStatus;
+            return (
+              <button
+                key={status}
+                type="button"
+                role="tab"
+                aria-selected={selected}
+                className={cn(
+                  "flex h-11 shrink-0 items-center gap-2 rounded-md border px-3 text-xs font-medium transition-colors",
+                  selected
+                    ? "border-primary bg-primary text-primary-foreground"
+                    : "border-border bg-background text-muted-foreground hover:text-foreground",
+                )}
+                onClick={() => setMobileStatus(status)}
+              >
+                <StatusIcon status={status} />
+                <span>{statusLabel(status)}</span>
+                <span className="tabular-nums opacity-70">
+                  {columnIssues[status]?.length ?? 0}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+
+        <KanbanColumn
+          status={mobileStatus}
+          issues={columnIssues[mobileStatus] ?? []}
+          agents={agents}
+          liveIssueIds={liveIssueIds}
+          subtreeLiveCounts={subtreeLiveCounts}
+          compactCards={compactCards}
+          collapsed={false}
+          visibleCount={visibleCountByStatus[mobileStatus] ?? initialVisibleCount}
+          revealIncrement={revealIncrement}
+          mobileFullWidth
+          onShowMore={() => {
+            setVisibleState((current) => {
+              const counts = current.paginationKey === paginationKey ? current.counts : {};
+              return {
+                paginationKey,
+                counts: {
+                  ...counts,
+                  [mobileStatus]: (counts[mobileStatus] ?? initialVisibleCount) + revealIncrement,
+                },
+              };
+            });
+          }}
+        />
+      </div>
+      ) : (
+      <div data-testid="kanban-desktop-board" className="flex gap-3 overflow-x-auto pb-4 -mx-2 px-2">
         {boardStatuses.map((status) => (
           <KanbanColumn
             key={status}
@@ -492,6 +564,7 @@ export function KanbanBoard({
           />
         ))}
       </div>
+      )}
       <DragOverlay>
         {activeIssue ? (
           <KanbanCard issue={activeIssue} agents={agents} isOverlay compact={compactCards} />

@@ -14,6 +14,11 @@ const mockIssuesApi = vi.hoisted(() => ({
   get: vi.fn(),
 }));
 
+const mockUseLiveRunTranscripts = vi.hoisted(() => vi.fn((_options: { runs: Array<{ id: string }> }) => ({
+  transcriptByRun: new Map(),
+  hasOutputForRun: () => false,
+})));
+
 vi.mock("@/lib/router", () => ({
   Link: ({ to, children, ...props }: { to: string; children: ReactNode }) => (
     <a href={to} {...props}>
@@ -39,10 +44,7 @@ vi.mock("./RunChatSurface", () => ({
 }));
 
 vi.mock("./transcript/useLiveRunTranscripts", () => ({
-  useLiveRunTranscripts: () => ({
-    transcriptByRun: new Map(),
-    hasOutputForRun: () => false,
-  }),
+  useLiveRunTranscripts: mockUseLiveRunTranscripts,
 }));
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -227,6 +229,33 @@ describe("ActiveAgentsPanel", () => {
       expect(issueLink?.textContent).toBe("PAP-3562 - Phase 4B: Implement LLM Wiki distillation UI");
       expect(issueLink?.getAttribute("href")).toBe("/issues/PAP-3562");
     });
+
+    await act(async () => {
+      root.unmount();
+    });
+  });
+
+  it("does not request missing transcripts for historical runs with no stored bytes", async () => {
+    mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue([
+      { ...createRun(1), status: "cancelled", finishedAt: "2026-04-24T12:01:00.000Z" },
+      { ...createRun(2), status: "succeeded", finishedAt: "2026-04-24T12:02:00.000Z", logBytes: 128 },
+    ]);
+    const root = createRoot(container);
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <ActiveAgentsPanel companyId="company-1" />
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+
+    const latestOptions = mockUseLiveRunTranscripts.mock.calls.at(-1)?.[0];
+    expect(latestOptions?.runs.map((run) => run.id)).toEqual(["run-2"]);
 
     await act(async () => {
       root.unmount();

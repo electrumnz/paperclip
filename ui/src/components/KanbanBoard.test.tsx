@@ -6,6 +6,12 @@ import type { Issue, IssueStatus } from "@paperclipai/shared";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { getKanbanColumnTone, KanbanBoard, resolveKanbanTargetStatus } from "./KanbanBoard";
 
+const sidebarState = vi.hoisted(() => ({ isMobile: false }));
+
+vi.mock("../context/SidebarContext", () => ({
+  useSidebar: () => sidebarState,
+}));
+
 vi.mock("@/lib/router", () => ({
   Link: ({
     children,
@@ -107,6 +113,7 @@ function renderBoard(
 
 describe("KanbanBoard", () => {
   beforeEach(() => {
+    sidebarState.isMobile = false;
     document.body.innerHTML = "";
   });
 
@@ -183,9 +190,30 @@ describe("KanbanBoard", () => {
       collapsedStatuses: ["done"],
     });
 
-    expect(container.textContent).toContain("Done");
-    expect(container.textContent).toContain("3");
-    expect(container.textContent).not.toContain("Issue 1");
+    const desktopBoard = container.querySelector('[data-testid="kanban-desktop-board"]');
+    expect(desktopBoard?.textContent).toContain("Done");
+    expect(desktopBoard?.textContent).toContain("3");
+    expect(desktopBoard?.textContent).not.toContain("Issue 1");
+  });
+
+  it("shows one selectable status lane in the mobile board", () => {
+    sidebarState.isMobile = true;
+    const { container } = renderBoard({
+      issues: [createIssue(1, "backlog"), createIssue(2, "blocked")],
+    });
+    const mobileBoard = container.querySelector('[data-testid="kanban-mobile-board"]');
+    expect(mobileBoard?.textContent).toContain("Issue 1");
+    expect(mobileBoard?.textContent).not.toContain("Issue 2");
+
+    const blockedTab = Array.from(mobileBoard?.querySelectorAll('[role="tab"]') ?? [])
+      .find((tab) => tab.textContent?.includes("Blocked"));
+    act(() => {
+      blockedTab?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    expect(blockedTab?.getAttribute("aria-selected")).toBe("true");
+    expect(mobileBoard?.textContent).toContain("Issue 2");
+    expect(mobileBoard?.textContent).not.toContain("Issue 1");
   });
 
   it("gives every column a status-hued tone", () => {

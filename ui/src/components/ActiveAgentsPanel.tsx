@@ -94,6 +94,13 @@ export function ActiveAgentsPanel({
 
   const runs = liveRuns ?? [];
   const visibleRuns = useMemo(() => runs.slice(0, cardLimit), [cardLimit, runs]);
+  const transcriptRuns = useMemo(
+    () => visibleRuns.filter((run) =>
+      isRunActive(run)
+      || (typeof run.logBytes === "number" && run.logBytes > 0)
+      || (typeof run.lastOutputBytes === "number" && run.lastOutputBytes > 0)),
+    [visibleRuns],
+  );
   const hiddenRunCount = Math.max(0, runs.length - visibleRuns.length);
   const visibleIssueIds = useMemo(
     () => [...new Set(visibleRuns.map((run) => run.issueId).filter((issueId): issueId is string => Boolean(issueId)))],
@@ -119,7 +126,9 @@ export function ActiveAgentsPanel({
   }, [issueQueries]);
 
   const { transcriptByRun, hasOutputForRun } = useLiveRunTranscripts({
-    runs: visibleRuns,
+    // Historical cancelled runs without stored bytes have no transcript
+    // endpoint. Excluding them avoids a guaranteed 404 on every dashboard load.
+    runs: transcriptRuns,
     companyId,
     maxChunksPerRun: DASHBOARD_MAX_CHUNKS_PER_RUN,
     logPollIntervalMs: DASHBOARD_LOG_POLL_INTERVAL_MS,
@@ -182,7 +191,7 @@ const AgentRunCard = memo(function AgentRunCard({
 }) {
   return (
     <div className={cn(
-      "flex h-(--sz-320px) flex-col overflow-hidden rounded-xl border shadow-sm",
+      "flex h-auto min-h-(--sz-120px) flex-col overflow-hidden rounded-xl border shadow-sm sm:h-(--sz-320px)",
       isActive
         ? "border-blue-500/25 bg-blue-500/[0.04] shadow-(--shadow-extract-1)"
         : "border-border bg-background/70",
@@ -237,7 +246,7 @@ const AgentRunCard = memo(function AgentRunCard({
         )}
       </div>
 
-      <div className="min-h-0 flex-1 overflow-y-auto p-3">
+      <div className="hidden min-h-0 flex-1 overflow-y-auto p-3 sm:block">
         <RunChatSurface
           run={run}
           transcript={transcript}
