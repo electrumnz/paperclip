@@ -193,6 +193,23 @@ export function chooseProviderWithTelemetry({
   return target;
 }
 
+export function withObservedProviderFailure(quota, provider) {
+  const current = quota[provider];
+  if (!current) return quota;
+  return {
+    ...quota,
+    [provider]: {
+      ...current,
+      hardBlocked: true,
+      reserveBlocked: true,
+      limitingWindows: [
+        ...current.limitingWindows,
+        { label: "Observed provider quota failure", usedPercent: 100, resetsAt: null },
+      ],
+    },
+  };
+}
+
 export function routableAgents(agents) {
   return (Array.isArray(agents) ? agents : []).filter(
     (agent) => Boolean(ADAPTER_TO_PROVIDER[agent?.adapterType]),
@@ -535,22 +552,14 @@ export class QuotaAwareAgentRouter {
       const urgent = Boolean(quotaRun) || ["critical", "high"].includes(actionable?.priority);
       const preferred = preferredProvider(agent, actionable, state.primaryProvider);
       const failedProvider = quotaRun ? ADAPTER_TO_PROVIDER[agent.adapterType] : null;
-      if (failedProvider) {
-        quota[failedProvider] = {
-          ...quota[failedProvider],
-          hardBlocked: true,
-          reserveBlocked: true,
-          limitingWindows: [
-            ...quota[failedProvider].limitingWindows,
-            { label: "Observed provider quota failure", usedPercent: 100, resetsAt: null },
-          ],
-        };
-      }
+      const routingQuota = failedProvider
+        ? withObservedProviderFailure(quota, failedProvider)
+        : quota;
       const currentProvider = ADAPTER_TO_PROVIDER[agent.adapterType];
       const target = chooseProviderWithTelemetry({
         preferred,
         current: currentProvider,
-        quota,
+        quota: routingQuota,
         urgent,
         quotaFailure: Boolean(quotaRun),
         unknownProviders: stableQuota.unknownProviders,
@@ -562,7 +571,7 @@ export class QuotaAwareAgentRouter {
           agentName: agent.name,
           preferred,
           issueId: actionable?.id ?? null,
-          earliestResetAt: Object.values(quota)
+          earliestResetAt: Object.values(routingQuota)
             .map((entry) => entry.resetsAt)
             .filter(Boolean)
             .sort()[0] ?? null,

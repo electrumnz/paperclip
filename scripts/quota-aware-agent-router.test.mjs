@@ -11,6 +11,7 @@ import {
   routableAgents,
   stabilizeQuotaState,
   summarizeQuota,
+  withObservedProviderFailure,
 } from "./quota-aware-agent-router.mjs";
 
 test("Claude is blocked when either the current-session or weekly window is exhausted", () => {
@@ -130,6 +131,19 @@ test("Grok OAuth failures are treated as provider-unavailable failures", () => {
     errorCode: "adapter_failed",
     log: "Grok is not authenticated: No auth credentials for cli-chat-proxy",
   }), true);
+});
+
+test("one agent's observed failure does not poison shared fleet quota state", () => {
+  const quota = buildQuotaState([
+    { provider: "anthropic", ok: true, windows: [{ label: "week", usedPercent: 50 }] },
+    { provider: "openai", ok: true, windows: [{ label: "5h", usedPercent: 80 }] },
+  ], 10);
+  const affectedAgentQuota = withObservedProviderFailure(quota, "openai");
+
+  assert.equal(affectedAgentQuota.openai.hardBlocked, true);
+  assert.equal(chooseProvider({ preferred: "openai", quota: affectedAgentQuota }), "xai");
+  assert.equal(quota.openai.hardBlocked, false);
+  assert.equal(chooseProvider({ preferred: "openai", quota }), "openai");
 });
 
 test("task fit prefers Codex for engineering and Claude for research", () => {
