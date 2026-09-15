@@ -1,5 +1,5 @@
 import { memo, useState, type KeyboardEvent, type ReactNode } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlarmClock,
   CalendarClock,
@@ -32,6 +32,7 @@ import {
 } from "../lib/attention";
 import { cn, relativeTime } from "../lib/utils";
 import { DecisionTriageStrip } from "./DecisionTriageStrip";
+import { ApprovalPayloadRenderer } from "./ApprovalPayload";
 import { InteractionAudienceLine } from "./InteractionAudienceLine";
 import { StatusGlyph } from "./StatusGlyph";
 import { Button } from "./ui/button";
@@ -175,16 +176,26 @@ export const AttentionQueueRow = memo(function AttentionQueueRow({
   // Disclosure control. Now the row's only expand affordance: it names what it
   // does instead of leaving a bare chevron to be decoded, and it sits at the
   // bottom-left where the eye lands after reading the row.
+  const disclosureKind =
+    item.sourceKind === "issue_thread_interaction" &&
+    item.subject.metadata?.kind === "ask_user_questions"
+      ? "question"
+      : item.sourceKind === "approval"
+        ? "request"
+        : "details";
+  const disclosureLabel = expanded
+    ? `Hide ${disclosureKind}`
+    : `Show ${disclosureKind}`;
   const toggle = expandable ? (
     <button
       type="button"
       className="inline-flex shrink-0 items-center gap-1 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground focus-visible:ring-ring focus-visible:ring-(length:--rad-3) focus-visible:outline-none"
-      aria-label={expanded ? "Collapse decision" : "Expand decision"}
+      aria-label={disclosureLabel}
       aria-expanded={expanded}
       onClick={activate}
     >
       {expanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
-      {expanded ? "See less" : "See more"}
+      {disclosureLabel}
     </button>
   ) : null;
 
@@ -215,7 +226,7 @@ export const AttentionQueueRow = memo(function AttentionQueueRow({
           {showOpen && (
             <Button asChild variant="default" size="xs" className={ACTION_BTN}>
               <Link to={href!}>
-                Open
+                {item.sourceKind === "review" ? "Open task" : "Open"}
                 <ExternalLink className="h-3 w-3" />
               </Link>
             </Button>
@@ -463,6 +474,14 @@ interface CompactAction {
 
 /** The compact accept/reject verbs a collapsed row can resolve in place. */
 function collectCompactActions(item: AttentionItem): CompactAction[] {
+  // A board request may be a multiple-choice question. Never let the operator
+  // approve it blind from the collapsed row; reveal the request first.
+  if (
+    item.sourceKind === "approval" &&
+    item.subject.metadata?.type === "request_board_approval"
+  ) {
+    return [];
+  }
   return item.decisionVerbs
     .slice(0, 3)
     .flatMap((verb) => {
@@ -534,7 +553,11 @@ function CompactDecisionActions({
   if (actions.length === 0) return null;
 
   return (
-    <div className="flex w-full flex-wrap items-center gap-2 @xl:w-auto @xl:justify-end @xl:gap-1" aria-label="Decision actions">
+    <div
+      aria-label="Decision actions"
+      className="flex w-full flex-wrap items-center gap-2 @xl:w-auto @xl:justify-end @xl:gap-1"
+      role="group"
+    >
       {actions.map(({ action, id, label, description }) => (
         <Button
           key={id}
@@ -831,12 +854,21 @@ function ResolverFooter({ toggle, children }: { toggle: ReactNode; children: Rea
 function ApprovalResolver({ item, companyId, toggle }: { item: AttentionItem; companyId: string; toggle: ReactNode }) {
   const queryClient = useQueryClient();
   const [note, setNote] = useState("");
+  const [selectedOption, setSelectedOption] = useState<string | null>(null);
+  const { data: approval, isLoading: approvalLoading, error: approvalError } = useQuery({
+    queryKey: queryKeys.approvals.detail(item.subject.id),
+    queryFn: () => approvalsApi.get(item.subject.id),
+  });
+  const payload = (approval?.payload ?? {}) as Record<string, unknown>;
+  const options = approvalResponseOptions(payload);
+  const decisionNote = () => buildApprovalDecisionNote(options, selectedOption, note);
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: queryKeys.attention(companyId) });
     queryClient.invalidateQueries({ queryKey: queryKeys.approvals.list(companyId) });
+    queryClient.invalidateQueries({ queryKey: queryKeys.approvals.detail(item.subject.id) });
   };
   const approve = useMutation({
-    mutationFn: () => approvalsApi.approve(item.subject.id, note.trim() || undefined),
+    mutationFn: () => approvalsApi.approve(item.subject.id, decisionNote()),
     onSuccess: invalidate,
   });
   const reject = useMutation({
@@ -848,33 +880,145 @@ function ApprovalResolver({ item, companyId, toggle }: { item: AttentionItem; co
     onSuccess: invalidate,
   });
   const pending = approve.isPending || reject.isPending || revise.isPending;
+  const decisionDisabled = pending || approvalLoading || Boolean(approvalError);
+  const actionError = approve.error ?? reject.error ?? revise.error;
 
   // Verb order matches the collapsed row exactly (revise → reject → approve),
   // so expanding never moves the button the operator was already aiming at.
   return (
     <>
+      {approvalLoading && (
+        <div className="flex items-center gap-2 py-3 text-xs text-muted-foreground">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading request…
+        </div>
+      )}
+      {approvalError && (
+        <p className="text-sm text-destructive">
+          {approvalError instanceof Error ? approvalError.message : "Could not load this request."}
+        </p>
+      )}
+      {approval && (
+        <div className="rounded-lg border border-border/60 bg-background/40 px-3.5 pb-3.5">
+          <ApprovalPayloadRenderer
+            type={approval.type}
+            payload={payload}
+            hidePrimaryTitle
+          />
+          {options.length > 0 && (
+            <fieldset className="mt-4 space-y-2">
+              <legend className="mb-2 text-xs font-medium text-foreground">
+                Choose a response
+              </legend>
+              {options.map((option) => (
+                <label
+                  key={option.value}
+                  className={cn(
+                    "flex min-h-11 cursor-pointer items-start gap-3 rounded-lg border px-3 py-2.5 transition-colors",
+                    selectedOption === option.value
+                      ? "border-primary/60 bg-primary/10"
+                      : "border-border bg-card hover:bg-muted/50",
+                  )}
+                >
+                  <input
+                    type="radio"
+                    name={`approval-response-${item.subject.id}`}
+                    value={option.value}
+                    checked={selectedOption === option.value}
+                    onChange={() => setSelectedOption(option.value)}
+                    className="mt-0.5 h-4 w-4 shrink-0 accent-primary"
+                  />
+                  <span className="min-w-0">
+                    <span className="block text-sm font-medium text-foreground">{option.label}</span>
+                    {option.description && (
+                      <span className="mt-0.5 block text-xs text-muted-foreground">
+                        {option.description}
+                      </span>
+                    )}
+                  </span>
+                </label>
+              ))}
+            </fieldset>
+          )}
+        </div>
+      )}
       <Textarea
         value={note}
         onChange={(e) => setNote(e.target.value)}
-        placeholder="Optional decision note…"
+        placeholder={options.length > 0 ? "Add context to your response (optional)…" : "Optional decision note…"}
         className="min-h-16 text-sm"
       />
+      {actionError && (
+        <p className="text-sm text-destructive">
+          {actionError instanceof Error ? actionError.message : "Could not submit this response."}
+        </p>
+      )}
       <ResolverFooter toggle={toggle}>
-        <Button size="sm" variant="outline" onClick={() => revise.mutate()} disabled={pending}>
+        <Button size="sm" variant="outline" onClick={() => revise.mutate()} disabled={decisionDisabled}>
           {revise.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
           Request revision
         </Button>
-        <Button size="sm" variant="destructive" onClick={() => reject.mutate()} disabled={pending}>
+        <Button size="sm" variant="destructive" onClick={() => reject.mutate()} disabled={decisionDisabled}>
           {reject.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
           Reject
         </Button>
-        <Button size="sm" onClick={() => approve.mutate()} disabled={pending}>
+        <Button
+          size="sm"
+          onClick={() => approve.mutate()}
+          disabled={decisionDisabled || (options.length > 0 && !selectedOption)}
+          title={options.length > 0 && !selectedOption ? "Choose a response first" : undefined}
+        >
           {approve.isPending && <Loader2 className="h-3.5 w-3.5 animate-spin" />}
-          Approve
+          {options.length > 0 ? "Submit response" : "Approve"}
         </Button>
       </ResolverFooter>
     </>
   );
+}
+
+interface ApprovalResponseOption {
+  value: string;
+  label: string;
+  description: string | null;
+}
+
+function humanizeApprovalOption(value: string): string {
+  const text = value.replaceAll("_", " ").replaceAll("-", " ").trim();
+  return text ? `${text.charAt(0).toUpperCase()}${text.slice(1)}` : value;
+}
+
+export function approvalResponseOptions(payload: Record<string, unknown>): ApprovalResponseOption[] {
+  if (!Array.isArray(payload.options)) return [];
+  return payload.options.flatMap((option): ApprovalResponseOption[] => {
+    if (typeof option === "string" && option.trim()) {
+      const value = option.trim();
+      return [{ value, label: humanizeApprovalOption(value), description: null }];
+    }
+    if (!option || typeof option !== "object") return [];
+    const record = option as Record<string, unknown>;
+    const rawValue = record.value ?? record.id ?? record.label;
+    if (typeof rawValue !== "string" || !rawValue.trim()) return [];
+    const value = rawValue.trim();
+    const label = typeof record.label === "string" && record.label.trim()
+      ? record.label.trim()
+      : humanizeApprovalOption(value);
+    const description = typeof record.description === "string" && record.description.trim()
+      ? record.description.trim()
+      : null;
+    return [{ value, label, description }];
+  });
+}
+
+export function buildApprovalDecisionNote(
+  options: ApprovalResponseOption[],
+  selectedValue: string | null,
+  note: string,
+): string | undefined {
+  const selected = options.find((option) => option.value === selectedValue);
+  const response = selected
+    ? `Selected response: ${selected.label} [${selected.value}]`
+    : null;
+  const context = note.trim();
+  return [response, context || null].filter(Boolean).join("\n\n") || undefined;
 }
 
 function JoinRequestResolver({ item, companyId, toggle }: { item: AttentionItem; companyId: string; toggle: ReactNode }) {

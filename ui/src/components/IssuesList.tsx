@@ -67,7 +67,7 @@ import { Input } from "@/components/ui/input";
 import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover";
 import { Collapsible, CollapsibleContent } from "@/components/ui/collapsible";
 import { CircleDot, Plus, ArrowUpDown, Layers, Check, ChevronRight, List, ListTree, User, Search, CircleSlash2, ChevronsDownUp, PanelTopClose, RotateCcw, ListCollapse,
-  SquareKanban,
+  Network, SquareKanban,
 } from "lucide-react";
 import {
   KanbanBoard,
@@ -77,6 +77,7 @@ import {
   KANBAN_COLUMN_PAGE_SIZE_OPTIONS,
   type KanbanColumnPageSize,
 } from "./KanbanBoard";
+import { TaskGraphView } from "./TaskGraphView";
 import { buildIssueTree, countDescendants } from "../lib/issue-tree";
 import { getInboxKeyboardSelectionIndex } from "../lib/inbox";
 import { hasBlockingShortcutDialog, isKeyboardShortcutTextInputTarget } from "../lib/keyboardShortcuts";
@@ -152,7 +153,7 @@ export type IssueViewState = IssueFilterState & {
   sortField: IssueSortField;
   sortDir: "asc" | "desc";
   groupBy: "status" | "priority" | "assignee" | "project" | "workspace" | "parent" | "none";
-  viewMode: "list" | "board";
+  viewMode: "list" | "board" | "graph";
   nestingEnabled: boolean;
   collapsedGroups: string[];
   collapsedParents: string[];
@@ -183,6 +184,11 @@ function normalizeBoardColdLaneMode(value: unknown): BoardColdLaneMode {
   return value === "collapsed" || value === "expanded" || value === "auto" ? value : "auto";
 }
 
+function normalizeIssueViewMode(value: unknown): IssueViewState["viewMode"] {
+  if (value === "timeline") return "graph";
+  return value === "board" || value === "graph" ? value : "list";
+}
+
 function normalizeBoardColumnPageSize(value: unknown): BoardColumnPageSize {
   return KANBAN_COLUMN_PAGE_SIZE_OPTIONS.includes(value as BoardColumnPageSize)
     ? value as BoardColumnPageSize
@@ -198,6 +204,7 @@ function getViewState(key: string): IssueViewState {
         ...defaultViewState,
         ...parsed,
         ...normalizeIssueFilterState(parsed),
+        viewMode: normalizeIssueViewMode(parsed.viewMode),
         boardCardDensity: normalizeBoardCardDensity(parsed.boardCardDensity),
         boardColdLaneMode: normalizeBoardColdLaneMode(parsed.boardColdLaneMode),
         boardColumnPageSize: normalizeBoardColumnPageSize(parsed.boardColumnPageSize),
@@ -864,7 +871,7 @@ export function IssuesList({
           limit: ISSUE_BOARD_COLUMN_RESULT_LIMIT,
           ...(enableRoutineVisibilityFilter ? { includeRoutineExecutions: true } : {}),
         }, { signal }).then((rows) => rows as Issue[]),
-      enabled: !!selectedCompanyId && viewState.viewMode === "board" && !searchWithinLoadedIssues,
+      enabled: !!selectedCompanyId && viewState.viewMode !== "list" && !searchWithinLoadedIssues,
       placeholderData: (previousData: Issue[] | undefined) => previousData,
     })),
   });
@@ -1068,7 +1075,7 @@ export function IssuesList({
   }, [issues]);
 
   const boardIssues = useMemo(() => {
-    if (viewState.viewMode !== "board" || searchWithinLoadedIssues) return null;
+    if (viewState.viewMode === "list" || searchWithinLoadedIssues) return null;
     const merged = new Map<string, Issue>();
     let isPending = false;
     for (const query of boardIssueQueries) {
@@ -1082,7 +1089,7 @@ export function IssuesList({
   }, [boardIssueQueries, issues, searchWithinLoadedIssues, viewState.viewMode]);
   const boardColumnLimitReached = useMemo(
     () =>
-      viewState.viewMode === "board" &&
+      viewState.viewMode !== "list" &&
       !searchWithinLoadedIssues &&
       boardIssueQueries.some((query) => (query.data?.length ?? 0) === ISSUE_BOARD_COLUMN_RESULT_LIMIT),
     [boardIssueQueries, searchWithinLoadedIssues, viewState.viewMode],
@@ -1703,6 +1710,16 @@ export function IssuesList({
               <SquareKanban className="h-3.5 w-3.5" />
               <span className="sm:hidden">Board</span>
             </button>
+            <button
+              className={`flex h-11 items-center justify-center gap-1.5 px-3 text-xs font-medium transition-colors sm:h-8 sm:w-8 sm:px-0 ${viewState.viewMode === "graph" ? "bg-accent text-foreground" : "text-muted-foreground hover:text-foreground"}`}
+              onClick={() => updateView({ viewMode: "graph" })}
+              title="Graph view"
+              aria-label="Graph view"
+              aria-pressed={viewState.viewMode === "graph"}
+            >
+              <Network className="h-3.5 w-3.5" />
+              <span className="sm:hidden">Graph</span>
+            </button>
           </div>
 
           {viewState.viewMode === "list" && (
@@ -1919,7 +1936,7 @@ export function IssuesList({
       )}
       {boardColumnLimitReached && (
         <p className="text-xs text-muted-foreground">
-          Some board columns are showing up to {ISSUE_BOARD_COLUMN_RESULT_LIMIT} tasks. Refine filters or search to reveal the rest.
+          Some statuses are showing up to {ISSUE_BOARD_COLUMN_RESULT_LIMIT} tasks. Refine filters or search to reveal the rest.
         </p>
       )}
       {!isLoading && !externalObjectFilterLoading && filtered.length === 0 && viewState.viewMode === "list" && (
@@ -1942,6 +1959,8 @@ export function IssuesList({
           revealIncrement={viewState.boardColumnPageSize}
           onUpdateIssue={onUpdateIssue}
         />
+      ) : viewState.viewMode === "graph" ? (
+        <TaskGraphView issues={filtered} liveIssueIds={liveIssueIds} />
       ) : (
         <>
           {groupedContent.map((group) => {

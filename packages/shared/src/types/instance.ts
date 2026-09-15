@@ -42,6 +42,13 @@ export interface InstanceGeneralSettings {
    * Kubernetes sandbox provider and denies local/ssh execution.
    */
   executionMode?: InstanceExecutionMode;
+  /**
+   * Company a fresh browser opens on, before anyone has chosen one. Without it
+   * the UI falls back to whichever company the API listed first, which on a
+   * multi-company instance is arbitrary and differs per device. A stored
+   * per-browser selection still wins; a stale id is ignored, not honoured.
+   */
+  defaultCompanyId?: string | null;
 }
 
 export interface InstanceExperimentalSettings {

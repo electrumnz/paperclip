@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@/lib/router";
+import { attentionApi } from "../api/attention";
 import { decisionQueuesApi } from "../api/decisionQueues";
 import { queryKeys } from "../lib/queryKeys";
 import { cn } from "../lib/utils";
@@ -30,6 +31,11 @@ export function DecisionQueueRail({ companyId, activeQueueKey = null }: Decision
     queryFn: () => decisionQueuesApi.list(companyId),
     enabled: !!companyId,
   });
+  const { data: attention } = useQuery({
+    queryKey: [...queryKeys.attention(companyId), "queue-counts"],
+    queryFn: () => attentionApi.list(companyId, { all: true }),
+    enabled: !!companyId,
+  });
 
   // Nothing to show until at least one queue exists — the desk still works
   // without the rail, so render nothing rather than a lone "All" chip.
@@ -38,10 +44,24 @@ export function DecisionQueueRail({ companyId, activeQueueKey = null }: Decision
   }
 
   const now = Date.now();
+  const activeItems = (attention?.items ?? []).filter(
+    (item) => !(item.dismissal?.isActive ?? false),
+  );
+  const countByQueue = new Map<string, number>();
+  for (const item of activeItems) {
+    for (const queue of item.queues ?? []) {
+      countByQueue.set(queue.key, (countByQueue.get(queue.key) ?? 0) + 1);
+    }
+  }
 
   return (
     <nav className="flex flex-wrap items-center gap-1.5" aria-label="Decision queues" data-decision-queue-rail>
-      <Chip href={decisionsHref(null)} active={activeQueueKey == null} label="All" />
+      <Chip
+        href={decisionsHref(null)}
+        active={activeQueueKey == null}
+        label="All"
+        count={attention ? activeItems.length : undefined}
+      />
       {queues.map((queue) => {
         const recent = now - new Date(queue.updatedAt).getTime() < RECENT_ACTIVITY_MS;
         return (
@@ -50,7 +70,7 @@ export function DecisionQueueRail({ companyId, activeQueueKey = null }: Decision
             href={decisionsHref(queue.key)}
             active={activeQueueKey === queue.key}
             label={queue.title}
-            count={queue.itemCount}
+            count={attention ? (countByQueue.get(queue.key) ?? 0) : undefined}
             recent={recent}
           />
         );

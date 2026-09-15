@@ -1380,7 +1380,7 @@ describe("IssuesList", () => {
     );
 
     await waitForAssertion(() => {
-      expect(container.textContent).toContain("Some board columns are showing up to 200 tasks. Refine filters or search to reveal the rest.");
+      expect(container.textContent).toContain("Some statuses are showing up to 200 tasks. Refine filters or search to reveal the rest.");
     });
 
     act(() => {

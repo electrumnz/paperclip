@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode, type TouchEvent } from "react";
 import { Link } from "@/lib/router";
 import {
   DndContext,
@@ -21,11 +21,15 @@ import { StatusIcon } from "./StatusIcon";
 import { PriorityIcon } from "./PriorityIcon";
 import { SHOW_TASK_PRIORITY_UI } from "../lib/ui-flags";
 import { Identity } from "./Identity";
-import type { Issue, IssueStatus } from "@paperclipai/shared";
-import { AlertTriangle } from "lucide-react";
+import type { Issue, IssueRelationIssueSummary, IssueStatus } from "@paperclipai/shared";
+import { AlertTriangle, CornerDownRight, GitBranch } from "lucide-react";
 import { isSuccessfulRunHandoffRequired } from "../lib/successful-run-handoff";
 import { collectSubtreeLiveCounts } from "../lib/liveIssueIds";
 import { cn } from "../lib/utils";
+import {
+  issueStatusText,
+  issueStatusTextDefault,
+} from "../lib/status-colors";
 import { Card } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { useSidebar } from "../context/SidebarContext";
@@ -37,6 +41,8 @@ export const KANBAN_COLUMN_DEFAULT_PAGE_SIZE: KanbanColumnPageSize = 10;
 export const KANBAN_COLUMN_INITIAL_VISIBLE_LIMIT = KANBAN_COLUMN_DEFAULT_PAGE_SIZE;
 export const KANBAN_COLUMN_REVEAL_INCREMENT = KANBAN_COLUMN_DEFAULT_PAGE_SIZE;
 export const KANBAN_COLD_STATUSES = ["backlog", "done", "cancelled"] as const;
+export const KANBAN_MOBILE_SWIPE_MIN_DISTANCE = 48;
+export const KANBAN_MOBILE_SWIPE_AXIS_RATIO = 1.2;
 
 export const boardStatuses = [
   "backlog",
@@ -142,6 +148,95 @@ export function resolveKanbanTargetStatus(overId: string, issues: Issue[]): Issu
   return issues.find((issue) => issue.id === overId)?.status ?? null;
 }
 
+export function resolveMobileSwipeStatus(
+  currentStatus: IssueStatus,
+  deltaX: number,
+  deltaY: number,
+): IssueStatus {
+  const horizontalDistance = Math.abs(deltaX);
+  if (
+    horizontalDistance < KANBAN_MOBILE_SWIPE_MIN_DISTANCE ||
+    horizontalDistance <= Math.abs(deltaY) * KANBAN_MOBILE_SWIPE_AXIS_RATIO
+  ) {
+    return currentStatus;
+  }
+
+  const currentIndex = boardStatuses.indexOf(currentStatus);
+  const nextIndex = Math.max(
+    0,
+    Math.min(boardStatuses.length - 1, currentIndex + (deltaX < 0 ? 1 : -1)),
+  );
+  return boardStatuses[nextIndex];
+}
+
+export interface KanbanIssuePlacement {
+  issue: Issue;
+  depth: number;
+}
+
+/**
+ * Keeps each status lane's original root/sibling order while placing descendants
+ * directly below their nearest parent in that same lane. Cross-lane children stay
+ * at the root of their current lane and rely on the card's visible parent context.
+ */
+export function orderKanbanIssues(issues: Issue[]): KanbanIssuePlacement[] {
+  const issueIds = new Set(issues.map((issue) => issue.id));
+  const childrenByParentId = new Map<string, Issue[]>();
+  const roots: Issue[] = [];
+
+  for (const issue of issues) {
+    if (issue.parentId && issueIds.has(issue.parentId)) {
+      const children = childrenByParentId.get(issue.parentId) ?? [];
+      children.push(issue);
+      childrenByParentId.set(issue.parentId, children);
+    } else {
+      roots.push(issue);
+    }
+  }
+
+  const ordered: KanbanIssuePlacement[] = [];
+  const visited = new Set<string>();
+  const visit = (issue: Issue, depth: number) => {
+    if (visited.has(issue.id)) return;
+    visited.add(issue.id);
+    ordered.push({ issue, depth });
+    for (const child of childrenByParentId.get(issue.id) ?? []) {
+      visit(child, depth + 1);
+    }
+  };
+
+  for (const root of roots) visit(root, 0);
+  // Corrupt/cyclic hierarchy data must never make a card disappear.
+  for (const issue of issues) visit(issue, 0);
+
+  return ordered;
+}
+
+function collectGraphicallyRelatedIssueIds(issues: Issue[]) {
+  const issueById = new Map(issues.map((issue) => [issue.id, issue]));
+  const relatedIdsByIssue = new Map<string, Set<string>>();
+  const addRelation = (leftId: string, rightId: string) => {
+    const left = relatedIdsByIssue.get(leftId) ?? new Set<string>();
+    const right = relatedIdsByIssue.get(rightId) ?? new Set<string>();
+    left.add(rightId);
+    right.add(leftId);
+    relatedIdsByIssue.set(leftId, left);
+    relatedIdsByIssue.set(rightId, right);
+  };
+
+  for (const issue of issues) {
+    const visited = new Set<string>();
+    let parentId = issue.parentId;
+    while (parentId && issueById.has(parentId) && !visited.has(parentId)) {
+      visited.add(parentId);
+      addRelation(issue.id, parentId);
+      parentId = issueById.get(parentId)?.parentId ?? null;
+    }
+  }
+
+  return relatedIdsByIssue;
+}
+
 interface Agent {
   id: string;
   name: string;
@@ -166,6 +261,8 @@ function KanbanColumn({
   agents,
   liveIssueIds,
   subtreeLiveCounts,
+  issueById,
+  directChildCountById,
   compactCards = false,
   collapsed = false,
   visibleCount,
@@ -178,6 +275,8 @@ function KanbanColumn({
   agents?: Agent[];
   liveIssueIds?: Set<string>;
   subtreeLiveCounts?: ReadonlyMap<string, number>;
+  issueById: ReadonlyMap<string, Issue>;
+  directChildCountById: ReadonlyMap<string, number>;
   compactCards?: boolean;
   collapsed?: boolean;
   visibleCount: number;
@@ -188,8 +287,12 @@ function KanbanColumn({
   const { setNodeRef, isOver } = useDroppable({ id: status });
 
   const isEmpty = issues.length === 0;
-  const visibleIssues = collapsed ? [] : issues.slice(0, visibleCount);
-  const hiddenCount = Math.max(issues.length - visibleIssues.length, 0);
+  const placements = useMemo(() => orderKanbanIssues(issues), [issues]);
+  const visiblePlacements = collapsed ? [] : placements.slice(0, visibleCount);
+  const graphicallyRelatedIdsByIssue = collectGraphicallyRelatedIssueIds(
+    visiblePlacements.map(({ issue }) => issue),
+  );
+  const hiddenCount = Math.max(issues.length - visiblePlacements.length, 0);
   const nextRevealCount = Math.min(revealIncrement, hiddenCount);
   const tone = getKanbanColumnTone(status);
 
@@ -238,19 +341,46 @@ function KanbanColumn({
       >
         {/* Hidden cards are intentionally excluded from sort targets until revealed. */}
         <SortableContext
-          items={visibleIssues.map((i) => i.id)}
+          items={visiblePlacements.map(({ issue }) => issue.id)}
           strategy={verticalListSortingStrategy}
         >
-          {visibleIssues.map((issue) => (
-            <KanbanCard
+          {visiblePlacements.map(({ issue, depth }) => (
+            <div
               key={issue.id}
-              issue={issue}
-              agents={agents}
-              isLive={liveIssueIds?.has(issue.id)}
-              subtreeLiveCount={subtreeLiveCounts?.get(issue.id) ?? 0}
-              compact={compactCards}
-              className={tone.card}
-            />
+              data-testid="kanban-card-shell"
+              data-issue-id={issue.id}
+              data-parent-id={issue.parentId ?? undefined}
+              data-depth={depth}
+              className={cn(
+                "relative",
+                depth === 1 && "ml-3 pl-3",
+                depth > 1 && "ml-6 pl-3",
+              )}
+            >
+              {depth > 0 ? (
+                <>
+                  <span
+                    className="pointer-events-none absolute inset-y-0 left-0 w-px bg-border"
+                    aria-hidden="true"
+                  />
+                  <span
+                    className="pointer-events-none absolute left-0 top-5 h-px w-2 bg-border"
+                    aria-hidden="true"
+                  />
+                </>
+              ) : null}
+              <KanbanCard
+                issue={issue}
+                parentIssue={issue.parentId ? issueById.get(issue.parentId) : undefined}
+                directChildCount={directChildCountById.get(issue.id) ?? 0}
+                agents={agents}
+                isLive={liveIssueIds?.has(issue.id)}
+                subtreeLiveCount={subtreeLiveCounts?.get(issue.id) ?? 0}
+                compact={compactCards}
+                className={tone.card}
+                graphicallyRelatedIssueIds={graphicallyRelatedIdsByIssue.get(issue.id)}
+              />
+            </div>
           ))}
         </SortableContext>
         {hiddenCount > 0 ? (
@@ -264,7 +394,7 @@ function KanbanColumn({
         ) : null}
         {issues.length > 0 && (hiddenCount > 0 || issues.length >= visibleCount) ? (
           <p className="px-1 pt-1 text-(length:--text-micro) text-muted-foreground">
-            Showing {visibleIssues.length} of {issues.length}
+            Showing {visiblePlacements.length} of {issues.length}
           </p>
         ) : null}
       </div>
@@ -274,22 +404,63 @@ function KanbanColumn({
 
 /* ── Draggable Card ── */
 
+function KanbanRelationshipLink({
+  label,
+  relatedIssue,
+  icon,
+  testId,
+}: {
+  label: string;
+  relatedIssue: Pick<IssueRelationIssueSummary, "id" | "identifier" | "title" | "status">;
+  icon: ReactNode;
+  testId: string;
+}) {
+  const tone = issueStatusText[relatedIssue.status] ?? issueStatusTextDefault;
+  const identifier = relatedIssue.identifier ?? relatedIssue.id.slice(0, 8);
+
+  return (
+    <Link
+      to={`/issues/${relatedIssue.identifier ?? relatedIssue.id}`}
+      disableIssueQuicklook
+      data-testid={testId}
+      data-related-status={relatedIssue.status}
+      className={cn(
+        "flex min-w-0 items-center gap-1 py-0.5 text-(length:--text-nano) no-underline hover:underline",
+        tone,
+      )}
+      title={`${label} ${identifier} · ${statusLabel(relatedIssue.status)}: ${relatedIssue.title}`}
+      onPointerDown={(event) => event.stopPropagation()}
+    >
+      {icon}
+      <span className="shrink-0">{label}</span>
+      <span className="shrink-0 font-mono font-semibold">{identifier}</span>
+      <span className="truncate">{relatedIssue.title}</span>
+    </Link>
+  );
+}
+
 function KanbanCard({
   issue,
+  parentIssue,
+  directChildCount = 0,
   agents,
   isLive,
   subtreeLiveCount = 0,
   isOverlay,
   compact = false,
   className,
+  graphicallyRelatedIssueIds,
 }: {
   issue: Issue;
+  parentIssue?: Issue;
+  directChildCount?: number;
   agents?: Agent[];
   isLive?: boolean;
   subtreeLiveCount?: number;
   isOverlay?: boolean;
   compact?: boolean;
   className?: string;
+  graphicallyRelatedIssueIds?: ReadonlySet<string>;
 }) {
   const {
     attributes,
@@ -309,6 +480,16 @@ function KanbanCard({
     if (!id || !agents) return null;
     return agents.find((a) => a.id === id)?.name ?? null;
   };
+  const unresolvedBlockers = (issue.blockedBy ?? []).filter(
+    (blocker) => blocker.status !== "done" && blocker.status !== "cancelled",
+  );
+  const waitingLabel = formatWaitingLabel(unresolvedBlockers);
+  const displayedBlockedIssues = (issue.blocks ?? []).filter(
+    (blockedIssue) => !graphicallyRelatedIssueIds?.has(blockedIssue.id),
+  );
+  const showParentContext = Boolean(
+    issue.parentId && !graphicallyRelatedIssueIds?.has(issue.parentId),
+  );
 
   return (
     <Card
@@ -324,6 +505,28 @@ function KanbanCard({
         className,
       )}
     >
+      {showParentContext ? (
+        parentIssue ? (
+          <div className="mb-1.5">
+            <KanbanRelationshipLink
+              label="Child of"
+              relatedIssue={parentIssue}
+              icon={<CornerDownRight className="h-3 w-3 shrink-0" aria-hidden="true" />}
+              testId="kanban-parent-context"
+            />
+          </div>
+        ) : (
+          <div
+            data-testid="kanban-parent-context"
+            className="mb-1.5 flex min-w-0 items-center gap-1 py-0.5 text-(length:--text-nano) text-muted-foreground"
+            title="Child task"
+          >
+            <CornerDownRight className="h-3 w-3 shrink-0" aria-hidden="true" />
+            <span className="shrink-0">Child of</span>
+            <span className="font-medium">parent task</span>
+          </div>
+        )
+      ) : null}
       <Link
         to={`/issues/${issue.identifier ?? issue.id}`}
         disableIssueQuicklook
@@ -367,6 +570,31 @@ function KanbanCard({
           )}
         </div>
         <p className={`${compact ? "mb-1.5 text-xs" : "mb-2 text-sm"} leading-snug line-clamp-2`}>{issue.title}</p>
+        {directChildCount > 0 || waitingLabel ? (
+          <div className="mb-2 flex flex-wrap items-center gap-1">
+            {directChildCount > 0 ? (
+              <Badge
+                variant="outline"
+                className="gap-1 border-border bg-muted/40 px-1.5 text-(length:--text-nano) text-muted-foreground"
+                title={`${directChildCount} direct subtask${directChildCount === 1 ? "" : "s"}`}
+              >
+                <GitBranch className="h-3 w-3" aria-hidden="true" />
+                {directChildCount} subtask{directChildCount === 1 ? "" : "s"}
+              </Badge>
+            ) : null}
+            {waitingLabel ? (
+              <Badge
+                variant="outline"
+                data-testid="kanban-waiting-on"
+                className="gap-1 border-amber-500/45 bg-amber-500/10 px-1.5 text-(length:--text-nano) text-amber-700 dark:text-amber-300"
+                title={unresolvedBlockers.map(formatIssueReference).join(", ")}
+              >
+                <AlertTriangle className="h-3 w-3" aria-hidden="true" />
+                {waitingLabel}
+              </Badge>
+            ) : null}
+          </div>
+        ) : null}
         <div className="flex items-center gap-2 min-w-0">
           {/* PAP-411: priority UI hidden behind SHOW_TASK_PRIORITY_UI. */}
           {SHOW_TASK_PRIORITY_UI && <PriorityIcon priority={issue.priority} />}
@@ -382,8 +610,34 @@ function KanbanCard({
           })()}
         </div>
       </Link>
+      {displayedBlockedIssues.length > 0 ? (
+        <div className="mt-2 space-y-1 border-t border-border/60 pt-1.5" aria-label="Tasks this card is blocking">
+          {displayedBlockedIssues.map((blockedIssue) => (
+            <KanbanRelationshipLink
+              key={blockedIssue.id}
+              label="Blocking"
+              relatedIssue={blockedIssue}
+              icon={<AlertTriangle className="h-3 w-3 shrink-0" aria-hidden="true" />}
+              testId="kanban-blocking-context"
+            />
+          ))}
+        </div>
+      ) : null}
     </Card>
   );
+}
+
+function formatIssueReference(issue: Pick<IssueRelationIssueSummary, "id" | "identifier" | "title">): string {
+  return `${issue.identifier ?? issue.id.slice(0, 8)} ${issue.title}`;
+}
+
+function formatWaitingLabel(blockers: IssueRelationIssueSummary[]): string | null {
+  const first = blockers[0];
+  if (!first) return null;
+  const identifier = first.identifier ?? first.id.slice(0, 8);
+  return blockers.length === 1
+    ? `Waiting on ${identifier}`
+    : `Waiting on ${identifier} +${blockers.length - 1}`;
 }
 
 /* ── Main Board ── */
@@ -406,6 +660,9 @@ export function KanbanBoard({
     );
     return firstPopulated ?? "backlog";
   });
+  const mobileStatusHydrated = useRef(issues.length > 0);
+  const mobileSwipeStart = useRef<{ x: number; y: number } | null>(null);
+  const mobileTabRefs = useRef<Partial<Record<IssueStatus, HTMLButtonElement | null>>>({});
   const paginationKey = `${initialVisibleCount}:${revealIncrement}`;
   const [visibleState, setVisibleState] = useState<{
     paginationKey: string;
@@ -414,9 +671,25 @@ export function KanbanBoard({
   const visibleCountByStatus = visibleState.paginationKey === paginationKey ? visibleState.counts : {};
   const collapsedStatusSet = useMemo(() => new Set(collapsedStatuses), [collapsedStatuses]);
 
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 5 } })
-  );
+  const pointerSensor = useSensor(PointerSensor, { activationConstraint: { distance: 5 } });
+  const sensors = useSensors(isMobile ? undefined : pointerSensor);
+
+  useEffect(() => {
+    if (!isMobile) return;
+    mobileTabRefs.current[mobileStatus]?.scrollIntoView?.({
+      block: "nearest",
+      inline: "center",
+    });
+  }, [isMobile, mobileStatus]);
+
+  useLayoutEffect(() => {
+    if (!isMobile || mobileStatusHydrated.current || issues.length === 0) return;
+    mobileStatusHydrated.current = true;
+    const firstPopulated = boardStatuses.find((status) =>
+      issues.some((issue) => issue.status === status),
+    );
+    if (firstPopulated) setMobileStatus(firstPopulated);
+  }, [isMobile, issues]);
 
   const columnIssues = useMemo(() => {
     const grouped: Record<IssueStatus, Issue[]> = {} as Record<IssueStatus, Issue[]>;
@@ -429,6 +702,20 @@ export function KanbanBoard({
       }
     }
     return grouped;
+  }, [issues]);
+
+  const issueById = useMemo(
+    () => new Map(issues.map((issue) => [issue.id, issue])),
+    [issues],
+  );
+
+  const directChildCountById = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const issue of issues) {
+      if (!issue.parentId) continue;
+      counts.set(issue.parentId, (counts.get(issue.parentId) ?? 0) + 1);
+    }
+    return counts;
   }, [issues]);
 
   const activeIssue = useMemo(
@@ -467,6 +754,27 @@ export function KanbanBoard({
     // Could be used for visual feedback; keeping simple for now
   }
 
+  function handleMobileTouchStart(event: TouchEvent<HTMLDivElement>) {
+    const touch = event.touches[0];
+    if (!touch) return;
+    mobileSwipeStart.current = { x: touch.clientX, y: touch.clientY };
+  }
+
+  function handleMobileTouchEnd(event: TouchEvent<HTMLDivElement>) {
+    const start = mobileSwipeStart.current;
+    const touch = event.changedTouches[0];
+    mobileSwipeStart.current = null;
+    if (!start || !touch || activeId) return;
+
+    setMobileStatus((currentStatus) =>
+      resolveMobileSwipeStatus(
+        currentStatus,
+        touch.clientX - start.x,
+        touch.clientY - start.y,
+      ),
+    );
+  }
+
   return (
     <DndContext
       sensors={sensors}
@@ -486,6 +794,9 @@ export function KanbanBoard({
             return (
               <button
                 key={status}
+                ref={(node) => {
+                  mobileTabRefs.current[status] = node;
+                }}
                 type="button"
                 role="tab"
                 aria-selected={selected}
@@ -507,30 +818,42 @@ export function KanbanBoard({
           })}
         </div>
 
-        <KanbanColumn
-          status={mobileStatus}
-          issues={columnIssues[mobileStatus] ?? []}
-          agents={agents}
-          liveIssueIds={liveIssueIds}
-          subtreeLiveCounts={subtreeLiveCounts}
-          compactCards={compactCards}
-          collapsed={false}
-          visibleCount={visibleCountByStatus[mobileStatus] ?? initialVisibleCount}
-          revealIncrement={revealIncrement}
-          mobileFullWidth
-          onShowMore={() => {
-            setVisibleState((current) => {
-              const counts = current.paginationKey === paginationKey ? current.counts : {};
-              return {
-                paginationKey,
-                counts: {
-                  ...counts,
-                  [mobileStatus]: (counts[mobileStatus] ?? initialVisibleCount) + revealIncrement,
-                },
-              };
-            });
+        <div
+          data-testid="kanban-mobile-lane"
+          className="touch-pan-y"
+          onTouchStart={handleMobileTouchStart}
+          onTouchEnd={handleMobileTouchEnd}
+          onTouchCancel={() => {
+            mobileSwipeStart.current = null;
           }}
-        />
+        >
+          <KanbanColumn
+            status={mobileStatus}
+            issues={columnIssues[mobileStatus] ?? []}
+            agents={agents}
+            liveIssueIds={liveIssueIds}
+            subtreeLiveCounts={subtreeLiveCounts}
+            issueById={issueById}
+            directChildCountById={directChildCountById}
+            compactCards={compactCards}
+            collapsed={false}
+            visibleCount={visibleCountByStatus[mobileStatus] ?? initialVisibleCount}
+            revealIncrement={revealIncrement}
+            mobileFullWidth
+            onShowMore={() => {
+              setVisibleState((current) => {
+                const counts = current.paginationKey === paginationKey ? current.counts : {};
+                return {
+                  paginationKey,
+                  counts: {
+                    ...counts,
+                    [mobileStatus]: (counts[mobileStatus] ?? initialVisibleCount) + revealIncrement,
+                  },
+                };
+              });
+            }}
+          />
+        </div>
       </div>
       ) : (
       <div data-testid="kanban-desktop-board" className="flex gap-3 overflow-x-auto pb-4 -mx-2 px-2">
@@ -542,6 +865,8 @@ export function KanbanBoard({
             agents={agents}
             liveIssueIds={liveIssueIds}
             subtreeLiveCounts={subtreeLiveCounts}
+            issueById={issueById}
+            directChildCountById={directChildCountById}
             compactCards={compactCards}
             // Compact mode (any lane explicitly collapsed) also collapses
             // empty lanes to the same labeled rail, so an empty In Progress

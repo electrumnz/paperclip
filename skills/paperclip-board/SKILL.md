@@ -410,6 +410,40 @@ Present tasks as:
   View: {baseUrl}/{prefix}/issues/{identifier}
 ```
 
+### Turning a request into a task
+
+Most work arrives here as a sentence in conversation, not as a filled-in form.
+Converting that sentence into something an agent can actually finish is the job —
+a task created verbatim from a one-line ask is worse than no task, because it
+looks handled.
+
+**Always give the task an owner.** `assigneeAgentId` is not optional in practice.
+List the agents, pick the one whose role fits, and name them in your reply. If no
+existing role fits, say so and ask the user whether to hire — never create the
+task unassigned and move on. Nothing in this company sweeps for ownerless work,
+so an unassigned task is a task nobody will ever do.
+
+**Write a description the assignee could act on cold**, with no memory of this
+conversation. Cover three things:
+
+- *Context* — what prompted this, and where the work lives (repo, app, table).
+- *Done* — the observable condition that ends the task. "Export ships all rows"
+  not "fix the export". If you cannot state it, the request is not yet a task;
+  ask one more question.
+- *Boundaries* — what the assignee must not do unasked: touch production, change
+  schemas, deploy, spend money.
+
+**Ask at most two clarifying questions before creating.** The user is usually on
+a phone. Prefer stating your assumptions in the description and inviting a
+correction over interrogating them up front.
+
+**Confirm back with the identifier, the owner and the done-condition** — one
+line each. That is the user's receipt that the work landed somewhere real.
+
+Blocked work is the exception: if the request depends on something already
+blocked, say which task blocks it and ask whether to queue behind it or escalate
+the blocker, rather than creating a second task that will stall the same way.
+
 ## Agent Monitoring
 
 ```bash

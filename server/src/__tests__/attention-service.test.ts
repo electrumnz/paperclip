@@ -1500,6 +1500,7 @@ describeEmbeddedPostgres("attention service", () => {
 
     expect(approvalItems).toHaveLength(1);
     expect(approvalItems[0]?.subject.metadata?.issueId).toBe(firstIssueId);
+    expect(approvalItems[0]?.inlineResolvable).toBe(true);
   });
 
   it("hides snoozed attention rows until snoozedUntil passes, then returns them unconditionally", async () => {
@@ -1640,16 +1641,29 @@ describeEmbeddedPostgres("attention service", () => {
       sort: "decide",
       limit: 20,
     });
-    // Desk badge = distinct items surfaced today OR with a due decide-by
-    // Everything here was seeded ~now, so every visible row
-    // counts; the whole page fits under limit:20 so items == rankedItems.
+    // Desk badge = distinct items *waiting on the operator* surfaced today OR
+    // with a due decide-by. Everything here was seeded ~now, so every awaiting
+    // row counts; the whole page fits under limit:20 so items == rankedItems.
+    // Rows that only report on the org (blocked dependencies, recovery
+    // actions) are excluded: the badge must not promise unactionable work.
     const startOfUtcDay = Date.UTC(
       new Date(now).getUTCFullYear(),
       new Date(now).getUTCMonth(),
       new Date(now).getUTCDate(),
     );
+    const operatorDecisionKinds = [
+      "approval",
+      "decision",
+      "issue_thread_interaction",
+      "join_request",
+      "review",
+    ];
+    const awaitsOperator = (item: (typeof feed.items)[number]) =>
+      item.inlineResolvable === true || operatorDecisionKinds.includes(item.sourceKind);
     const expectedBadge = feed.items.filter(
-      (item) => new Date(item.createdAt).getTime() >= startOfUtcDay || item.decideBy === "today",
+      (item) =>
+        awaitsOperator(item) &&
+        (new Date(item.createdAt).getTime() >= startOfUtcDay || item.decideBy === "today"),
     ).length;
     expect(expectedBadge).toBeGreaterThanOrEqual(2);
     expect(feed.deskBadgeCount).toBe(expectedBadge);

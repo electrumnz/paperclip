@@ -38,6 +38,22 @@ export function isInlineResolvable(item: AttentionItem): boolean {
 }
 
 /**
+ * True when the row is waiting on the operator — either a decision they own
+ * (approval, question, review) or anything the server marks resolvable from
+ * the row itself.
+ *
+ * Both halves are needed. The kind check alone drops rows like
+ * `agent_error_alert`, which carry `inlineResolvable: true` and have a working
+ * action but are not "decisions". The `inlineResolvable` check alone drops an
+ * approval that must be opened before it can be answered — still waiting on
+ * them, just not from here. Blocked dependencies and recovery actions satisfy
+ * neither: they report on the org rather than ask the operator for anything.
+ */
+export function isAwaitingOperator(item: AttentionItem): boolean {
+  return item.inlineResolvable === true || INLINE_RESOLVABLE_SOURCE_KINDS.has(item.sourceKind);
+}
+
+/**
  * Per-source wording only. The icon used to live here too — one glyph per
  * source kind — but rows now borrow the task-status glyph for their kind (see
  * `attentionStatus` below), so a source contributes its *name* and nothing
@@ -574,9 +590,35 @@ export const ATTENTION_GROUP_BY_KEY = "paperclip:attention:group-by";
 export const ATTENTION_SORT_KEY = "paperclip:attention:sort";
 export const ATTENTION_FILTERS_KEY_PREFIX = "paperclip:attention:filters";
 export const ATTENTION_COLLAPSED_GROUPS_KEY_PREFIX = "paperclip:attention:collapsed-groups";
+export const ATTENTION_ACTIONABLE_ONLY_KEY_PREFIX = "paperclip:attention:actionable-only";
 
 function isAttentionGroupBy(value: unknown): value is AttentionGroupBy {
   return value === "none" || value === "date" || value === "type" || value === "project" || value === "severity";
+}
+
+function attentionActionableOnlyKey(companyId: string | null | undefined): string {
+  return `${ATTENTION_ACTIONABLE_ONLY_KEY_PREFIX}:${companyId ?? "none"}`;
+}
+
+/**
+ * Desk default is actionable-only: the operator opens the page to decide
+ * things, and an org with stalled work can otherwise bury two approvals under
+ * thirty blocked-dependency rows. Opt out per company; the choice persists.
+ */
+export function loadAttentionActionableOnly(companyId: string | null | undefined): boolean {
+  try {
+    return localStorage.getItem(attentionActionableOnlyKey(companyId)) !== "false";
+  } catch {
+    return true;
+  }
+}
+
+export function saveAttentionActionableOnly(companyId: string | null | undefined, value: boolean) {
+  try {
+    localStorage.setItem(attentionActionableOnlyKey(companyId), value ? "true" : "false");
+  } catch {
+    // Ignore localStorage failures.
+  }
 }
 
 export function loadAttentionGroupBy(): AttentionGroupBy {

@@ -16,6 +16,7 @@ import {
   defaultAttentionFilterState,
   filterAttentionItems,
   groupAttentionItems,
+  isAwaitingOperator,
   isInlineResolvable,
   loadAttentionGroupBy,
   NO_GROUP_SENTINEL,
@@ -534,6 +535,42 @@ describe("filterAttentionItems", () => {
   const approval = buildItem({ id: "ap", sourceKind: "approval", severity: "high", project: { id: "p1", name: "Alpha", urlKey: "a", color: null, icon: null } });
   const join = buildItem({ id: "jn", sourceKind: "join_request", severity: "low", project: null });
   const items = [approval, join];
+
+  it("treats operator decisions as awaiting, and org reports as not", () => {
+    // Approvals, questions and reviews are requests to the operator.
+    for (const kind of ["approval", "decision", "issue_thread_interaction", "join_request", "review"] as const) {
+      expect(isAwaitingOperator(buildItem({ id: kind, sourceKind: kind }))).toBe(true);
+    }
+    // Blocked dependencies and recovery actions report on the org; the server
+    // ships them with inlineResolvable false because there is nothing to press.
+    for (const kind of ["blocker_attention", "recovery_action", "failed_run", "budget_alert"] as const) {
+      expect(
+        isAwaitingOperator(buildItem({ id: kind, sourceKind: kind, inlineResolvable: false })),
+      ).toBe(false);
+    }
+  });
+
+  it("keeps a row the server marks resolvable, even outside the decision kinds", () => {
+    // agent_error_alert is not a "decision", but it carries a working inline
+    // action -- hiding it would strand the operator with an unclearable error.
+    const alert = buildItem({ id: "err", sourceKind: "agent_error_alert", inlineResolvable: true });
+    expect(isAwaitingOperator(alert)).toBe(true);
+    // A blocked dependency satisfies neither half and stays hidden.
+    const blocked = buildItem({
+      id: "blk",
+      sourceKind: "blocker_attention",
+      inlineResolvable: false,
+    });
+    expect(isAwaitingOperator(blocked)).toBe(false);
+  });
+
+  it("counts an approval as awaiting even when it cannot be resolved inline", () => {
+    // It still needs the operator, it just has to be opened first -- so it
+    // belongs on the desk, unlike anything isInlineResolvable would keep.
+    const item = buildItem({ id: "ap2", sourceKind: "approval", inlineResolvable: false });
+    expect(isInlineResolvable(item)).toBe(false);
+    expect(isAwaitingOperator(item)).toBe(true);
+  });
 
   it("returns everything when no filters are active", () => {
     expect(filterAttentionItems(items, defaultAttentionFilterState)).toHaveLength(2);

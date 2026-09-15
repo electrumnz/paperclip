@@ -35,6 +35,11 @@ export const instanceGeneralSettingsSchema = z.object({
   // Execution policy. Absent/"any" = unrestricted; "kubernetes" forces the
   // Kubernetes sandbox provider and denies local/ssh execution (cloud_tenant).
   executionMode: z.enum(["kubernetes", "any"]).optional(),
+  // Company a fresh browser opens on, before anyone has chosen one. Without
+  // it the UI falls back to whichever company the API happened to list first,
+  // which on a multi-company instance is arbitrary and differs per device.
+  // A stale id is ignored rather than honoured, so deleting the company is safe.
+  defaultCompanyId: z.string().guid().nullable().optional(),
 }).strict();
 
 export const patchInstanceGeneralSettingsSchema = z

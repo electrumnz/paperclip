@@ -23,6 +23,7 @@ const BOARD_ROUTE_ROOTS = new Set([
   "decisions",
   "inbox",
   "board-chat",
+  "chair-chat",
   "artifacts",
   "u",
   "design-guide",

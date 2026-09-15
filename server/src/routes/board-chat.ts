@@ -7,6 +7,7 @@ import type { Db } from "@paperclipai/db";
 import type { DeploymentMode } from "@paperclipai/shared";
 import { instanceSettingsService, issueService } from "../services/index.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
+import { resolveBoardChatProvider } from "../services/board-chat-provider.js";
 
 /**
  * Strip structured action signals (`%%ACTIONS%%{...}%%/ACTIONS%%`) from a
@@ -223,21 +224,14 @@ export function boardChatRoutes(
     const serverPort = req.socket?.localPort ?? 3100;
     const apiUrl = `http://${serverAddr}:${serverPort}`;
 
-    const args = [
-      "-p",
-      "-",
-      "--output-format",
-      "stream-json",
-      // Emit content_block_delta events so the UI renders token-by-token
-      // rather than a single block once the whole turn completes.
-      "--include-partial-messages",
-      "--verbose",
-      "--append-system-prompt",
-      systemPrompt,
-      "--model",
-      "sonnet",
-      "--dangerously-skip-permissions",
-    ];
+    // Which CLI answers board chat is configuration, not a constant — see
+    // services/board-chat-provider.ts. Claude takes the skill as a system
+    // prompt; providers without that flag receive it on stdin instead.
+    const provider = resolveBoardChatProvider();
+    const args =
+      provider.id === "claude"
+        ? [...provider.args, "--append-system-prompt", systemPrompt]
+        : [...provider.args];
 
     liveBoardChats += 1;
     let slotReleased = false;
@@ -247,7 +241,7 @@ export function boardChatRoutes(
       liveBoardChats -= 1;
     };
 
-    const proc = spawn("claude", args, {
+    const proc = spawn(provider.command, args, {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: "/tmp",
       env: {
@@ -285,18 +279,9 @@ export function boardChatRoutes(
       }
     };
 
-    const writeToolStatus = (toolName: string) => {
+    // Wording is the provider's job — tool vocabularies differ between CLIs.
+    const writeToolStatus = (statusText: string) => {
       if (!res.writable) return;
-      let statusText: string;
-      if (toolName === "Bash" || toolName === "bash") {
-        statusText = "Running a command...";
-      } else if (toolName === "Read" || toolName === "read") {
-        statusText = "Reading a file...";
-      } else if (toolName === "Grep" || toolName === "grep") {
-        statusText = "Searching...";
-      } else {
-        statusText = `Using ${toolName}...`;
-      }
       res.write(`data: ${JSON.stringify({ type: "status", text: statusText })}\n\n`);
     };
 
@@ -320,29 +305,14 @@ export function boardChatRoutes(
           continue; // Not JSON — skip.
         }
 
-        // Unwrap partial-message stream events.
-        const inner = event.type === "stream_event" ? event.event : event;
-        if (!inner || typeof inner !== "object") continue;
-
-        if (inner.type === "content_block_delta" && inner.delta?.text) {
+        // The provider owns its vendor's event shape; this loop only moves
+        // text and status onto the wire.
+        const update = provider.parseEvent(event);
+        for (const chunk of update.chunks) {
           streamedViaDelta = true;
-          writeChunk(inner.delta.text);
-        } else if (
-          inner.type === "content_block_start" &&
-          inner.content_block?.type === "tool_use"
-        ) {
-          writeToolStatus(inner.content_block.name ?? "working");
-        } else if (event.type === "assistant" && event.message?.content) {
-          // Only consume the full message if we never streamed deltas
-          // (otherwise it would duplicate the already-streamed text).
-          if (!streamedViaDelta) {
-            for (const block of event.message.content) {
-              if (block.type === "text" && block.text) writeChunk(block.text);
-            }
-          }
-        } else if (event.type === "result" && event.result && !fullResponse) {
-          writeChunk(event.result);
+          writeChunk(chunk);
         }
+        if (update.status) writeToolStatus(update.status);
       }
     });
 
@@ -396,8 +366,9 @@ export function boardChatRoutes(
       }
     });
 
-    // Feed the prompt to the CLI via stdin.
-    proc.stdin.write(prompt);
+    // Feed the prompt to the CLI via stdin. Providers without a
+    // system-prompt flag get the skill prepended here instead.
+    proc.stdin.write(provider.buildStdin(systemPrompt, prompt));
     proc.stdin.end();
   });
 

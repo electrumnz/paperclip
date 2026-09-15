@@ -114,6 +114,13 @@ describe("company routes", () => {
     expect(extractCompanyPrefixFromPath("/attention")).toBe("ATTENTION");
   });
 
+  it("keeps Chair Chat inside the active company", () => {
+    expect(isBoardPathWithoutPrefix("/chair-chat")).toBe(true);
+    expect(extractCompanyPrefixFromPath("/chair-chat")).toBeNull();
+    expect(applyCompanyPrefix("/chair-chat", "PAP")).toBe("/PAP/chair-chat");
+    expect(toCompanyRelativePath("/PAP/chair-chat")).toBe("/chair-chat");
+  });
+
   it("treats /timeline as a board route that needs a company prefix", () => {
     expect(isBoardPathWithoutPrefix("/timeline")).toBe(true);
     expect(extractCompanyPrefixFromPath("/timeline")).toBeNull();

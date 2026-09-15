@@ -19,7 +19,9 @@ import {
   defaultAttentionFilterState,
   filterAttentionItems,
   groupAttentionItems,
+  isAwaitingOperator,
   isInlineResolvable,
+  loadAttentionActionableOnly,
   loadAttentionFilters,
   loadAttentionGroupBy,
   loadAttentionSortOrder,
@@ -27,6 +29,7 @@ import {
   buildDeskShelves,
   planAttentionRenderRows,
   resolveAttentionDateRange,
+  saveAttentionActionableOnly,
   saveAttentionFilters,
   saveAttentionGroupBy,
   saveAttentionSortOrder,
@@ -102,6 +105,7 @@ export function WhatNeedsMe() {
   const [groupBy, setGroupBy] = useState<AttentionGroupBy>(() => loadAttentionGroupBy());
   const [sortOrder, setSortOrder] = useState<AttentionSortOrder>(() => loadAttentionSortOrder());
   const [filters, setFilters] = useState<AttentionFilterState>(() => defaultAttentionFilterState);
+  const [actionableOnly, setActionableOnly] = useState<boolean>(() => loadAttentionActionableOnly(null));
   const [collapsedGroupKeys, setCollapsedGroupKeys] = useState<Set<string>>(() => new Set());
   const [snoozedOpen, setSnoozedOpen] = useState(false);
   const [dismissedOpen, setDismissedOpen] = useState(false);
@@ -135,12 +139,13 @@ export function WhatNeedsMe() {
   );
 
   useEffect(() => {
-    setBreadcrumbs([{ label: "Decisions" }]);
+    setBreadcrumbs([{ label: "Approvals & questions" }]);
   }, [setBreadcrumbs]);
 
   // Re-hydrate per-company preferences when the company changes.
   useEffect(() => {
     setFilters(loadAttentionFilters(selectedCompanyId));
+    setActionableOnly(loadAttentionActionableOnly(selectedCompanyId));
     setCollapsedGroupKeys(loadCollapsedAttentionGroupKeys(selectedCompanyId));
   }, [selectedCompanyId]);
 
@@ -227,7 +232,18 @@ export function WhatNeedsMe() {
   // Aging shelf (§4.4): items the server flags as idle past retention leave the
   // live desk for their own curtain, so today's desk shows only fresh decisions.
   const agingItems = useMemo(() => activeItems.filter(attentionIsAging), [activeItems]);
-  const deskItems = useMemo(() => activeItems.filter((item) => !attentionIsAging(item)), [activeItems]);
+  const freshItems = useMemo(() => activeItems.filter((item) => !attentionIsAging(item)), [activeItems]);
+  // Rows that report on the org rather than ask the operator for a decision —
+  // blocked dependencies, recovery actions, failed runs, budget alerts. Hidden
+  // by default so the desk answers "what is waiting on me", not "what is wrong".
+  const informationalItems = useMemo(
+    () => freshItems.filter((item) => !isAwaitingOperator(item)),
+    [freshItems],
+  );
+  const deskItems = useMemo(
+    () => (actionableOnly ? freshItems.filter(isAwaitingOperator) : freshItems),
+    [freshItems, actionableOnly],
+  );
   const snoozedItems = useMemo(
     () =>
       allItems.filter(
@@ -395,6 +411,11 @@ export function WhatNeedsMe() {
     setSortOrder(next);
     saveAttentionSortOrder(next);
   };
+  const updateActionableOnly = (next: boolean) => {
+    setActionableOnly(next);
+    saveAttentionActionableOnly(selectedCompanyId, next);
+  };
+
   const updateFilters = (next: AttentionFilterState) => {
     setFilters(next);
     saveAttentionFilters(selectedCompanyId, next);
@@ -519,7 +540,12 @@ export function WhatNeedsMe() {
   return (
     <div ref={rootRef} className="max-w-3xl space-y-4">
       <div className="flex items-center justify-between gap-2">
-        <h1 className="text-xl font-bold">Decisions</h1>
+        <div>
+          <h1 className="text-xl font-bold">Approvals &amp; questions</h1>
+          <p className="mt-0.5 text-sm text-muted-foreground">
+            Everything waiting for your answer, across every agent and task.
+          </p>
+        </div>
         <DecisionsToolbar
           visibleCount={visibleCount}
           filterOptions={filterOptions}
@@ -531,6 +557,39 @@ export function WhatNeedsMe() {
           onSortOrderChange={updateSortOrder}
         />
       </div>
+
+      {/* The desk hides rows that report on the org rather than ask the
+          operator for a decision. This has to read as a stated choice with a
+          way back: an empty desk beside thirty silently-dropped blockers looks
+          like data loss, not a filter. Rendered as its own row rather than
+          trailing the toolbar so it survives a narrow mobile layout. */}
+      {(actionableOnly ? informationalItems.length > 0 : true) && (
+        <button
+          type="button"
+          onClick={() => updateActionableOnly(!actionableOnly)}
+          aria-pressed={actionableOnly}
+          className="flex w-full items-center gap-2 rounded-md border border-dashed border-border bg-muted/30 px-3 py-2 text-left text-xs text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
+        >
+          {actionableOnly ? (
+            <>
+              <span className="inline-flex h-5 min-w-5 items-center justify-center rounded-full bg-muted px-1.5 font-medium text-foreground tabular-nums">
+                {informationalItems.length}
+              </span>
+              <span>
+                hidden — blocked dependencies and recovery notices you cannot action.
+                <span className="ml-1 underline underline-offset-2">Show them</span>
+              </span>
+            </>
+          ) : (
+            <span>
+              Showing everything, including items you cannot action.
+              <span className="ml-1 underline underline-offset-2">
+                Show only what is waiting on me
+              </span>
+            </span>
+          )}
+        </button>
+      )}
 
       {/* Queue quicklinks + date-range chips (§4.1–§4.2). The rail self-hides
           when the company has no queues; the chips filter the desk server-side. */}

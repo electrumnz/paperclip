@@ -88,14 +88,10 @@ export function Sidebar() {
   const showStatusCards = experimentalSettings?.enableStatusCards === true;
   const goalsLinkPending = experimentalSettings === undefined;
   const showGoalsLink = experimentalSettings?.enableGoalsSidebarLink === true;
-  // Decisions (attention home) is an experimental surface (PAP-13481): the nav
-  // item is hidden entirely until the flag is enabled (same no-flash pattern as
-  // showWorkspacesLink — it defaults hidden, so no placeholder is needed).
-  const showDecisions = experimentalSettings?.enableDecisions === true;
   const { data: attentionFeed } = useQuery({
     queryKey: queryKeys.attention(selectedCompanyId!),
     queryFn: () => attentionApi.list(selectedCompanyId!),
-    enabled: !!selectedCompanyId && showDecisions,
+    enabled: !!selectedCompanyId,
     refetchInterval: 60_000,
   });
   const attentionCount = attentionBadgeCount(attentionFeed);
@@ -106,10 +102,6 @@ export function Sidebar() {
   // user-selectable. Kept as a constant so the classic branch below stays as a
   // documented reference until it is fully removed. Routes are unaffected.
   const streamlined = true;
-  // Conference Room Chat flag (PAP-136/PAP-137): the Conference Room nav item
-  // is a new surface, hidden entirely while the flag is off (same no-flash
-  // pattern as showWorkspacesLink above).
-  const conferenceRoomChatEnabled = experimentalSettings?.enableConferenceRoomChat === true;
 
   const pluginContext = {
     companyId: selectedCompanyId,
@@ -207,21 +199,17 @@ export function Sidebar() {
             badgeTone={inboxBadge.failedRuns > 0 ? "danger" : "default"}
             alert={inboxBadge.failedRuns > 0}
           />
-          {showDecisions ? (
-            <SidebarNavItem
-              to="/decisions"
-              label="Decisions"
-              icon={ListChecks}
-              badge={attentionCount}
-              badgeLabel="decisions"
-            />
-          ) : null}
+          <SidebarNavItem
+            to="/decisions"
+            label="Approvals"
+            icon={ListChecks}
+            badge={attentionCount}
+            badgeLabel="approvals and questions"
+          />
           {showStatusCards ? (
             <SidebarNavItem to="/status" label="Status" icon={LayoutGrid} textBadge="beta" />
           ) : null}
-          {conferenceRoomChatEnabled ? (
-            <SidebarNavItem to="/board-chat" label="Conference Room" icon={MessagesSquare} />
-          ) : null}
+          <SidebarNavItem to="/chair-chat" label="Chair Chat" icon={MessagesSquare} />
         </div>
 
         <SidebarSection label="Work" collapsible={{ open: workOpen, onOpenChange: setWorkOpen }}>

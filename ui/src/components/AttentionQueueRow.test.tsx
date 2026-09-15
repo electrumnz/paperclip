@@ -11,7 +11,11 @@ import { ApiError } from "../api/client";
 import { issuesApi } from "../api/issues";
 import { ToastViewport } from "./ToastViewport";
 import { ToastProvider } from "../context/ToastContext";
-import { AttentionQueueRow } from "./AttentionQueueRow";
+import {
+  AttentionQueueRow,
+  approvalResponseOptions,
+  buildApprovalDecisionNote,
+} from "./AttentionQueueRow";
 
 vi.mock("@/lib/router", () => ({
   Link: ({ children, to, ...props }: AnchorHTMLAttributes<HTMLAnchorElement> & { to: string }) => (
@@ -21,6 +25,7 @@ vi.mock("@/lib/router", () => ({
 
 vi.mock("../api/approvals", () => ({
   approvalsApi: {
+    get: vi.fn(() => new Promise(() => {})),
     approve: vi.fn(),
     reject: vi.fn(),
     requestRevision: vi.fn(),
@@ -134,6 +139,83 @@ function buildItem(overrides: Partial<AttentionItem> = {}): AttentionItem {
 const noop = () => {};
 
 describe("AttentionQueueRow", () => {
+  it("turns board request options into readable responses and records the chosen value", () => {
+    const options = approvalResponseOptions({
+      options: [
+        "grant_agents_configure",
+        { value: "apply_by_hand", label: "Apply it myself", description: "Keep agent settings unchanged." },
+        { id: "stand_down" },
+        null,
+      ],
+    });
+
+    expect(options).toEqual([
+      { value: "grant_agents_configure", label: "Grant agents configure", description: null },
+      { value: "apply_by_hand", label: "Apply it myself", description: "Keep agent settings unchanged." },
+      { value: "stand_down", label: "Stand down", description: null },
+    ]);
+    expect(buildApprovalDecisionNote(options, "apply_by_hand", "Please do this today.")).toBe(
+      "Selected response: Apply it myself [apply_by_hand]\n\nPlease do this today.",
+    );
+  });
+
+  it("makes a board approval reveal its request before offering a decision", () => {
+    const el = render(
+      <AttentionQueueRow
+        item={buildItem({
+          subject: {
+            kind: "approval",
+            id: "approval-1",
+            companyId: "c1",
+            title: "Choose an agent configuration",
+            identifier: null,
+            status: "pending",
+            href: "/PAP/approvals/approval-1",
+            metadata: { type: "request_board_approval" },
+          },
+          decisionVerbs: [
+            { id: "approve", label: "Approve", description: null },
+            { id: "reject", label: "Reject", description: null },
+          ],
+        })}
+        companyId="c1"
+        expanded={false}
+        onToggleExpand={noop}
+        onDismiss={noop}
+      />,
+    );
+
+    expect(el.textContent).toContain("Show request");
+    expect(el.textContent).not.toContain("Approve");
+    expect(el.textContent).not.toContain("Open");
+  });
+
+  it("names a structured interaction as a question", () => {
+    const el = render(
+      <AttentionQueueRow
+        item={buildItem({
+          sourceKind: "issue_thread_interaction",
+          subject: {
+            kind: "interaction",
+            id: "interaction-1",
+            companyId: "c1",
+            title: "Which rollout should we use?",
+            identifier: null,
+            status: "pending",
+            href: "/PAP/issues/issue-1#interaction-interaction-1",
+            metadata: { kind: "ask_user_questions", issueId: "issue-1" },
+          },
+        })}
+        companyId="c1"
+        expanded={false}
+        onToggleExpand={noop}
+        onDismiss={noop}
+      />,
+    );
+
+    expect(el.textContent).toContain("Show question");
+  });
+
   it("renders an inline approval resolver when expanded", () => {
     const el = render(
       <AttentionQueueRow
@@ -343,7 +425,7 @@ describe("AttentionQueueRow", () => {
       />,
     );
 
-    const chevronButton = container?.querySelector('button[aria-label="Expand decision"]');
+    const chevronButton = container?.querySelector('button[aria-label="Show request"]');
     expect(chevronButton).toBeTruthy();
     expect(chevronButton?.getAttribute("aria-expanded")).toBe("false");
     act(() => chevronButton?.dispatchEvent(new MouseEvent("click", { bubbles: true })));

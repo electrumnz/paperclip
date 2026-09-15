@@ -1,18 +1,21 @@
 import { useMemo } from "react";
-import { NavLink, useLocation } from "@/lib/router";
+import { NavLink } from "@/lib/router";
 import {
   House,
   CircleDot,
-  SquarePen,
-  Users,
   Inbox,
+  ListChecks,
+  MessagesSquare,
 } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import { useCompany } from "../context/CompanyContext";
-import { useDialogActions } from "../context/DialogContext";
 import { SIDEBAR_SCROLL_RESET_STATE } from "../lib/navigation-scroll";
 import { cn } from "../lib/utils";
 import { useInboxBadge } from "../hooks/useInboxBadge";
 import { Badge } from "@/components/ui/badge";
+import { attentionApi } from "../api/attention";
+import { attentionBadgeCount } from "../lib/attention";
+import { queryKeys } from "../lib/queryKeys";
 
 interface MobileBottomNavProps {
   visible: boolean;
@@ -26,27 +29,31 @@ interface MobileNavLinkItem {
   badge?: number;
 }
 
-interface MobileNavActionItem {
-  type: "action";
-  label: string;
-  icon: typeof SquarePen;
-  onClick: () => void;
-}
-
-type MobileNavItem = MobileNavLinkItem | MobileNavActionItem;
+type MobileNavItem = MobileNavLinkItem;
 
 export function MobileBottomNav({ visible }: MobileBottomNavProps) {
-  const location = useLocation();
   const { selectedCompanyId } = useCompany();
-  const { openNewIssue } = useDialogActions();
   const inboxBadge = useInboxBadge(selectedCompanyId);
+  const { data: attentionFeed } = useQuery({
+    queryKey: queryKeys.attention(selectedCompanyId!),
+    queryFn: () => attentionApi.list(selectedCompanyId!),
+    enabled: !!selectedCompanyId,
+    refetchInterval: 60_000,
+  });
+  const approvalsBadge = attentionBadgeCount(attentionFeed);
 
   const items = useMemo<MobileNavItem[]>(
     () => [
       { type: "link", to: "/dashboard", label: "Home", icon: House },
       { type: "link", to: "/issues", label: "Tasks", icon: CircleDot },
-      { type: "action", label: "Create", icon: SquarePen, onClick: () => openNewIssue() },
-      { type: "link", to: "/agents/all", label: "Agents", icon: Users },
+      { type: "link", to: "/chair-chat", label: "Chat", icon: MessagesSquare },
+      {
+        type: "link",
+        to: "/decisions",
+        label: "Approvals",
+        icon: ListChecks,
+        badge: approvalsBadge,
+      },
       {
         type: "link",
         to: "/inbox",
@@ -55,7 +62,7 @@ export function MobileBottomNav({ visible }: MobileBottomNavProps) {
         badge: inboxBadge.inbox,
       },
     ],
-    [openNewIssue, inboxBadge.inbox],
+    [approvalsBadge, inboxBadge.inbox],
   );
 
   return (
@@ -68,27 +75,6 @@ export function MobileBottomNav({ visible }: MobileBottomNavProps) {
     >
       <div className="grid h-16 grid-cols-5 px-1">
         {items.map((item) => {
-          if (item.type === "action") {
-            const Icon = item.icon;
-            const active = /\/issues\/new(?:\/|$)/.test(location.pathname);
-            return (
-              <button
-                key={item.label}
-                type="button"
-                onClick={item.onClick}
-                className={cn(
-                  "relative flex min-w-0 flex-col items-center justify-center gap-1 rounded-md text-(length:--text-nano) font-medium transition-colors",
-                  active
-                    ? "text-foreground"
-                    : "text-muted-foreground hover:text-foreground",
-                )}
-              >
-                <Icon className="h-(--sz-18px) w-(--sz-18px)" />
-                <span className="truncate">{item.label}</span>
-              </button>
-            );
-          }
-
           const Icon = item.icon;
           return (
             <NavLink

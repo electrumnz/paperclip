@@ -206,6 +206,11 @@ function normalizeGeneralSettings(raw: unknown): InstanceGeneralSettings {
       backupRetention: parsed.data.backupRetention ?? DEFAULT_BACKUP_RETENTION,
       // Absent => unrestricted; only carry through an explicit policy.
       ...(parsed.data.executionMode ? { executionMode: parsed.data.executionMode } : {}),
+      // Absent => fall back to list order in the UI. Carried through only when
+      // set, so an unset instance stores nothing rather than an explicit null.
+      ...(parsed.data.defaultCompanyId
+        ? { defaultCompanyId: parsed.data.defaultCompanyId }
+        : {}),
     };
   }
   return {

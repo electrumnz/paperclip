@@ -90,7 +90,7 @@ function TypingBubble() {
           "bg-card border border-border text-foreground [border-radius:14px_14px_14px_4px]",
         )}
       >
-        <span className="typing-dots" aria-label="typing">
+        <span className="typing-dots" aria-label="Typing" role="status">
           <span />
           <span />
           <span />
@@ -106,7 +106,7 @@ export function BoardChat() {
   const queryClient = useQueryClient();
 
   useEffect(() => {
-    setBreadcrumbs([{ label: "Conference Room" }]);
+    setBreadcrumbs([{ label: "Chair Chat" }]);
   }, [setBreadcrumbs]);
 
   const splitContainerRef = useRef<HTMLDivElement>(null);
@@ -279,10 +279,15 @@ export function BoardChat() {
     enabled: !!selectedCompanyId,
   });
 
-  const ceoAgent = useMemo(
-    () => agents?.find((a) => a.role === "ceo" && a.status !== "terminated"),
-    [agents],
-  );
+  // Board chat speaks for the top of the org chart — the agent nobody reports
+  // through. That is the Chair, not whoever happens to hold the `ceo` role:
+  // the CEO runs delivery, while this surface is where Sam brings progress
+  // questions and new work. Fall back to the `ceo` role for companies whose
+  // chart has no single root.
+  const boardAgent = useMemo(() => {
+    const live = agents?.filter((a) => a.status !== "terminated") ?? [];
+    return live.find((a) => !a.reportsTo) ?? live.find((a) => a.role === "ceo");
+  }, [agents]);
 
   // Pull the company's top-level goal so the CEO's welcome can reference
   // the mission verbatim.
@@ -403,7 +408,7 @@ export function BoardChat() {
   // needed to render the welcome bubble. This guarantees the animation is
   // visible at the moment the user arrives, even if agent/goal queries
   // take a beat to resolve.
-  const canRenderWelcome = !!ceoAgent && !!selectedCompany;
+  const canRenderWelcome = !!boardAgent && !!selectedCompany;
   useEffect(() => {
     if (!canRenderWelcome) return;
     if (welcomeRevealed) return;
@@ -660,7 +665,7 @@ export function BoardChat() {
         <div className="text-center max-w-sm">
           <h2 className="text-lg font-semibold">No organization selected</h2>
           <p className="text-sm text-muted-foreground mt-2">
-            Select an organization to start chatting with your board concierge.
+            Select an organization to start chatting with its Chair.
           </p>
         </div>
       </div>
@@ -688,9 +693,9 @@ export function BoardChat() {
               aria-hidden
             />
             <div className="min-w-0 flex-1">
-              <h3 className="text-sm font-semibold">
-                {ceoAgent?.name ?? "Conference Room"}
-              </h3>
+              <h2 className="text-sm font-semibold">
+                {boardAgent?.name ?? "Conference Room"}
+              </h2>
               <p className="text-xs text-muted-foreground">
                 {selectedCompany?.name ?? "Your organization"}
               </p>
@@ -740,14 +745,14 @@ export function BoardChat() {
                    visible even while agent/goal data is still loading. */}
               {!welcomeRevealed && <TypingBubble />}
 
-              {welcomeRevealed && ceoAgent && selectedCompany && (() => {
-                const ceoName = ceoAgent.name;
+              {welcomeRevealed && boardAgent && selectedCompany && (() => {
+                const boardAgentName = boardAgent.name;
                 const companyName = selectedCompany.name;
                 const missionLine = missionText
                   ? ` — your mission is "${missionText}".`
                   : ".";
                 const welcomeBody =
-                  `Welcome to **${companyName}**! I'm ${ceoName}, your team lead. I've read through what you shared in the wizard${missionLine}\n\n` +
+                  `Welcome to **${companyName}**! I'm ${boardAgentName}, your team lead. I've read through what you shared in the wizard${missionLine}\n\n` +
                   `Here are a few things I can help you put on paper right now. Pick one below and I'll draft it for you using everything you told us.`;
 
                 const userHasReplied = sortedComments.some(
@@ -776,7 +781,7 @@ export function BoardChat() {
                 return (
                   <>
                     <div className="flex flex-col items-start">
-                      <AgentBubbleHeader name={ceoName} icon={ceoAgent.icon} />
+                      <AgentBubbleHeader name={boardAgentName} icon={boardAgent.icon} />
                       <div
                         className={cn(
                           boardChatBubbleShell,
@@ -828,7 +833,7 @@ export function BoardChat() {
                 // the room speaks the same bubble language as the task thread.
                 const agent = comment.authorAgentId
                   ? agentMap.get(comment.authorAgentId) ?? null
-                  : ceoAgent ?? null;
+                  : boardAgent ?? null;
                 const agentName = agent?.name ?? "Assistant";
                 const agentIconValue = agent?.icon ?? null;
                 return (
@@ -882,8 +887,8 @@ export function BoardChat() {
               {/* Streaming response */}
               {streamingText && (
                 <div className="flex flex-col items-start">
-                  {ceoAgent && (
-                    <AgentBubbleHeader name={ceoAgent.name} icon={ceoAgent.icon} />
+                  {boardAgent && (
+                    <AgentBubbleHeader name={boardAgent.name} icon={boardAgent.icon} />
                   )}
                   <div
                     className={cn(

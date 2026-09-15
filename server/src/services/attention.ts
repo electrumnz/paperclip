@@ -88,6 +88,29 @@ const SEVERITY_RANK: Record<AttentionSeverity, number> = {
   low: 3,
 };
 
+/**
+ * Kinds that are a decision the operator owns, even when the row carries no
+ * inline action and has to be opened first. Mirrors
+ * `INLINE_RESOLVABLE_SOURCE_KINDS` in `ui/src/lib/attention.ts`.
+ */
+const OPERATOR_DECISION_SOURCE_KINDS: ReadonlySet<AttentionSourceKind> = new Set<AttentionSourceKind>([
+  "approval",
+  "decision",
+  "issue_thread_interaction",
+  "join_request",
+  "review",
+]);
+
+/**
+ * True when the row is waiting on the operator rather than reporting on the
+ * org. Blocked dependencies, recovery actions, failed runs and budget alerts
+ * answer false: there is nothing for the operator to decide, so counting them
+ * in the badge promises work that cannot be done.
+ */
+function isAwaitingOperator(item: { sourceKind: AttentionSourceKind; inlineResolvable?: boolean }) {
+  return item.inlineResolvable === true || OPERATOR_DECISION_SOURCE_KINDS.has(item.sourceKind);
+}
+
 const SOURCE_RANK: Record<AttentionSourceKind, number> = {
   failed_run: 0,
   recovery_action: 1,
@@ -1149,7 +1172,11 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
             { id: "reject", label: "Reject", description: "Reject the request." },
             { id: "request_revision", label: "Request revision", description: "Send the request back for changes." },
           ),
-          inlineResolvable: approval.type !== "request_board_approval",
+          // Board requests can carry a real question and structured options.
+          // Keep them on the decisions desk: the expanded row fetches the full
+          // approval, shows its request, and records the selected response in
+          // the approval decision note.
+          inlineResolvable: true,
           entryRule: "approvals.status = 'pending'",
           exitRule: "Approval leaves pending status.",
           dedupKey,
@@ -2057,11 +2084,17 @@ export function attentionService(db: Db, serviceOptions: AttentionServiceOptions
         companyId,
         generatedAt: new Date().toISOString(),
         totalCount: rankedItems.length,
-        // Desk badge: distinct items that surfaced
+        // Desk badge: distinct items *waiting on the operator* that surfaced
         // today OR carry an explicit decide-by deadline due today/past. Counted
         // over the full ranked set (pre-pagination) so the sidebar badge stays
         // company-wide accurate even on a small first page.
-        deskBadgeCount: rankedItems.filter((item) => isNewToday(item, now) || isDecideNow(item, now)).length,
+        //
+        // The awaiting filter matters: an org with a stalled dependency chain
+        // generates dozens of blocker rows, and a badge counting those sends
+        // the operator to a desk with nothing they can action.
+        deskBadgeCount: rankedItems.filter(
+          (item) => isAwaitingOperator(item) && (isNewToday(item, now) || isDecideNow(item, now)),
+        ).length,
         nextCursor,
         countsBySourceKind,
         items,

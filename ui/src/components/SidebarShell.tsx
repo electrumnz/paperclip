@@ -195,7 +195,11 @@ export function SidebarShell({
   );
 
   return (
-    <div className={cn("relative h-full shrink-0", className)} style={reservedStyle}>
+    <aside
+      aria-label="Workspace navigation"
+      className={cn("relative h-full shrink-0", className)}
+      style={reservedStyle}
+    >
       <div
         className={cn(
           "absolute inset-y-0 left-0 flex flex-col overflow-hidden",
@@ -239,6 +243,6 @@ export function SidebarShell({
           />
         ) : null}
       </div>
-    </div>
+    </aside>
   );
 }

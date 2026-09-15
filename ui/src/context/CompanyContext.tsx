@@ -8,9 +8,10 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { Company } from "@paperclipai/shared";
 import { companiesApi } from "../api/companies";
+import { instanceSettingsApi } from "../api/instanceSettings";
 import {
   fetchCompanyListForCurrentAccount,
   useAccountIdentity,
@@ -53,6 +54,12 @@ export function resolveBootstrapCompanySelection(input: {
   sidebarCompanies: Array<Pick<Company, "id">>;
   selectedCompanyId: string | null;
   storedCompanyId: string | null;
+  /**
+   * Instance-wide default (`general.defaultCompanyId`). Used only when this
+   * browser has no stored choice, so an operator's own selection always wins
+   * over the instance default. Ignored when it names a company that is gone.
+   */
+  defaultCompanyId?: string | null;
 }) {
   if (input.companies.length === 0) return null;
 
@@ -72,6 +79,14 @@ export function resolveBootstrapCompanySelection(input: {
   }
   if (input.storedCompanyId && selectableCompanies.some((company) => company.id === input.storedCompanyId)) {
     return input.storedCompanyId;
+  }
+  // Configured default before list order — the latter is whatever the API
+  // returned first, which is arbitrary and varies by device.
+  if (
+    input.defaultCompanyId &&
+    selectableCompanies.some((company) => company.id === input.defaultCompanyId)
+  ) {
+    return input.defaultCompanyId;
   }
   return selectableCompanies[0]?.id ?? null;
 }
@@ -103,6 +118,14 @@ export function shouldClearStoredCompanySelection(input: {
 
 export function CompanyProvider({ children }: { children: ReactNode }) {
   const queryClient = useQueryClient();
+  // Instance-wide opening company. Read once at boot; a failure here must not
+  // block company selection, so the resolver simply falls through to list order.
+  const { data: generalSettings } = useQuery({
+    queryKey: queryKeys.instance.generalSettings,
+    queryFn: () => instanceSettingsApi.getGeneral(),
+    staleTime: 5 * 60 * 1000,
+    retry: false,
+  });
   const [selectionSource, setSelectionSource] = useState<CompanySelectionSource>("bootstrap");
   const [selectedCompanyId, setSelectedCompanyIdState] = useState<string | null>(null);
 
@@ -177,6 +200,7 @@ export function CompanyProvider({ children }: { children: ReactNode }) {
       sidebarCompanies,
       selectedCompanyId,
       storedCompanyId: localStorage.getItem(STORAGE_KEY),
+      defaultCompanyId: generalSettings?.defaultCompanyId ?? null,
     });
     if (next === null || next === selectedCompanyId) return;
     setSelectedCompanyIdState(next);

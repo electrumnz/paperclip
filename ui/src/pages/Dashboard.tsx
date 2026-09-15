@@ -421,7 +421,7 @@ export function Dashboard() {
                 ))}
                 {data.pendingApprovals + data.budgets.pendingApprovals > 0 ? (
                   <Link
-                    to="/approvals"
+                    to="/decisions"
                     className="flex min-h-11 items-center gap-3 px-4 py-3 text-sm no-underline text-inherit transition-colors hover:bg-accent/50"
                   >
                     <ShieldCheck className="h-4 w-4 text-muted-foreground" aria-hidden />
@@ -478,7 +478,7 @@ export function Dashboard() {
               icon={ShieldCheck}
               value={data.pendingApprovals + data.budgets.pendingApprovals}
               label="Pending Approvals"
-              to="/approvals"
+              to="/decisions"
               description={
                 <span>
                   {data.budgets.pendingApprovals > 0
