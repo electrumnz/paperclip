@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import {
   buildQuotaState,
   chooseProvider,
+  chooseProviderDecision,
   chooseProviderWithTelemetry,
   isQuotaFailure,
   mergeRuntimePolicy,
@@ -12,12 +13,15 @@ import {
   optimizedClaudeConfig,
   preferredProvider,
   providerForAgent,
+  quotaFailureKind,
   QuotaAwareAgentRouter,
   routableAgents,
+  sortAgentsManagersFirst,
   stabilizeQuotaState,
   summarizeQuota,
   targetConfig,
   withObservedProviderFailure,
+  withObservedSessionWindowFailure,
 } from "./quota-aware-agent-router.mjs";
 
 test("Claude is blocked when either the current-session or weekly window is exhausted", () => {
@@ -41,7 +45,233 @@ test("Claude is also blocked when only the five-hour session window is exhausted
     ],
   });
   assert.equal(quota.hardBlocked, true);
+  assert.equal(quota.sessionWindowHardBlocked, true);
+  assert.equal(quota.fallbackHardBlocked, false);
   assert.equal(quota.limitingWindows[0].label, "Current session");
+});
+
+test("five-hour session pressure holds the primary account instead of consuming fallback", () => {
+  const quota = buildQuotaState([
+    {
+      provider: "anthropic",
+      ok: true,
+      windows: [
+        { label: "Current session", usedPercent: 95, resetsAt: "2099-01-01T00:00:00Z" },
+        { label: "Current week (all models)", usedPercent: 25 },
+      ],
+    },
+    {
+      provider: "anthropic_personal",
+      ok: true,
+      windows: [{ label: "Current session", usedPercent: 10 }],
+    },
+  ], 5);
+  assert.deepEqual(chooseProviderDecision({ preferred: "anthropic", quota }), {
+    target: null,
+    holdProvider: "anthropic",
+  });
+  assert.deepEqual(chooseProviderDecision({ preferred: "anthropic", quota, urgent: true }), {
+    target: null,
+    holdProvider: "anthropic",
+  });
+  assert.equal(quota.anthropic.sessionWindowResetsAt, "2099-01-01T00:00:00.000Z");
+});
+
+test("weekly pressure still advances from Keece Claude to Electrum Claude", () => {
+  const quota = buildQuotaState([
+    {
+      provider: "anthropic",
+      ok: true,
+      windows: [
+        { label: "Current session", usedPercent: 15 },
+        { label: "Current week (all models)", usedPercent: 95 },
+      ],
+    },
+    {
+      provider: "anthropic_personal",
+      ok: true,
+      windows: [{ label: "Current session", usedPercent: 10 }],
+    },
+  ], 5);
+  assert.equal(chooseProvider({ preferred: "anthropic", quota }), "anthropic_personal");
+});
+
+test("a five-hour limit on the weekly fallback account holds there", () => {
+  const quota = buildQuotaState([
+    {
+      provider: "anthropic",
+      ok: true,
+      windows: [{ label: "Current week (all models)", usedPercent: 95 }],
+    },
+    {
+      provider: "anthropic_personal",
+      ok: true,
+      windows: [
+        { label: "Current session", usedPercent: 95 },
+        { label: "Current week (all models)", usedPercent: 30 },
+      ],
+    },
+  ], 5);
+  assert.deepEqual(chooseProviderDecision({ preferred: "anthropic", quota }), {
+    target: null,
+    holdProvider: "anthropic_personal",
+  });
+});
+
+test("a company tick pauses an idle agent at the five-hour reserve without switching accounts", async () => {
+  const calls = [];
+  const agent = {
+    id: "agent-1",
+    companyId: "company-1",
+    name: "Coder",
+    role: "engineer",
+    status: "idle",
+    adapterType: "claude_local",
+    adapterConfig: {
+      model: "claude-sonnet-5",
+      effort: "medium",
+      env: { CLAUDE_CONFIG_DIR: "/tmp/work-claude" },
+    },
+    runtimeConfig: {
+      heartbeat: { maxConcurrentRuns: 1 },
+      modelProfiles: {
+        cheap: {
+          enabled: true,
+          adapterConfig: { model: "claude-haiku-4-5", effort: "low" },
+        },
+      },
+    },
+  };
+  class SessionHoldRouter extends QuotaAwareAgentRouter {
+    async claudeQuotaEntries() {
+      return [{
+        provider: "anthropic",
+        ok: true,
+        windows: [
+          { label: "Current session", usedPercent: 95, resetsAt: "2099-01-01T00:00:00Z" },
+          { label: "Current week (all models)", usedPercent: 20 },
+        ],
+      }];
+    }
+
+    async api(pathname, options = {}) {
+      calls.push({ pathname, method: options.method ?? "GET" });
+      if (pathname.endsWith("/agents")) return [agent];
+      if (pathname.includes("/issues?")) return [];
+      if (pathname.endsWith("/costs/quota-windows")) {
+        return [{
+          provider: "anthropic",
+          ok: true,
+          windows: [{ label: "Current session", usedPercent: 10 }],
+        }];
+      }
+      if (pathname.endsWith("/live-runs?limit=200")) return [];
+      if (pathname.includes("/heartbeat-runs?")) return [];
+      if (pathname === "/agents/agent-1/pause") return { ...agent, status: "paused" };
+      throw new Error(`Unexpected API call: ${options.method ?? "GET"} ${pathname}`);
+    }
+
+    async saveState() {}
+    async log() {}
+  }
+  const router = new SessionHoldRouter({
+    statePath: "/tmp/unused",
+    logPath: "/tmp/unused.log",
+    reservePercent: 10,
+    reservePercentByProvider: { anthropic: 5 },
+    defaultPrimaryProvider: "anthropic",
+    claudeProfiles: {
+      anthropic: { configDir: "/tmp/work-claude" },
+      anthropic_personal: { configDir: "/tmp/personal-claude" },
+    },
+    cheapProfile: { enabled: true, model: "claude-haiku-4-5", effort: "low" },
+  });
+  await router.tickCompany({ id: "company-1", name: "Company" });
+  assert.equal(calls.some((call) => call.pathname === "/agents/agent-1/pause"), true);
+  assert.equal(calls.some((call) => call.pathname === "/agents/agent-1" && call.method === "PATCH"), false);
+  assert.equal(router.state.agents[agent.id].sessionWindowHold.provider, "anthropic");
+});
+
+test("a router-owned session hold resumes and retries its task after reset", async () => {
+  const calls = [];
+  class SessionReleaseRouter extends QuotaAwareAgentRouter {
+    async api(pathname, options = {}) {
+      calls.push({ pathname, method: options.method ?? "GET", body: options.body ?? null });
+      if (pathname === "/agents/agent-1/resume") {
+        return { id: "agent-1", companyId: "company-1", name: "Coder", status: "idle" };
+      }
+      if (pathname === "/agents/agent-1/wakeup") return { status: "queued" };
+      throw new Error(`Unexpected API call: ${options.method ?? "GET"} ${pathname}`);
+    }
+
+    async saveState() {}
+    async log() {}
+  }
+  const router = new SessionReleaseRouter({ statePath: "/tmp/unused", logPath: "/tmp/unused.log" });
+  const state = {
+    sessionWindowHold: {
+      provider: "anthropic",
+      resetsAt: "2099-01-01T00:00:00.000Z",
+      issueId: "issue-1",
+      run: null,
+    },
+  };
+  const released = await router.releaseAgentSessionWindowHold(
+    { id: "company-1", name: "Company" },
+    { id: "agent-1", companyId: "company-1", name: "Coder", status: "paused" },
+    state,
+    state.sessionWindowHold,
+    { id: "issue-1", identifier: "KEE-1", status: "todo" },
+  );
+  assert.equal(released.status, "idle");
+  assert.equal(state.sessionWindowHold, undefined);
+  assert.deepEqual(calls.map((call) => [call.method, call.pathname]), [
+    ["POST", "/agents/agent-1/resume"],
+    ["POST", "/agents/agent-1/wakeup"],
+  ]);
+  assert.match(calls[1].body, /claude_five_hour_window_reset/);
+});
+
+test("session holds and releases process managers before their reports", () => {
+  const agents = [
+    { id: "coder", reportsTo: "lead" },
+    { id: "chair", reportsTo: null },
+    { id: "lead", reportsTo: "chair" },
+    { id: "peer", reportsTo: "chair" },
+  ];
+  const positions = Object.fromEntries(
+    sortAgentsManagersFirst(agents).map((agent, index) => [agent.id, index]),
+  );
+  assert.ok(positions.chair < positions.lead);
+  assert.ok(positions.chair < positions.peer);
+  assert.ok(positions.lead < positions.coder);
+});
+
+test("a held child stays paused when a manually paused manager blocks its release", async () => {
+  class BlockedReleaseRouter extends QuotaAwareAgentRouter {
+    async api(pathname) {
+      throw new Error(`POST ${pathname} returned 409: reporting chain is paused`);
+    }
+
+    async saveState() {
+      throw new Error("state must not be cleared");
+    }
+
+    async log() {}
+  }
+  const router = new BlockedReleaseRouter({ statePath: "/tmp/unused", logPath: "/tmp/unused.log" });
+  const hold = { provider: "anthropic", resetsAt: "2099-01-01T00:00:00Z" };
+  const state = { sessionWindowHold: hold };
+  const agent = { id: "child", companyId: "company-1", name: "Child", status: "paused" };
+  const result = await router.releaseAgentSessionWindowHold(
+    { id: "company-1", name: "Company" },
+    agent,
+    state,
+    hold,
+    null,
+  );
+  assert.equal(result, agent);
+  assert.equal(state.sessionWindowHold, hold);
 });
 
 test("Keece Claude falls back only to Electrum Claude", () => {
@@ -168,10 +398,53 @@ test("Grok OAuth failures are treated as provider-unavailable failures", () => {
 });
 
 test("generic 401 authentication failures trigger provider fallback", () => {
-  assert.equal(isQuotaFailure({
+  const failure = {
     errorCode: "acpx_turn_failed",
     log: "Upstream request failed with HTTP 401 Unauthorized",
-  }), true);
+  };
+  assert.equal(isQuotaFailure(failure), true);
+  assert.equal(quotaFailureKind(failure), "authentication");
+});
+
+test("observed five-hour failures are held without poisoning weekly fallback", () => {
+  const quota = buildQuotaState([
+    {
+      provider: "anthropic",
+      ok: true,
+      windows: [
+        { label: "Current session", usedPercent: 94 },
+        { label: "Current week (all models)", usedPercent: 20 },
+      ],
+    },
+    {
+      provider: "anthropic_personal",
+      ok: true,
+      windows: [{ label: "Current session", usedPercent: 5 }],
+    },
+  ], 5);
+  const observed = withObservedSessionWindowFailure(quota, "anthropic");
+  assert.equal(observed.anthropic.fallbackHardBlocked, false);
+  assert.deepEqual(chooseProviderDecision({ preferred: "anthropic", quota: observed }), {
+    target: null,
+    holdProvider: "anthropic",
+  });
+  assert.equal(quotaFailureKind({ log: "Current session / five-hour usage limit reached" }), "session_window");
+});
+
+test("an explicit five-hour failure still holds when quota polling is temporarily unavailable", () => {
+  const quota = buildQuotaState([
+    { provider: "anthropic", ok: false, error: "poll timeout" },
+    {
+      provider: "anthropic_personal",
+      ok: true,
+      windows: [{ label: "Current session", usedPercent: 5 }],
+    },
+  ], 5);
+  const observed = withObservedSessionWindowFailure(quota, "anthropic");
+  assert.deepEqual(chooseProviderDecision({ preferred: "anthropic", quota: observed }), {
+    target: null,
+    holdProvider: "anthropic",
+  });
 });
 
 test("legacy Grok state can be normalized during migration without a model pin", () => {

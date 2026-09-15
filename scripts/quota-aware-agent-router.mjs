@@ -70,6 +70,18 @@ const QUOTA_FAILURE_PATTERNS = [
 const PRIORITY_ORDER = { critical: 0, high: 1, medium: 2, low: 3 };
 const ACTIONABLE_STATUSES = new Set(["todo", "in_progress"]);
 
+export function isClaudeSessionWindow(window) {
+  const label = String(window?.label ?? "");
+  return /\bcurrent session\b|\b(?:five|5)[ -]?hour\b|\b5h\b/i.test(label);
+}
+
+function earliestResetAt(windows) {
+  const resets = windows
+    .map((window) => Date.parse(window?.resetsAt ?? ""))
+    .filter((value) => Number.isFinite(value) && value > Date.now());
+  return resets.length ? new Date(Math.min(...resets)).toISOString() : null;
+}
+
 export function summarizeQuota(entry, reservePercent = 15) {
   const windows = Array.isArray(entry?.windows) ? entry.windows : [];
   const enforced = windows.filter((window) => Number.isFinite(window?.usedPercent));
@@ -77,14 +89,21 @@ export function summarizeQuota(entry, reservePercent = 15) {
   const reserveWindows = enforced.filter(
     (window) => Number(window.usedPercent) >= 100 - reservePercent,
   );
-  const resetCandidates = hardWindows
-    .map((window) => Date.parse(window.resetsAt ?? ""))
-    .filter((value) => Number.isFinite(value) && value > Date.now());
+  const sessionHardWindows = hardWindows.filter(isClaudeSessionWindow);
+  const sessionReserveWindows = reserveWindows.filter(isClaudeSessionWindow);
+  const fallbackHardWindows = hardWindows.filter((window) => !isClaudeSessionWindow(window));
+  const fallbackReserveWindows = reserveWindows.filter((window) => !isClaudeSessionWindow(window));
+  const telemetryUnavailable = entry?.ok !== true;
 
   return {
     ok: entry?.ok === true,
-    hardBlocked: entry?.ok !== true || hardWindows.length > 0,
-    reserveBlocked: entry?.ok !== true || reserveWindows.length > 0,
+    hardBlocked: telemetryUnavailable || hardWindows.length > 0,
+    reserveBlocked: telemetryUnavailable || reserveWindows.length > 0,
+    sessionWindowHardBlocked: sessionHardWindows.length > 0,
+    sessionWindowReserveBlocked: sessionReserveWindows.length > 0,
+    fallbackHardBlocked: telemetryUnavailable || fallbackHardWindows.length > 0,
+    fallbackReserveBlocked: telemetryUnavailable || fallbackReserveWindows.length > 0,
+    sessionWindowResetsAt: earliestResetAt(sessionReserveWindows),
     maxUsedPercent: enforced.length
       ? Math.max(...enforced.map((window) => Number(window.usedPercent)))
       : null,
@@ -93,7 +112,7 @@ export function summarizeQuota(entry, reservePercent = 15) {
       usedPercent: Number(window.usedPercent),
       resetsAt: window.resetsAt ?? null,
     })),
-    resetsAt: resetCandidates.length ? new Date(Math.min(...resetCandidates)).toISOString() : null,
+    resetsAt: earliestResetAt(hardWindows),
   };
 }
 
@@ -171,6 +190,17 @@ export function isQuotaFailure(value) {
   return QUOTA_FAILURE_PATTERNS.some((pattern) => pattern.test(text));
 }
 
+export function quotaFailureKind(value) {
+  const text = [value?.errorCode, value?.errorMessage, value?.log]
+    .filter((item) => typeof item === "string")
+    .join("\n");
+  if (/(?:five|5)[ -]?hour|current session|\b5h\b/i.test(text)) return "session_window";
+  if (/(?:authentication[_ -]?error|invalid authentication|\b401\b|unauthorized|authentication required|not authenticated|no auth credentials)/i.test(text)) {
+    return "authentication";
+  }
+  return "quota";
+}
+
 export function preferredProvider(agent, issue, configuredPrimary) {
   if (Object.hasOwn(PROVIDERS, configuredPrimary)) return configuredPrimary;
   const text = `${agent?.name ?? ""} ${agent?.role ?? ""} ${issue?.title ?? ""} ${issue?.description ?? ""}`;
@@ -184,15 +214,32 @@ export function preferredProvider(agent, issue, configuredPrimary) {
   return ADAPTER_TO_PROVIDER[agent?.adapterType] ?? "openai";
 }
 
-export function chooseProvider({ preferred, quota, urgent = false }) {
+export function chooseProviderDecision({ preferred, quota, urgent = false }) {
   const candidates = PROVIDER_FALLBACK_ORDER[preferred] ?? Object.keys(PROVIDERS);
-  const available = candidates.find((provider) => !quota[provider]?.reserveBlocked);
-  if (available) return available;
-  if (urgent) return candidates.find((provider) => !quota[provider]?.hardBlocked) ?? null;
-  return null;
+  for (const provider of candidates) {
+    const state = quota[provider];
+    if (!state?.reserveBlocked) return { target: provider, holdProvider: null };
+    if (state.sessionWindowReserveBlocked && !state.fallbackReserveBlocked) {
+      return { target: null, holdProvider: provider };
+    }
+  }
+  if (urgent) {
+    for (const provider of candidates) {
+      const state = quota[provider];
+      if (state?.sessionWindowHardBlocked && !state.fallbackHardBlocked) {
+        return { target: null, holdProvider: provider };
+      }
+      if (!state?.hardBlocked) return { target: provider, holdProvider: null };
+    }
+  }
+  return { target: null, holdProvider: null };
 }
 
-export function chooseProviderWithTelemetry({
+export function chooseProvider(options) {
+  return chooseProviderDecision(options).target;
+}
+
+export function chooseProviderDecisionWithTelemetry({
   preferred,
   current,
   quota,
@@ -200,16 +247,20 @@ export function chooseProviderWithTelemetry({
   quotaFailure = false,
   unknownProviders = [],
 }) {
-  const target = chooseProvider({ preferred, quota, urgent });
+  const decision = chooseProviderDecision({ preferred, quota, urgent });
   if (
     !quotaFailure &&
     unknownProviders.includes(preferred) &&
     current &&
     !quota[current]?.hardBlocked
   ) {
-    return current;
+    return { target: current, holdProvider: null };
   }
-  return target;
+  return decision;
+}
+
+export function chooseProviderWithTelemetry(options) {
+  return chooseProviderDecisionWithTelemetry(options).target;
 }
 
 export function withObservedProviderFailure(quota, provider) {
@@ -229,10 +280,55 @@ export function withObservedProviderFailure(quota, provider) {
   };
 }
 
+export function withObservedSessionWindowFailure(quota, provider) {
+  const current = quota[provider];
+  if (!current) return quota;
+  return {
+    ...quota,
+    [provider]: {
+      ...current,
+      hardBlocked: true,
+      reserveBlocked: true,
+      sessionWindowHardBlocked: true,
+      sessionWindowReserveBlocked: true,
+      // An explicit five-hour failure is stronger evidence than a temporarily
+      // unavailable poll. Do not reinterpret that poll failure as weekly
+      // exhaustion and spend the next subscription. Preserve any real weekly
+      // block from a successful quota reading.
+      fallbackHardBlocked: current.ok === true ? current.fallbackHardBlocked : false,
+      fallbackReserveBlocked: current.ok === true ? current.fallbackReserveBlocked : false,
+      limitingWindows: [
+        ...current.limitingWindows,
+        {
+          label: "Observed five-hour session limit",
+          usedPercent: 100,
+          resetsAt: current.sessionWindowResetsAt ?? null,
+        },
+      ],
+    },
+  };
+}
+
 export function routableAgents(agents) {
   return (Array.isArray(agents) ? agents : []).filter(
     (agent) => ROUTABLE_ADAPTERS.has(agent?.adapterType),
   );
+}
+
+export function sortAgentsManagersFirst(agents) {
+  const ordered = Array.isArray(agents) ? [...agents] : [];
+  const byId = new Map(ordered.map((agent) => [agent.id, agent]));
+  const depths = new Map();
+  const depthOf = (agent, visiting = new Set()) => {
+    if (depths.has(agent.id)) return depths.get(agent.id);
+    if (!agent.reportsTo || !byId.has(agent.reportsTo)) return 0;
+    if (visiting.has(agent.id)) return ordered.length;
+    const nextVisiting = new Set(visiting).add(agent.id);
+    const depth = 1 + depthOf(byId.get(agent.reportsTo), nextVisiting);
+    depths.set(agent.id, depth);
+    return depth;
+  };
+  return ordered.sort((left, right) => depthOf(left) - depthOf(right));
 }
 
 export function providerForAgent(agent, claudeProfiles = {}) {
@@ -527,7 +623,9 @@ export class QuotaAwareAgentRouter {
 
     for (const run of recentFailures) {
       if (this.state.processedQuotaRunIds.includes(run.id)) continue;
-      if (isQuotaFailure(run)) return run;
+      if (isQuotaFailure(run)) {
+        return { ...run, quotaFailureKind: quotaFailureKind(run) };
+      }
       let logResult;
       try {
         logResult = await this.api(`/heartbeat-runs/${run.id}/log?offset=0&limitBytes=262144`);
@@ -542,7 +640,10 @@ export class QuotaAwareAgentRouter {
         });
         continue;
       }
-      if (isQuotaFailure({ ...run, log: logResult?.content })) return run;
+      const failure = { ...run, log: logResult?.content };
+      if (isQuotaFailure(failure)) {
+        return { ...run, quotaFailureKind: quotaFailureKind(failure) };
+      }
     }
     return null;
   }
@@ -701,6 +802,92 @@ export class QuotaAwareAgentRouter {
     await this.saveState();
   }
 
+  async holdAgentForSessionWindow(company, agent, state, provider, quotaState, issue, run) {
+    if (agent.status !== "paused") {
+      agent = await this.api(`/agents/${agent.id}/pause`, { method: "POST", body: "{}" });
+    }
+    const previous = state.sessionWindowHold;
+    state.sessionWindowHold = {
+      provider,
+      resetsAt: quotaState?.sessionWindowResetsAt ?? previous?.resetsAt ?? null,
+      startedAt: previous?.startedAt ?? nowIso(),
+      issueId: run?.contextSnapshot?.issueId ?? run?.contextSnapshot?.taskId ?? issue?.id ?? null,
+      run: run ? {
+        id: run.id,
+        contextSnapshot: run.contextSnapshot ?? null,
+      } : previous?.run ?? null,
+    };
+    state.lastDecisionKey = null;
+    await this.saveState();
+    if (!previous) {
+      await this.log("agent_held_for_session_window", {
+        companyId: company.id,
+        companyName: company.name,
+        agentId: agent.id,
+        agentName: agent.name,
+        provider,
+        issueId: state.sessionWindowHold.issueId,
+        resetsAt: state.sessionWindowHold.resetsAt,
+      });
+    }
+    return agent;
+  }
+
+  async releaseAgentSessionWindowHold(company, agent, state, hold, issue) {
+    if (agent.status === "paused") {
+      try {
+        agent = await this.api(`/agents/${agent.id}/resume`, { method: "POST", body: "{}" });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!/ returned 409:/.test(message)) throw error;
+        await this.log("session_hold_release_deferred", {
+          companyId: company.id,
+          companyName: company.name,
+          agentId: agent.id,
+          agentName: agent.name,
+          provider: hold.provider,
+          reason: "reporting chain is still paused",
+        });
+        return agent;
+      }
+    }
+    delete state.sessionWindowHold;
+    state.lastDecisionKey = null;
+    await this.saveState();
+    await this.log("agent_released_after_session_reset", {
+      companyId: company.id,
+      companyName: company.name,
+      agentId: agent.id,
+      agentName: agent.name,
+      provider: hold.provider,
+      issueId: hold.issueId ?? issue?.id ?? null,
+      resetAt: hold.resetsAt,
+    });
+
+    if (hold.run) {
+      await this.recoverQuotaFailure(agent, hold.run, issue);
+    } else if (issue && ACTIONABLE_STATUSES.has(issue.status)) {
+      await this.api(`/agents/${agent.id}/wakeup`, {
+        method: "POST",
+        body: JSON.stringify({
+          source: "automation",
+          triggerDetail: "system",
+          reason: "claude_five_hour_window_reset",
+          payload: { issueId: issue.id, taskId: issue.id },
+          idempotencyKey: `quota-router:session-reset:${hold.provider}:${hold.resetsAt ?? "observed"}:${agent.id}`,
+        }),
+      });
+      await this.log("session_window_issue_retried", {
+        companyId: company.id,
+        companyName: company.name,
+        agentId: agent.id,
+        issueId: issue.id,
+        identifier: issue.identifier,
+      });
+    }
+    return agent;
+  }
+
   async tickCompany(company) {
     const companyId = company.id;
     const [agentsResult, issuesResult, quotaResult, liveRunsResult] = await Promise.all([
@@ -729,7 +916,7 @@ export class QuotaAwareAgentRouter {
     );
     companyState.quotaLastGood = stableQuota.cache;
     const quota = stableQuota.quota;
-    const agents = routableAgents(agentsResult);
+    const agents = sortAgentsManagersFirst(routableAgents(agentsResult));
     const issues = Array.isArray(issuesResult) ? issuesResult : [];
     const activeAgentIds = new Set(
       (Array.isArray(liveRunsResult) ? liveRunsResult : [])
@@ -775,21 +962,51 @@ export class QuotaAwareAgentRouter {
     for (let agent of agents) {
       const state = this.ensureAgentState(company, agent);
       if (activeAgentIds.has(agent.id) || agent.status === "running") continue;
+      const heldSessionWindow = state.sessionWindowHold ?? null;
+      if (heldSessionWindow) {
+        const heldQuota = quota[heldSessionWindow.provider];
+        const telemetryUnknown = stableQuota.unknownProviders.includes(heldSessionWindow.provider);
+        const sessionStillBlocked = heldQuota?.sessionWindowReserveBlocked
+          && !heldQuota?.fallbackReserveBlocked;
+        if (telemetryUnknown || sessionStillBlocked) continue;
+      } else if (agent.status === "paused") {
+        // A pause not recorded by this router belongs to the user or another
+        // Paperclip policy and must never be undone here.
+        continue;
+      }
       agent = await this.enforceRuntimePolicy(agent);
 
-      const quotaRun = await this.quotaFailureForAgent(companyId, agent);
+      const quotaRun = heldSessionWindow
+        ? null
+        : await this.quotaFailureForAgent(companyId, agent);
       const quotaIssueId = quotaRun?.contextSnapshot?.issueId ?? quotaRun?.contextSnapshot?.taskId ?? null;
       const assigned = sortIssues(issues.filter((issue) => issue.assigneeAgentId === agent.id));
-      const quotaIssue = quotaIssueId ? issues.find((issue) => issue.id === quotaIssueId) ?? null : null;
+      const heldIssueId = heldSessionWindow?.issueId ?? null;
+      const quotaIssue = quotaIssueId || heldIssueId
+        ? issues.find((issue) => issue.id === (quotaIssueId ?? heldIssueId)) ?? null
+        : null;
       const actionable = assigned.find((issue) => ACTIONABLE_STATUSES.has(issue.status)) ?? quotaIssue;
       const urgent = Boolean(quotaRun) || ["critical", "high"].includes(actionable?.priority);
       const preferred = preferredProvider(agent, actionable, state.primaryProvider);
       const failedProvider = quotaRun ? this.currentProvider(agent) : null;
+      const sessionWindowFailure = Boolean(
+        quotaRun
+        && failedProvider
+        && (
+          quotaRun.quotaFailureKind === "session_window"
+          || (
+            quota[failedProvider]?.sessionWindowHardBlocked
+            && !quota[failedProvider]?.fallbackHardBlocked
+          )
+        )
+      );
       const routingQuota = failedProvider
-        ? withObservedProviderFailure(quota, failedProvider)
+        ? sessionWindowFailure
+          ? withObservedSessionWindowFailure(quota, failedProvider)
+          : withObservedProviderFailure(quota, failedProvider)
         : quota;
       const currentProvider = this.currentProvider(agent);
-      const target = chooseProviderWithTelemetry({
+      const decision = chooseProviderDecisionWithTelemetry({
         preferred,
         current: currentProvider,
         quota: routingQuota,
@@ -797,6 +1014,20 @@ export class QuotaAwareAgentRouter {
         quotaFailure: Boolean(quotaRun),
         unknownProviders: stableQuota.unknownProviders,
       });
+      const target = decision.target;
+
+      if (decision.holdProvider) {
+        await this.holdAgentForSessionWindow(
+          company,
+          agent,
+          state,
+          decision.holdProvider,
+          routingQuota[decision.holdProvider],
+          actionable,
+          quotaRun,
+        );
+        continue;
+      }
 
       if (!target) {
         const waitingDetails = {
@@ -841,7 +1072,12 @@ export class QuotaAwareAgentRouter {
       if (currentProvider !== target || configRefresh) {
         const lastSwitch = Date.parse(state.lastSwitchAt ?? "");
         const cooldownMs = this.config.switchCooldownMs ?? 60_000;
-        if (Number.isFinite(lastSwitch) && Date.now() - lastSwitch < cooldownMs && !quotaRun) continue;
+        if (
+          Number.isFinite(lastSwitch)
+          && Date.now() - lastSwitch < cooldownMs
+          && !quotaRun
+          && !heldSessionWindow
+        ) continue;
         agent = await this.switchAgent(
           company,
           agent,
@@ -856,6 +1092,15 @@ export class QuotaAwareAgentRouter {
         );
       }
 
+      if (heldSessionWindow) {
+        agent = await this.releaseAgentSessionWindowHold(
+          company,
+          agent,
+          state,
+          heldSessionWindow,
+          quotaIssue ?? actionable,
+        );
+      }
       if (quotaRun) await this.recoverQuotaFailure(agent, quotaRun, quotaIssue);
     }
     await this.saveState();
