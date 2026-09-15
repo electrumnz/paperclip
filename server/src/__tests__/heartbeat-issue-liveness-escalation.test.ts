@@ -230,7 +230,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       type: "blocks",
     });
 
-    return { companyId, managerId, coderId, blockedIssueId, blockerIssueId };
+    return { companyId, managerId, coderId, blockedIssueId, blockerIssueId, issuePrefix };
   }
 
   async function seedResolvedDependencyBackstopFixture(opts: {
@@ -1008,7 +1008,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
 
   it("creates one bounded escalation for an assigned backlog blocker leaf", async () => {
     await enableAutoRecovery();
-    const { companyId, coderId, blockedIssueId, blockerIssueId } = await seedBlockedChain({
+    const { companyId, coderId, blockedIssueId, blockerIssueId, issuePrefix } = await seedBlockedChain({
       blockerStatus: "backlog",
       blockerAssigneeAgentId: "coder",
     });
@@ -1028,6 +1028,7 @@ describeEmbeddedPostgres("heartbeat issue graph liveness escalation", () => {
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "harness_liveness_escalation")));
     expect(escalations).toHaveLength(1);
     expect(escalations[0]).toMatchObject({
+      title: `Review ${issuePrefix}-2 (blocking ${issuePrefix}-1)`,
       parentId: blockerIssueId,
       assigneeAgentId: coderId,
       originId: [

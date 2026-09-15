@@ -701,6 +701,19 @@ function formatDependencyPath(finding: IssueLivenessFinding) {
     .join(" -> ");
 }
 
+function buildLivenessEscalationTitle(input: {
+  finding: IssueLivenessFinding;
+  issue: typeof issues.$inferSelect;
+  recoveryIssue: typeof issues.$inferSelect;
+}) {
+  const sourceLabel = input.issue.identifier ?? input.issue.id;
+  if (input.finding.recoveryIssueId === input.finding.issueId) {
+    return `Unblock liveness incident for ${sourceLabel}`;
+  }
+  const recoveryLabel = input.recoveryIssue.identifier ?? input.recoveryIssue.id;
+  return `Review ${recoveryLabel} (blocking ${sourceLabel})`;
+}
+
 function buildLivenessEscalationDescription(finding: IssueLivenessFinding) {
   const source = finding.dependencyPath[0];
   const recovery = finding.dependencyPath.find((entry) => entry.issueId === finding.recoveryIssueId);
@@ -5028,7 +5041,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     let escalation: Awaited<ReturnType<typeof issuesSvc.create>>;
     try {
       escalation = await issuesSvc.create(issue.companyId, {
-        title: `Unblock liveness incident for ${issue.identifier ?? issue.id}`,
+        title: buildLivenessEscalationTitle({ finding: input.finding, issue, recoveryIssue }),
         description: buildLivenessEscalationDescription(input.finding),
         status: "todo",
         priority: "high",
