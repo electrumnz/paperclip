@@ -119,6 +119,7 @@ import type {
   TurnCompletion,
 } from "./run-contracts.js";
 import { createRunResourceLedger } from "./run-resource-ledger.js";
+import { classifyAcpxOutputRejection } from "./output-rejection.js";
 import { settleAcpRun, type SettlementSteps } from "./settlement-sequence.js";
 import {
   runAttempt,
@@ -4700,6 +4701,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         outputSegments.push(currentOutputChunk.join(""));
         currentOutputChunk = [];
       };
+      // Whether the turn did anything beyond talking. The output-rejection seam
+      // below reads it: a turn that called a tool is doing work, so its text is
+      // never reclassified as a provider rejection, however the text reads.
+      let sawToolActivity = false;
       let eventBreakdown: AcpRuntimeUsageBreakdown | null = null;
       let eventCostUsd: number | null = null;
       // The turn-local state the sequence steps share. `promptBuild` sets the
@@ -4921,6 +4926,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             for await (const event of turn.events) {
               // ACPX currently flattens client-side filesystem/terminal receipts
               // into status text. They cannot establish complete action outcomes.
+              if (event.type === "tool_call") sawToolActivity = true;
               if (event.type === "status" && /^(fs|terminal)\//.test(event.text)) incompleteToolInventory = true;
               if (event.type === "tool_call") {
                 if (!event.toolCallId) incompleteToolInventory = true;
@@ -5058,10 +5064,24 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         const channelLostMessage = duplexLossReason
           ? `The sandbox duplex control channel was lost (${duplexLossReason}) before the run completed.`
           : null;
-        // A completed, non-timed-out turn whose channel stayed live is the one
-        // success path. Every other outcome — a failed, cancelled, or timed-out
-        // terminal, or a completed terminal with a lost channel — is a failure.
-        const turnSucceeded = terminal.status === "completed" && !timedOut && !channelLost;
+        // A provider that refuses the requested model can answer the rejection as
+        // ordinary assistant text and still end the turn `end_turn`. Nothing was
+        // done, but every operator surface reads healthy and the assigned card
+        // just never moves. Reclassify that turn here, so the run records the
+        // failure its output already describes. The seam runs only on an
+        // otherwise-success-eligible terminal: a failed, cancelled, timed-out or
+        // channel-lost turn already has a truer cause than its text.
+        const outputRejection =
+          terminal.status === "completed" && !timedOut && !channelLost
+            ? classifyAcpxOutputRejection({ outputSegments, sawToolActivity })
+            : null;
+        // A completed, non-timed-out turn whose channel stayed live and whose
+        // output is not a bare provider error payload is the one success path.
+        // Every other outcome — a failed, cancelled, or timed-out terminal, a
+        // completed terminal with a lost channel, or a completed terminal that
+        // only relayed a provider rejection — is a failure.
+        const turnSucceeded =
+          terminal.status === "completed" && !timedOut && !channelLost && outputRejection === null;
         // Read usage before the settlement can discard runtime state.
         const postTurnStatus = await readRuntimeStatus(runtime, sessionHandle);
         const turnUsage = summarizeAcpxTurnUsage({
@@ -5101,10 +5121,16 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             ? "paperclip timeout cleanup"
             : channelLost
               ? "paperclip duplex channel lost cleanup"
-              : failedTurn
-                ? `paperclip turn ${terminal.status}`
-                : "paperclip completed turn cleanup",
-          discardPersistentState: sessionUnavailable || (terminal.status === "cancelled" && !preserveInterruptedSession) || timedOut || channelLost,
+              : outputRejection
+                ? `paperclip turn ${outputRejection.kind}`
+                : failedTurn
+                  ? `paperclip turn ${terminal.status}`
+                  : "paperclip completed turn cleanup",
+          // Discard the conversation a rejected turn leaves behind. Resuming it
+          // would replay a provider error payload as the last exchange, and the
+          // turn banked no work worth carrying forward.
+          discardPersistentState:
+            sessionUnavailable || (terminal.status === "cancelled" && !preserveInterruptedSession) || timedOut || channelLost || outputRejection !== null,
           dropWarmEntry: false,
           recordCloseError: false,
           cancelTurnReason: null,
@@ -5115,14 +5141,20 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
           : channelLost
             ? channelLostMessage
-            : resultErrorMessage(terminal);
+            : outputRejection
+              ? outputRejection.message
+              : resultErrorMessage(terminal);
         const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
         const classifiedFailure = !timedOut && !channelLost && terminal.status === "failed"
           ? terminalFailureClassification
           : null;
         await emitAcpxLog(ctx, {
           type: turnSucceeded ? "acpx.result" : "acpx.error",
-          summary: channelLost ? "duplex_channel_lost" : terminal.status,
+          summary: channelLost
+            ? "duplex_channel_lost"
+            : outputRejection
+              ? outputRejection.kind
+              : terminal.status,
           stopReason: terminalStopReason,
           message: errorMessage,
         });
@@ -5135,13 +5167,15 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           signal: timedOut ? "SIGTERM" : null,
           timedOut,
           errorMessage,
-          errorCode: timedOut
-            ? "acpx_timeout"
-            : channelLost
-              ? DUPLEX_CHANNEL_LOST_ERROR_CODE
-              : terminal.status === "failed"
-                ? classifiedFailure?.errorCode ?? "acpx_turn_failed"
-                : null,
+          errorCode: outputRejection
+            ? outputRejection.errorCode
+            : timedOut
+              ? "acpx_timeout"
+              : channelLost
+                ? DUPLEX_CHANNEL_LOST_ERROR_CODE
+                : terminal.status === "failed"
+                  ? classifiedFailure?.errorCode ?? "acpx_turn_failed"
+                  : null,
           ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
           ...(classifiedFailure?.retryNotBefore ? { retryNotBefore: classifiedFailure.retryNotBefore } : {}),
           sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
@@ -5153,7 +5187,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           ...(turnUsage.usage ? { usage: turnUsage.usage, usageBasis: "per_run" as const } : {}),
           costUsd: turnUsage.costUsd,
           resultJson: {
-            status: channelLost ? "failed" : terminal.status,
+            // The provider's own stop reason stays on the record. It is the
+            // evidence for the reclassification, not a contradiction of it: a
+            // rejected turn really did end `end_turn`, which is the bug.
+            status: channelLost || outputRejection ? "failed" : terminal.status,
             ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
             ...(classifiedFailure?.retryNotBefore
               ? {
@@ -5164,6 +5201,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                 }
               : {}),
             stopReason: terminalStopReason,
+            ...(outputRejection ? { outputRejection: outputRejection.kind } : {}),
             permissionMode: prepared.permissionMode,
             mode: prepared.mode,
             requestedModel: prepared.requestedModel || null,
@@ -5229,6 +5267,16 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               kind: "turn_failed",
               error: terminal.error instanceof Error ? terminal.error : new Error(String(terminal.error)),
             },
+            resources: emptyConsumed,
+          };
+        }
+        // A completed terminal that only relayed a provider rejection returns a
+        // failed completion for the same reason: the coordinator settles for a
+        // failure and the reuse decision forbids saving the session.
+        if (outputRejection) {
+          return {
+            kind: "failed",
+            cause: { kind: "turn_failed", error: new Error(outputRejection.message) },
             resources: emptyConsumed,
           };
         }
