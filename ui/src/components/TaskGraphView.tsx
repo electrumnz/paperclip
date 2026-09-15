@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from "react";
-import { Maximize2, Minus, Plus, Radio } from "lucide-react";
+import { CheckCircle2, Maximize2, Minus, Plus, Radio } from "lucide-react";
 import type { Issue, IssueStatus } from "@paperclipai/shared";
 
 import { Button } from "./ui/button";
@@ -218,18 +218,21 @@ export function TaskGraphView({
   issues: Issue[];
   liveIssueIds?: ReadonlySet<string>;
 }) {
-  const layout = useMemo(() => buildTaskGraphLayout(issues), [issues]);
+  const [showCompleted, setShowCompleted] = useState(false);
+  const completedCount = useMemo(
+    () => issues.filter((issue) => issue.status === "done" || issue.status === "cancelled").length,
+    [issues],
+  );
+  const visibleIssues = useMemo(
+    () => showCompleted
+      ? issues
+      : issues.filter((issue) => issue.status !== "done" && issue.status !== "cancelled"),
+    [issues, showCompleted],
+  );
+  const layout = useMemo(() => buildTaskGraphLayout(visibleIssues), [visibleIssues]);
   const nodeById = useMemo(() => new Map(layout.nodes.map((node) => [node.issue.id, node])), [layout.nodes]);
   const [zoom, setZoom] = useState(1);
   const scrollerRef = useRef<HTMLDivElement>(null);
-
-  if (layout.nodes.length === 0) {
-    return (
-      <div className="rounded-lg border border-dashed border-border px-5 py-12 text-center text-sm text-muted-foreground">
-        No tasks match the current filters or search.
-      </div>
-    );
-  }
 
   const changeZoom = (next: number) => setZoom(Math.min(1.4, Math.max(MIN_ZOOM, next)));
   const fitGraph = () => {
@@ -250,38 +253,53 @@ export function TaskGraphView({
           <span className="w-5 border-t border-dashed border-red-500/80" /> blocked by
         </span>
         <span className="hidden sm:inline">Swipe or scroll to pan</span>
-        <div className="ml-auto flex items-center rounded-md border border-border bg-background/70">
+        <div className="ml-auto flex items-center gap-2">
           <Button
             type="button"
-            variant="ghost"
-            size="icon"
-            className="h-8 w-8 rounded-r-none"
-            aria-label="Zoom out"
-            onClick={() => changeZoom(zoom - 0.15)}
+            variant={showCompleted ? "secondary" : "outline"}
+            size="sm"
+            className="h-8 gap-1.5 px-2 text-(length:--text-nano)"
+            aria-label={showCompleted ? "Hide completed tasks" : `Show ${completedCount} completed tasks`}
+            aria-pressed={showCompleted}
+            onClick={() => setShowCompleted((current) => !current)}
+            disabled={completedCount === 0}
           >
-            <Minus className="h-3.5 w-3.5" />
+            <CheckCircle2 className="h-3.5 w-3.5" />
+            {showCompleted ? "Hide completed" : `Show completed (${completedCount})`}
           </Button>
-          <span className="min-w-11 text-center font-mono text-foreground">{Math.round(zoom * 100)}%</span>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="h-8 w-8 rounded-none"
-            aria-label="Zoom in"
-            onClick={() => changeZoom(zoom + 0.15)}
-          >
-            <Plus className="h-3.5 w-3.5" />
-          </Button>
-          <Button
-            type="button"
-            variant="ghost"
-            size="icon"
-            className="h-8 w-8 rounded-l-none border-l border-border"
-            aria-label="Fit graph"
-            onClick={fitGraph}
-          >
-            <Maximize2 className="h-3.5 w-3.5" />
-          </Button>
+          <div className="flex items-center rounded-md border border-border bg-background/70">
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 rounded-r-none"
+              aria-label="Zoom out"
+              onClick={() => changeZoom(zoom - 0.15)}
+            >
+              <Minus className="h-3.5 w-3.5" />
+            </Button>
+            <span className="min-w-11 text-center font-mono text-foreground">{Math.round(zoom * 100)}%</span>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 rounded-none"
+              aria-label="Zoom in"
+              onClick={() => changeZoom(zoom + 0.15)}
+            >
+              <Plus className="h-3.5 w-3.5" />
+            </Button>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-8 w-8 rounded-l-none border-l border-border"
+              aria-label="Fit graph"
+              onClick={fitGraph}
+            >
+              <Maximize2 className="h-3.5 w-3.5" />
+            </Button>
+          </div>
         </div>
       </div>
 
@@ -290,7 +308,11 @@ export function TaskGraphView({
         className="h-[min(68vh,760px)] min-h-96 touch-pan-x touch-pan-y overflow-auto overscroll-contain bg-background/35"
         data-testid="task-graph-scroller"
       >
-        <div className="relative" style={{ width: layout.width * zoom, height: layout.height * zoom }}>
+        {layout.nodes.length === 0 ? (
+          <div className="flex h-full min-h-96 items-center justify-center px-5 text-center text-sm text-muted-foreground">
+            {completedCount > 0 ? "No active tasks. Show completed tasks to view the archive." : "No tasks match the current filters or search."}
+          </div>
+        ) : <div className="relative" style={{ width: layout.width * zoom, height: layout.height * zoom }}>
           <div
             className="absolute left-0 top-0 origin-top-left"
             style={{ width: layout.width, height: layout.height, transform: `scale(${zoom})` }}
@@ -352,7 +374,7 @@ export function TaskGraphView({
               );
             })}
           </div>
-        </div>
+        </div>}
       </div>
     </section>
   );

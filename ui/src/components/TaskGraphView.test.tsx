@@ -136,6 +136,21 @@ describe("TaskGraphView", () => {
     expect(container.querySelector('path[marker-end="url(#task-graph-blocker-arrow)"]')).not.toBeNull();
   });
 
+  it("hides completed tasks by default and lets the operator reveal them", () => {
+    const active = createIssue(1, "in_progress");
+    const done = createIssue(2, "done");
+    const cancelled = createIssue(3, "cancelled");
+    const container = renderGraph([active, done, cancelled]);
+
+    expect(container.querySelectorAll('[data-testid="task-graph-node"]')).toHaveLength(1);
+    const toggle = container.querySelector<HTMLButtonElement>('[aria-label="Show 2 completed tasks"]');
+    expect(toggle).not.toBeNull();
+
+    flushSync(() => toggle?.click());
+    expect(container.querySelectorAll('[data-testid="task-graph-node"]')).toHaveLength(3);
+    expect(container.querySelector('[aria-label="Hide completed tasks"]')).not.toBeNull();
+  });
+
   it("shows a useful empty state", () => {
     expect(renderGraph([]).textContent).toContain("No tasks match");
   });
