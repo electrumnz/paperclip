@@ -24,19 +24,35 @@ afterEach(async () => {
   );
 });
 
-async function createCodexHome(configToml?: string): Promise<string> {
+// `homeMode` / `configMode` default to what a home Paperclip has already
+// narrowed looks like, so the policy tests below see no mode note. The tests
+// that care about narrowing pass the wide modes explicitly.
+async function createCodexHome(
+  configToml?: string,
+  modes: { homeMode?: number; configMode?: number } = {},
+): Promise<string> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-kee192-codex-"));
   cleanupRoots.push(root);
   const home = path.join(root, "codex-home");
-  await fs.mkdir(home, { recursive: true });
+  await fs.mkdir(home, { recursive: true, mode: modes.homeMode ?? 0o700 });
   if (configToml !== undefined) {
-    await fs.writeFile(path.join(home, "config.toml"), configToml, "utf8");
+    await fs.writeFile(path.join(home, "config.toml"), configToml, {
+      encoding: "utf8",
+      mode: modes.configMode ?? 0o600,
+    });
   }
   return home;
 }
 
 async function readConfig(home: string): Promise<string> {
   return await fs.readFile(path.join(home, "config.toml"), "utf8");
+}
+
+// Assert what is on disk, not the `mode` argument — it is masked by the process
+// umask and ignored outright when the path already exists. "No group or other
+// bits" rather than an exact 0600/0700: a stricter umask can only remove bits.
+async function isPrivate(target: string): Promise<boolean> {
+  return (((await fs.stat(target)).mode & 0o777) & 0o077) === 0;
 }
 
 describe("applyShellSnapshotPolicy", () => {
@@ -152,6 +168,65 @@ describe("enforceCodexShellSnapshotPolicy", () => {
 
     expect(notes).toHaveLength(1);
     expect(notes[0]).toContain("Left Codex shell snapshots enabled");
+    expect(await readConfig(home)).toBe("features = { web_search = true }\n");
+  });
+
+  // KEE-216. A home created at 0755 with a 0644 config is what every install
+  // that predates this had, and Codex writes `shell_snapshots/*.sh` into that
+  // home itself — Paperclip never gets to pick their mode, so a private home is
+  // the only thing keeping them from other accounts on the host.
+  it("creates config.toml private", async () => {
+    const home = await createCodexHome();
+
+    await enforceCodexShellSnapshotPolicy(home);
+
+    expect(await isPrivate(path.join(home, "config.toml"))).toBe(true);
+  });
+
+  it("narrows a world-readable home, and rewrites its config private", async () => {
+    const home = await createCodexHome('model = "gpt-5.6-sol"\n', {
+      homeMode: 0o755,
+      configMode: 0o644,
+    });
+    expect(await isPrivate(home)).toBe(false);
+
+    const notes = await enforceCodexShellSnapshotPolicy(home);
+
+    expect(notes.some((note) => note.includes("Narrowed") && note.includes("0755"))).toBe(true);
+    expect(notes.some((note) => note.includes("Disabled Codex shell snapshots"))).toBe(true);
+    expect(await isPrivate(home)).toBe(true);
+    expect(await isPrivate(path.join(home, "config.toml"))).toBe(true);
+    // Narrowing must not cost the operator their settings.
+    expect(parseToml(await readConfig(home))).toMatchObject({
+      model: "gpt-5.6-sol",
+      features: { shell_snapshot: false },
+    });
+  });
+
+  it("narrows the home even when the policy is already in force", async () => {
+    // The config is already correct, so the writer returns early. The mode
+    // repair still has to run, or a home seeded before KEE-216 stays at 0755
+    // forever with its old snapshots inside it.
+    const home = await createCodexHome(applyShellSnapshotPolicy("").text, {
+      homeMode: 0o755,
+    });
+
+    const notes = await enforceCodexShellSnapshotPolicy(home);
+
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain("Narrowed");
+    expect(await isPrivate(home)).toBe(true);
+  });
+
+  it("leaves an unsupported config alone but still narrows the home", async () => {
+    const home = await createCodexHome("features = { web_search = true }\n", {
+      homeMode: 0o755,
+    });
+
+    const notes = await enforceCodexShellSnapshotPolicy(home);
+
+    expect(notes.some((note) => note.includes("Left Codex shell snapshots enabled"))).toBe(true);
+    expect(await isPrivate(home)).toBe(true);
     expect(await readConfig(home)).toBe("features = { web_search = true }\n");
   });
 });

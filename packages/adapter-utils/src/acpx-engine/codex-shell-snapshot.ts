@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { ensureRestrictedDir, writeRestrictedFile } from "./restricted-files.js";
 
 /**
  * Codex shell snapshots serialize the provider process environment into
@@ -144,12 +145,20 @@ function ensureTrailingNewline(text: string): string {
  */
 export async function enforceCodexShellSnapshotPolicy(codexHome: string): Promise<string[]> {
   const configPath = path.join(codexHome, "config.toml");
+  // Runs before the policy is read, and on every call rather than only when the
+  // config changes. Any `shell_snapshots/*.sh` a Codex run wrote before this
+  // policy existed is still sitting in this home, and Codex — not Paperclip —
+  // creates those files, so their own mode is out of reach. A private home is
+  // the only thing that keeps them from other accounts on the host.
+  const notes = await ensureRestrictedDir(codexHome);
+
   let current = "";
   try {
     current = await fs.readFile(configPath, "utf8");
   } catch (err) {
     if (!isMissingFile(err)) {
       return [
+        ...notes,
         `[paperclip] Could not read "${configPath}" to disable Codex shell snapshots: ${errorText(err)}`,
       ];
     }
@@ -158,23 +167,28 @@ export async function enforceCodexShellSnapshotPolicy(codexHome: string): Promis
   const policy = applyShellSnapshotPolicy(current);
   if (policy.unsupported) {
     return [
+      ...notes,
       `[paperclip] Left Codex shell snapshots enabled: ${policy.unsupported}. ` +
         "Set features.shell_snapshot = false there by hand — snapshots record this run's credentials to disk.",
     ];
   }
-  if (!policy.changed) return [];
+  if (!policy.changed) return notes;
 
   try {
-    await fs.mkdir(codexHome, { recursive: true });
     const tempPath = `${configPath}.paperclip-${process.pid}.tmp`;
-    await fs.writeFile(tempPath, policy.text, "utf8");
+    // Written at 0600 and renamed into place: the config carries whatever the
+    // operator's seed carried, and a mode set after the write would leave a
+    // world-readable window in between.
+    await writeRestrictedFile(tempPath, policy.text);
     await fs.rename(tempPath, configPath);
   } catch (err) {
     return [
+      ...notes,
       `[paperclip] Could not write "${configPath}" to disable Codex shell snapshots: ${errorText(err)}`,
     ];
   }
   return [
+    ...notes,
     `[paperclip] Disabled Codex shell snapshots in "${configPath}" (they record the launch environment, credentials included).`,
   ];
 }

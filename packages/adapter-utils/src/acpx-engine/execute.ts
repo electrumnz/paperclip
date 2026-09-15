@@ -94,6 +94,7 @@ import {
   type AcpSessionStore,
 } from "acpx/runtime";
 import { enforceCodexShellSnapshotPolicy } from "./codex-shell-snapshot.js";
+import { ensureRestrictedDir } from "./restricted-files.js";
 import {
   ACPX_DUPLEX_LOSS_CANCEL_DEADLINE_MS,
   ACPX_HANDSHAKE_TIMEOUT_MS,
@@ -4201,6 +4202,17 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         processIdentitySink.current = ctx.onSpawn;
         flushChildStderr(childStderrState);
         childStderrState.logPath = prepared.childStderrLogPath;
+        // ACPX's own `FileSessionStore` creates `<stateDir>/sessions` and writes
+        // each record with no mode argument — 0755 and 0644 under the usual
+        // umask — and both calls live inside the vendored package, so the record
+        // files cannot be created at 0600 from here. Creating the directory at
+        // 0700 first is what is reachable: `ensureDir()` in the store is
+        // `mkdir(recursive)`, which leaves an existing directory's mode alone, so
+        // this wins the race by running before any load or save. Narrowing, not
+        // a control — see restricted-files.ts.
+        for (const line of await ensureRestrictedDir(path.join(prepared.stateDir, "sessions"))) {
+          await ctx.onLog("stderr", `${line}\n`);
+        }
         const persistedRuntimeStore = createRuntimeStore({ stateDir: prepared.stateDir });
         // `load` re-injects this run's launch environment (ACPX resumes from the
         // stored session options, not the options passed to ensureSession) and
