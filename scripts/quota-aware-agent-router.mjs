@@ -401,7 +401,15 @@ function sortIssues(issues) {
   });
 }
 
-export function mergeRuntimePolicy(runtimeConfig, cheapProfile = {}) {
+export function cheapProfileAdapterConfig(cheapProfile = {}, family = "anthropic") {
+  // The cheap profile names an Anthropic model. Stamping it onto a non-Anthropic
+  // adapter produces a 400 before the run does any work, so leave the model unset
+  // and let the adapter's own cheap profile choose.
+  if (family !== "anthropic") return {};
+  return { model: cheapProfile.model ?? "claude-haiku-4-5", effort: cheapProfile.effort ?? "low" };
+}
+
+export function mergeRuntimePolicy(runtimeConfig, cheapProfile = {}, family = "anthropic") {
   const runtime = runtimeConfig && typeof runtimeConfig === "object" ? runtimeConfig : {};
   const heartbeat = runtime.heartbeat && typeof runtime.heartbeat === "object" ? runtime.heartbeat : {};
   const profiles = runtime.modelProfiles && typeof runtime.modelProfiles === "object"
@@ -416,13 +424,18 @@ export function mergeRuntimePolicy(runtimeConfig, cheapProfile = {}) {
     }))
     : {};
   const cheap = profiles.cheap && typeof profiles.cheap === "object" ? profiles.cheap : {};
+  const existingCheapAdapterConfig = cheap.adapterConfig && typeof cheap.adapterConfig === "object"
+    ? cheap.adapterConfig
+    : {};
+  // Strip any stale model/effort from a previous provider before reapplying, so a
+  // seat that moved off anthropic gets cleaned up rather than carrying it forward.
+  const { model: _staleModel, effort: _staleEffort, ...cheapAdapterConfigRest } = existingCheapAdapterConfig;
   profiles.cheap = {
     ...cheap,
     enabled: cheapProfile.enabled !== false,
     adapterConfig: {
-      ...(cheap.adapterConfig && typeof cheap.adapterConfig === "object" ? cheap.adapterConfig : {}),
-      model: cheapProfile.model ?? "claude-haiku-4-5",
-      effort: cheapProfile.effort ?? "low",
+      ...cheapAdapterConfigRest,
+      ...cheapProfileAdapterConfig(cheapProfile, family),
     },
   };
   return {
@@ -432,12 +445,13 @@ export function mergeRuntimePolicy(runtimeConfig, cheapProfile = {}) {
   };
 }
 
-export function needsRuntimePolicyRefresh(runtimeConfig, cheapProfile = {}) {
+export function needsRuntimePolicyRefresh(runtimeConfig, cheapProfile = {}, family = "anthropic") {
   const cheap = runtimeConfig?.modelProfiles?.cheap;
+  const desired = cheapProfileAdapterConfig(cheapProfile, family);
   return runtimeConfig?.heartbeat?.maxConcurrentRuns !== 1
     || cheap?.enabled !== (cheapProfile.enabled !== false)
-    || cheap?.adapterConfig?.model !== (cheapProfile.model ?? "claude-haiku-4-5")
-    || cheap?.adapterConfig?.effort !== (cheapProfile.effort ?? "low");
+    || cheap?.adapterConfig?.model !== desired.model
+    || cheap?.adapterConfig?.effort !== desired.effort;
 }
 
 export function targetConfig(provider, savedConfig, claudeProfiles = {}, desiredConfig = {}) {
@@ -676,11 +690,12 @@ export class QuotaAwareAgentRouter {
   }
 
   async enforceRuntimePolicy(agent) {
-    if (!needsRuntimePolicyRefresh(agent.runtimeConfig, this.config.cheapProfile)) return agent;
+    const family = PROVIDERS[this.currentProvider(agent)]?.family;
+    if (!needsRuntimePolicyRefresh(agent.runtimeConfig, this.config.cheapProfile, family)) return agent;
     const updated = await this.api(`/agents/${agent.id}`, {
       method: "PATCH",
       body: JSON.stringify({
-        runtimeConfig: mergeRuntimePolicy(agent.runtimeConfig, this.config.cheapProfile),
+        runtimeConfig: mergeRuntimePolicy(agent.runtimeConfig, this.config.cheapProfile, family),
       }),
     });
     await this.log("runtime_policy_applied", {
@@ -696,7 +711,8 @@ export class QuotaAwareAgentRouter {
     const currentProvider = this.currentProvider(agent);
     if (currentProvider) state.configs[currentProvider] = agent.adapterConfig ?? {};
 
-    const desiredConfig = PROVIDERS[targetProvider]?.family === "anthropic"
+    const targetFamily = PROVIDERS[targetProvider]?.family;
+    const desiredConfig = targetFamily === "anthropic"
       ? this.desiredClaudeConfig(agent)
       : {};
     const updated = await this.api(`/agents/${agent.id}`, {
@@ -710,7 +726,7 @@ export class QuotaAwareAgentRouter {
           desiredConfig,
         ),
         replaceAdapterConfig: true,
-        runtimeConfig: mergeRuntimePolicy(agent.runtimeConfig, this.config.cheapProfile),
+        runtimeConfig: mergeRuntimePolicy(agent.runtimeConfig, this.config.cheapProfile, targetFamily),
       }),
     });
     state.configs[targetProvider] = updated.adapterConfig ?? targetConfig(

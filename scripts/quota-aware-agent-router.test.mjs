@@ -555,6 +555,32 @@ test("cheap runs are enabled on Haiku at low effort without dropping other profi
   }), false);
 });
 
+test("cheap profile leaves model unset for a non-Anthropic adapter family", () => {
+  const runtime = mergeRuntimePolicy({
+    heartbeat: { enabled: true },
+  }, { model: "claude-haiku-4-5", effort: "low" }, "openai");
+  assert.deepEqual(runtime.modelProfiles.cheap, { enabled: true, adapterConfig: {} });
+  assert.equal(needsRuntimePolicyRefresh(runtime, {
+    model: "claude-haiku-4-5",
+    effort: "low",
+  }, "openai"), false);
+});
+
+test("a stamped Anthropic model is stripped when the cheap profile is reapplied to a non-Anthropic family", () => {
+  const stamped = {
+    heartbeat: { enabled: true },
+    modelProfiles: {
+      cheap: { enabled: true, adapterConfig: { model: "claude-haiku-4-5", effort: "low" } },
+    },
+  };
+  assert.equal(needsRuntimePolicyRefresh(stamped, {
+    model: "claude-haiku-4-5",
+    effort: "low",
+  }, "openai"), true);
+  const cleaned = mergeRuntimePolicy(stamped, { model: "claude-haiku-4-5", effort: "low" }, "openai");
+  assert.deepEqual(cleaned.modelProfiles.cheap.adapterConfig, {});
+});
+
 test("Claude profile quotas are polled with isolated credential environments", async () => {
   const calls = [];
   const router = new QuotaAwareAgentRouter({
