@@ -311,7 +311,20 @@ export class QuotaAwareAgentRouter {
     for (const run of recentFailures) {
       if (this.state.processedQuotaRunIds.includes(run.id)) continue;
       if (isQuotaFailure(run)) return run;
-      const logResult = await this.api(`/heartbeat-runs/${run.id}/log?offset=0&limitBytes=262144`);
+      let logResult;
+      try {
+        logResult = await this.api(`/heartbeat-runs/${run.id}/log?offset=0&limitBytes=262144`);
+      } catch (error) {
+        if (!/ returned 404:/.test(error instanceof Error ? error.message : String(error))) throw error;
+        this.state.processedQuotaRunIds.push(run.id);
+        this.state.processedQuotaRunIds = this.state.processedQuotaRunIds.slice(-200);
+        await this.log("provider_failure_log_missing", {
+          companyId,
+          agentId: agent.id,
+          runId: run.id,
+        });
+        continue;
+      }
       if (isQuotaFailure({ ...run, log: logResult?.content })) return run;
     }
     return null;

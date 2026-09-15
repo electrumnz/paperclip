@@ -182,3 +182,26 @@ test("instance discovery visits every active organisation", async () => {
   await router.tick();
   assert.deepEqual(visited, ["one", "two"]);
 });
+
+test("a pruned historical run log does not abort routing for its organisation", async () => {
+  class MissingLogRouter extends QuotaAwareAgentRouter {
+    async api(pathname) {
+      if (pathname.includes("heartbeat-runs?")) {
+        return [{
+          id: "missing-log-run",
+          status: "failed",
+          errorCode: "process_lost",
+          createdAt: new Date().toISOString(),
+        }];
+      }
+      throw new Error(`GET ${pathname} returned 404: {"error":"Run log not found"}`);
+    }
+
+    async log() {}
+  }
+
+  const router = new MissingLogRouter({ statePath: "/tmp/unused", logPath: "/tmp/unused.log" });
+  const result = await router.quotaFailureForAgent("company", { id: "agent" });
+  assert.equal(result, null);
+  assert.deepEqual(router.state.processedQuotaRunIds, ["missing-log-run"]);
+});
