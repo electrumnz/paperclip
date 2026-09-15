@@ -6,7 +6,10 @@ import {
   chooseProvider,
   chooseProviderWithTelemetry,
   isQuotaFailure,
+  mergeRuntimePolicy,
   needsProviderConfigRefresh,
+  needsRuntimePolicyRefresh,
+  optimizedClaudeConfig,
   preferredProvider,
   providerForAgent,
   QuotaAwareAgentRouter,
@@ -202,34 +205,81 @@ test("Claude account profiles remain distinguishable on the shared adapter", () 
 
 test("Claude profile switching forces the selected credential directory", () => {
   const profiles = {
-    anthropic: { configDir: "/tmp/paperclip-claude", model: "claude-fable-5" },
-    anthropic_personal: { configDir: "/tmp/personal-claude", model: "claude-fable-5" },
+    anthropic: { configDir: "/tmp/paperclip-claude" },
+    anthropic_personal: { configDir: "/tmp/personal-claude" },
   };
   assert.deepEqual(
     targetConfig("anthropic", {
       dangerouslySkipPermissions: true,
       env: { KEEP_ME: "yes", CLAUDE_CONFIG_DIR: "/wrong/account" },
-    }, profiles),
+    }, profiles, { model: "claude-sonnet-5", effort: "medium" }),
     {
       dangerouslySkipPermissions: true,
-      model: "claude-fable-5",
+      model: "claude-sonnet-5",
+      effort: "medium",
       env: { KEEP_ME: "yes", CLAUDE_CONFIG_DIR: "/tmp/paperclip-claude" },
     },
   );
 });
 
-test("existing Claude agents are reconciled to the configured Fable model", () => {
+test("only explicitly overridden principals use Fable while coder agents use Sonnet", () => {
+  const overrides = {
+    principal: { model: "claude-fable-5", effort: "high" },
+    operations: { model: "claude-opus-5", effort: "high" },
+  };
+  assert.deepEqual(
+    optimizedClaudeConfig({ id: "principal", name: "Principal Architect" }, overrides),
+    { model: "claude-fable-5", effort: "high" },
+  );
+  for (const name of [
+    "Frontend Delivery Coder",
+    "Backend Delivery Coder",
+    "Maintenance & Test Coder",
+  ]) {
+    assert.deepEqual(
+      optimizedClaudeConfig({ id: name, name }, overrides),
+      { model: "claude-sonnet-5", effort: "medium" },
+    );
+  }
+  assert.deepEqual(
+    optimizedClaudeConfig({ id: "chair", name: "Chair of Board" }, overrides),
+    { model: "claude-opus-5", effort: "high" },
+  );
+  assert.deepEqual(
+    optimizedClaudeConfig({ id: "operations", name: "AI Processing Operations Lead" }, overrides),
+    { model: "claude-opus-5", effort: "high" },
+  );
+});
+
+test("existing Claude agents are reconciled to their role model", () => {
   const profiles = {
-    anthropic: { configDir: "/tmp/paperclip-claude", model: "claude-fable-5" },
+    anthropic: { configDir: "/tmp/paperclip-claude" },
   };
   assert.equal(needsProviderConfigRefresh({
     adapterType: "claude_local",
-    adapterConfig: { model: "claude-sonnet-5" },
-  }, "anthropic", profiles), true);
+    adapterConfig: { model: "claude-fable-5", effort: "high" },
+  }, "anthropic", profiles, { model: "claude-sonnet-5", effort: "medium" }), true);
   assert.equal(needsProviderConfigRefresh({
     adapterType: "claude_local",
-    adapterConfig: { model: "claude-fable-5" },
-  }, "anthropic", profiles), false);
+    adapterConfig: { model: "claude-sonnet-5", effort: "medium" },
+  }, "anthropic", profiles, { model: "claude-sonnet-5", effort: "medium" }), false);
+});
+
+test("cheap runs are enabled on Haiku at low effort without dropping other profiles", () => {
+  const runtime = mergeRuntimePolicy({
+    heartbeat: { enabled: true },
+    modelProfiles: { specialist: { enabled: true, adapterConfig: { model: "claude-opus-5" } } },
+  }, { model: "claude-haiku-4-5", effort: "low" });
+  assert.equal(runtime.heartbeat.maxConcurrentRuns, 1);
+  assert.deepEqual(runtime.modelProfiles.cheap, {
+    enabled: true,
+    adapterConfig: { model: "claude-haiku-4-5", effort: "low" },
+  });
+  assert.equal(runtime.modelProfiles.specialist.adapterConfig.model, "claude-opus-5");
+  assert.equal(needsRuntimePolicyRefresh(runtime, {
+    model: "claude-haiku-4-5",
+    effort: "low",
+  }), false);
 });
 
 test("Claude profile quotas are polled with isolated credential environments", async () => {

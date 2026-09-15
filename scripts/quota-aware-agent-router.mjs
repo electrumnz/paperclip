@@ -258,17 +258,43 @@ export function providerForAgent(agent, claudeProfiles = {}) {
     : "anthropic";
 }
 
-export function needsProviderConfigRefresh(agent, provider, claudeProfiles = {}) {
+export function optimizedClaudeConfig(agent, overrides = {}, policy = {}) {
+  const override = overrides?.[agent?.id];
+  if (typeof override === "string" && override.trim()) {
+    return { model: override.trim(), effort: "high" };
+  }
+  if (override && typeof override === "object" && typeof override.model === "string") {
+    return {
+      model: override.model.trim(),
+      effort: typeof override.effort === "string" ? override.effort : "high",
+    };
+  }
+  const text = `${agent?.name ?? ""} ${agent?.role ?? ""} ${agent?.title ?? ""}`;
+  if (/\b(?:chair|chief|managing director|director of people)\b/i.test(text)) {
+    return {
+      model: policy.executiveModel ?? "claude-opus-5",
+      effort: policy.executiveEffort ?? "high",
+    };
+  }
+  return {
+    model: policy.defaultModel ?? "claude-sonnet-5",
+    effort: policy.defaultEffort ?? "medium",
+  };
+}
+
+export function needsProviderConfigRefresh(
+  agent,
+  provider,
+  claudeProfiles = {},
+  desiredConfig = {},
+) {
   const profile = claudeProfiles?.[provider];
   if (PROVIDERS[provider]?.family !== "anthropic" || !profile) return false;
-  if (
-    typeof profile.model === "string"
-    && profile.model.trim()
-    && agent?.adapterConfig?.model !== profile.model.trim()
-  ) {
-    return true;
-  }
-  return false;
+  return ["model", "effort"].some((key) => (
+    typeof desiredConfig?.[key] === "string"
+    && desiredConfig[key].trim()
+    && agent?.adapterConfig?.[key] !== desiredConfig[key].trim()
+  ));
 }
 
 function sortIssues(issues) {
@@ -279,7 +305,7 @@ function sortIssues(issues) {
   });
 }
 
-function mergeSingleConcurrency(runtimeConfig) {
+export function mergeRuntimePolicy(runtimeConfig, cheapProfile = {}) {
   const runtime = runtimeConfig && typeof runtimeConfig === "object" ? runtimeConfig : {};
   const heartbeat = runtime.heartbeat && typeof runtime.heartbeat === "object" ? runtime.heartbeat : {};
   const profiles = runtime.modelProfiles && typeof runtime.modelProfiles === "object"
@@ -292,15 +318,33 @@ function mergeSingleConcurrency(runtimeConfig) {
           : {},
       }];
     }))
-    : undefined;
+    : {};
+  const cheap = profiles.cheap && typeof profiles.cheap === "object" ? profiles.cheap : {};
+  profiles.cheap = {
+    ...cheap,
+    enabled: cheapProfile.enabled !== false,
+    adapterConfig: {
+      ...(cheap.adapterConfig && typeof cheap.adapterConfig === "object" ? cheap.adapterConfig : {}),
+      model: cheapProfile.model ?? "claude-haiku-4-5",
+      effort: cheapProfile.effort ?? "low",
+    },
+  };
   return {
     ...runtime,
     heartbeat: { ...heartbeat, maxConcurrentRuns: 1 },
-    ...(profiles ? { modelProfiles: profiles } : {}),
+    modelProfiles: profiles,
   };
 }
 
-export function targetConfig(provider, savedConfig, claudeProfiles = {}) {
+export function needsRuntimePolicyRefresh(runtimeConfig, cheapProfile = {}) {
+  const cheap = runtimeConfig?.modelProfiles?.cheap;
+  return runtimeConfig?.heartbeat?.maxConcurrentRuns !== 1
+    || cheap?.enabled !== (cheapProfile.enabled !== false)
+    || cheap?.adapterConfig?.model !== (cheapProfile.model ?? "claude-haiku-4-5")
+    || cheap?.adapterConfig?.effort !== (cheapProfile.effort ?? "low");
+}
+
+export function targetConfig(provider, savedConfig, claudeProfiles = {}, desiredConfig = {}) {
   let target;
   if (savedConfig && typeof savedConfig === "object") {
     if (provider === "xai" && savedConfig.model === "grok-4.6") {
@@ -317,8 +361,11 @@ export function targetConfig(provider, savedConfig, claudeProfiles = {}) {
   if (PROVIDERS[provider]?.family === "anthropic" && profile?.configDir) {
     return {
       ...target,
-      ...(typeof profile.model === "string" && profile.model.trim()
-        ? { model: profile.model.trim() }
+      ...(typeof desiredConfig.model === "string" && desiredConfig.model.trim()
+        ? { model: desiredConfig.model.trim() }
+        : {}),
+      ...(typeof desiredConfig.effort === "string" && desiredConfig.effort.trim()
+        ? { effort: desiredConfig.effort.trim() }
         : {}),
       env: {
         ...(target?.env && typeof target.env === "object" ? target.env : {}),
@@ -346,6 +393,14 @@ export class QuotaAwareAgentRouter {
 
   currentProvider(agent) {
     return providerForAgent(agent, this.config.claudeProfiles);
+  }
+
+  desiredClaudeConfig(agent) {
+    return optimizedClaudeConfig(
+      agent,
+      this.config.claudeModelOverrides,
+      this.config.claudeRolePolicy,
+    );
   }
 
   async probeClaudeProfile(provider, profile) {
@@ -519,13 +574,15 @@ export class QuotaAwareAgentRouter {
     return entry;
   }
 
-  async enforceSingleConcurrency(agent) {
-    if (agent.runtimeConfig?.heartbeat?.maxConcurrentRuns === 1) return agent;
+  async enforceRuntimePolicy(agent) {
+    if (!needsRuntimePolicyRefresh(agent.runtimeConfig, this.config.cheapProfile)) return agent;
     const updated = await this.api(`/agents/${agent.id}`, {
       method: "PATCH",
-      body: JSON.stringify({ runtimeConfig: mergeSingleConcurrency(agent.runtimeConfig) }),
+      body: JSON.stringify({
+        runtimeConfig: mergeRuntimePolicy(agent.runtimeConfig, this.config.cheapProfile),
+      }),
     });
-    await this.log("concurrency_guard_applied", {
+    await this.log("runtime_policy_applied", {
       companyId: agent.companyId,
       agentId: agent.id,
       agentName: agent.name,
@@ -538,6 +595,9 @@ export class QuotaAwareAgentRouter {
     const currentProvider = this.currentProvider(agent);
     if (currentProvider) state.configs[currentProvider] = agent.adapterConfig ?? {};
 
+    const desiredConfig = PROVIDERS[targetProvider]?.family === "anthropic"
+      ? this.desiredClaudeConfig(agent)
+      : {};
     const updated = await this.api(`/agents/${agent.id}`, {
       method: "PATCH",
       body: JSON.stringify({
@@ -546,15 +606,17 @@ export class QuotaAwareAgentRouter {
           targetProvider,
           state.configs[targetProvider],
           this.config.claudeProfiles,
+          desiredConfig,
         ),
         replaceAdapterConfig: true,
-        runtimeConfig: mergeSingleConcurrency(agent.runtimeConfig),
+        runtimeConfig: mergeRuntimePolicy(agent.runtimeConfig, this.config.cheapProfile),
       }),
     });
     state.configs[targetProvider] = updated.adapterConfig ?? targetConfig(
       targetProvider,
       undefined,
       this.config.claudeProfiles,
+      desiredConfig,
     );
     state.lastSwitchAt = nowIso();
     state.lastSwitchReason = reason;
@@ -713,7 +775,7 @@ export class QuotaAwareAgentRouter {
     for (let agent of agents) {
       const state = this.ensureAgentState(company, agent);
       if (activeAgentIds.has(agent.id) || agent.status === "running") continue;
-      agent = await this.enforceSingleConcurrency(agent);
+      agent = await this.enforceRuntimePolicy(agent);
 
       const quotaRun = await this.quotaFailureForAgent(companyId, agent);
       const quotaIssueId = quotaRun?.contextSnapshot?.issueId ?? quotaRun?.contextSnapshot?.taskId ?? null;
@@ -766,8 +828,16 @@ export class QuotaAwareAgentRouter {
 
       state.lastDecisionKey = null;
 
+      const desiredConfig = PROVIDERS[target]?.family === "anthropic"
+        ? this.desiredClaudeConfig(agent)
+        : {};
       const configRefresh = currentProvider === target
-        && needsProviderConfigRefresh(agent, target, this.config.claudeProfiles);
+        && needsProviderConfigRefresh(
+          agent,
+          target,
+          this.config.claudeProfiles,
+          desiredConfig,
+        );
       if (currentProvider !== target || configRefresh) {
         const lastSwitch = Date.parse(state.lastSwitchAt ?? "");
         const cooldownMs = this.config.switchCooldownMs ?? 60_000;
