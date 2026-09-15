@@ -5,7 +5,7 @@ import { flushSync } from "react-dom";
 import type { Issue, IssueStatus } from "@paperclipai/shared";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { buildTaskGraphLayout, TaskGraphView } from "./TaskGraphView";
+import { buildTaskGraphLayout, filterTaskGraphIssues, TaskGraphView } from "./TaskGraphView";
 
 vi.mock("@/lib/router", () => ({
   Link: ({
@@ -136,19 +136,42 @@ describe("TaskGraphView", () => {
     expect(container.querySelector('path[marker-end="url(#task-graph-blocker-arrow)"]')).not.toBeNull();
   });
 
-  it("hides completed tasks by default and lets the operator reveal them", () => {
-    const active = createIssue(1, "in_progress");
-    const done = createIssue(2, "done");
-    const cancelled = createIssue(3, "cancelled");
-    const container = renderGraph([active, done, cancelled]);
+  it("keeps completed ancestors in the relevant graph but hides finished branches", () => {
+    const completedRoot = createIssue(1, "done");
+    const activeChild = createIssue(2, "in_progress", completedRoot.id);
+    const completedSibling = createIssue(3, "done", completedRoot.id);
+    const completedTree = createIssue(4, "cancelled");
+    const issues = [completedRoot, activeChild, completedSibling, completedTree];
 
+    expect(filterTaskGraphIssues(issues, "relevant").map((issue) => issue.id)).toEqual([
+      completedRoot.id,
+      activeChild.id,
+    ]);
+    expect(filterTaskGraphIssues(issues, "active").map((issue) => issue.id)).toEqual([
+      activeChild.id,
+    ]);
+    expect(filterTaskGraphIssues(issues, "all")).toEqual(issues);
+  });
+
+  it("offers relevant, active-only, and full graph scopes", () => {
+    const completedRoot = createIssue(1, "done");
+    const activeChild = createIssue(2, "in_progress", completedRoot.id);
+    const completedSibling = createIssue(3, "done", completedRoot.id);
+    const completedTree = createIssue(4, "cancelled");
+    const container = renderGraph([completedRoot, activeChild, completedSibling, completedTree]);
+
+    expect(container.querySelectorAll('[data-testid="task-graph-node"]')).toHaveLength(2);
+    expect(container.querySelector('[aria-label="Relevant graph"]')?.getAttribute("aria-pressed")).toBe("true");
+
+    const activeOnly = container.querySelector<HTMLButtonElement>('[aria-label="Active only graph"]');
+    flushSync(() => activeOnly?.click());
     expect(container.querySelectorAll('[data-testid="task-graph-node"]')).toHaveLength(1);
-    const toggle = container.querySelector<HTMLButtonElement>('[aria-label="Show 2 completed tasks"]');
-    expect(toggle).not.toBeNull();
+    expect(activeOnly?.getAttribute("aria-pressed")).toBe("true");
 
-    flushSync(() => toggle?.click());
-    expect(container.querySelectorAll('[data-testid="task-graph-node"]')).toHaveLength(3);
-    expect(container.querySelector('[aria-label="Hide completed tasks"]')).not.toBeNull();
+    const all = container.querySelector<HTMLButtonElement>('[aria-label="All graph"]');
+    flushSync(() => all?.click());
+    expect(container.querySelectorAll('[data-testid="task-graph-node"]')).toHaveLength(4);
+    expect(all?.getAttribute("aria-pressed")).toBe("true");
   });
 
   it("shows a useful empty state", () => {

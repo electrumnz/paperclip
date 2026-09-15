@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from "react";
-import { CheckCircle2, Maximize2, Minus, Plus, Radio } from "lucide-react";
+import { Maximize2, Minus, Plus, Radio } from "lucide-react";
 import type { Issue, IssueStatus } from "@paperclipai/shared";
 
 import { Button } from "./ui/button";
@@ -44,6 +44,37 @@ export interface TaskGraphLayout {
   edges: TaskGraphEdge[];
   width: number;
   height: number;
+}
+
+export type TaskGraphScope = "relevant" | "active" | "all";
+
+function isCompletedTask(issue: Issue): boolean {
+  return issue.status === "done" || issue.status === "cancelled";
+}
+
+export function filterTaskGraphIssues(issues: Issue[], scope: TaskGraphScope): Issue[] {
+  if (scope === "all") return issues;
+
+  const activeIssues = issues.filter((issue) => !isCompletedTask(issue));
+  if (scope === "active") return activeIssues;
+
+  // Keep completed ancestors only when they are needed to preserve the parent
+  // path to current work. Completed siblings, leaves, and wholly completed trees
+  // stay hidden, so the graph retains context without becoming an archive.
+  const issueById = new Map(issues.map((issue) => [issue.id, issue]));
+  const relevantIds = new Set(activeIssues.map((issue) => issue.id));
+  for (const issue of activeIssues) {
+    const visited = new Set<string>();
+    let parentId = issue.parentId;
+    while (parentId && !visited.has(parentId)) {
+      visited.add(parentId);
+      const parent = issueById.get(parentId);
+      if (!parent) break;
+      relevantIds.add(parent.id);
+      parentId = parent.parentId;
+    }
+  }
+  return issues.filter((issue) => relevantIds.has(issue.id));
 }
 
 function issueSort(left: Issue, right: Issue) {
@@ -218,17 +249,9 @@ export function TaskGraphView({
   issues: Issue[];
   liveIssueIds?: ReadonlySet<string>;
 }) {
-  const [showCompleted, setShowCompleted] = useState(false);
-  const completedCount = useMemo(
-    () => issues.filter((issue) => issue.status === "done" || issue.status === "cancelled").length,
-    [issues],
-  );
-  const visibleIssues = useMemo(
-    () => showCompleted
-      ? issues
-      : issues.filter((issue) => issue.status !== "done" && issue.status !== "cancelled"),
-    [issues, showCompleted],
-  );
+  const [scope, setScope] = useState<TaskGraphScope>("relevant");
+  const completedCount = useMemo(() => issues.filter(isCompletedTask).length, [issues]);
+  const visibleIssues = useMemo(() => filterTaskGraphIssues(issues, scope), [issues, scope]);
   const layout = useMemo(() => buildTaskGraphLayout(visibleIssues), [visibleIssues]);
   const nodeById = useMemo(() => new Map(layout.nodes.map((node) => [node.issue.id, node])), [layout.nodes]);
   const [zoom, setZoom] = useState(1);
@@ -253,20 +276,29 @@ export function TaskGraphView({
           <span className="w-5 border-t border-dashed border-red-500/80" /> blocked by
         </span>
         <span className="hidden sm:inline">Swipe or scroll to pan</span>
-        <div className="ml-auto flex items-center gap-2">
-          <Button
-            type="button"
-            variant={showCompleted ? "secondary" : "outline"}
-            size="sm"
-            className="h-8 gap-1.5 px-2 text-(length:--text-nano)"
-            aria-label={showCompleted ? "Hide completed tasks" : `Show ${completedCount} completed tasks`}
-            aria-pressed={showCompleted}
-            onClick={() => setShowCompleted((current) => !current)}
-            disabled={completedCount === 0}
-          >
-            <CheckCircle2 className="h-3.5 w-3.5" />
-            {showCompleted ? "Hide completed" : `Show completed (${completedCount})`}
-          </Button>
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          <div className="flex overflow-hidden rounded-md border border-border bg-background/70" role="group" aria-label="Graph scope">
+            {([
+              ["relevant", "Relevant", "Hide completed branches but keep completed parents needed by active work"],
+              ["active", "Active only", "Hide every completed and cancelled task"],
+              ["all", "All", `Show all tasks, including ${completedCount} completed or cancelled`],
+            ] as const).map(([value, label, title]) => (
+              <button
+                key={value}
+                type="button"
+                className={cn(
+                  "h-8 border-r border-border px-2 text-(length:--text-nano) font-medium text-muted-foreground transition-colors last:border-r-0 hover:text-foreground",
+                  scope === value && "bg-accent text-foreground",
+                )}
+                aria-label={`${label} graph`}
+                aria-pressed={scope === value}
+                title={title}
+                onClick={() => setScope(value)}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
           <div className="flex items-center rounded-md border border-border bg-background/70">
             <Button
               type="button"
@@ -310,7 +342,7 @@ export function TaskGraphView({
       >
         {layout.nodes.length === 0 ? (
           <div className="flex h-full min-h-96 items-center justify-center px-5 text-center text-sm text-muted-foreground">
-            {completedCount > 0 ? "No active tasks. Show completed tasks to view the archive." : "No tasks match the current filters or search."}
+            {completedCount > 0 ? "No active tasks. Choose All to view completed work." : "No tasks match the current filters or search."}
           </div>
         ) : <div className="relative" style={{ width: layout.width * zoom, height: layout.height * zoom }}>
           <div
