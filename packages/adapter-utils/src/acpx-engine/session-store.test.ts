@@ -10,6 +10,7 @@ import {
   createRuntimeStore,
   type AcpSessionRecord,
 } from "acpx/runtime";
+import { ensureRestrictedDir } from "./restricted-files.js";
 import { createCredentialSafeSessionStore, stripPersistedLaunchEnv } from "./session-store.js";
 
 const repoRoot = fileURLToPath(new URL("../../../..", import.meta.url));
@@ -306,4 +307,45 @@ describe("acpx session records on disk", () => {
       expect(storedSessionEnv(entry.parsed)).toBeUndefined();
     }
   }, 60_000);
+});
+
+// KEE-216. Keeping the credential value out of the record (above) is the control
+// that works; this is narrowing on top of it — every seat still runs as the same
+// OS account, so a private directory keeps the records from other OS users and
+// from nothing else.
+describe("session directory mode", () => {
+  async function sessionsDirMode(stateDir: string): Promise<number> {
+    return (await fs.stat(path.join(stateDir, "sessions"))).mode & 0o777;
+  }
+
+  it("keeps the 0700 directory the engine pre-creates", async () => {
+    const root = await createRoot();
+    const stateDir = path.join(root, "state");
+    // What execute.ts does before it hands the stateDir to ACPX.
+    await ensureRestrictedDir(path.join(stateDir, "sessions"));
+
+    const store = createCredentialSafeSessionStore({
+      persisted: createRuntimeStore({ stateDir }),
+      launchEnv: LAUNCH_ENV,
+    });
+    await store.save(baseRecord({ acpx: { session_options: { env: { ...LAUNCH_ENV } } } }));
+    await store.load("record-1");
+
+    // ACPX's `ensureDir()` is `mkdir(recursive)` on every load and save. That is
+    // a no-op on an existing directory — it does not reset the mode — which is
+    // why pre-creating it is enough and no sweep is needed.
+    expect(await sessionsDirMode(stateDir) & 0o077).toBe(0);
+    expect((await readPersistedSessionFiles(stateDir)).length).toBeGreaterThan(0);
+  });
+
+  // Negative control: without the pre-create, ACPX's own mkdir leaves the
+  // directory at the umask default, which is what KEE-193 measured on disk.
+  it("is 0755 from ACPX alone, so the pre-create is what does the work", async () => {
+    const root = await createRoot();
+    const stateDir = path.join(root, "state");
+
+    await createRuntimeStore({ stateDir }).save(baseRecord());
+
+    expect(await sessionsDirMode(stateDir) & 0o077).not.toBe(0);
+  });
 });
