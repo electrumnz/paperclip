@@ -1,27 +1,41 @@
 #!/usr/bin/env node
 
+import { execFile } from "node:child_process";
 import { appendFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { pathToFileURL } from "node:url";
+import { promisify } from "node:util";
+import { fileURLToPath, pathToFileURL } from "node:url";
+
+const execFileAsync = promisify(execFile);
+const scriptDir = dirname(fileURLToPath(import.meta.url));
+const repositoryRoot = resolve(scriptDir, "..");
 
 export const PROVIDERS = {
-  anthropic: { adapterType: "claude_local" },
+  // The first Claude lane is the dedicated Paperclip subscription. The second
+  // is an independently authenticated safety net using the same adapter.
+  anthropic: { adapterType: "claude_local", family: "anthropic" },
+  anthropic_personal: { adapterType: "claude_local", family: "anthropic" },
   openai: { adapterType: "codex_local" },
-  // Grok Build exposes subscription use through OAuth but does not currently
-  // expose quota windows through Paperclip. Treat it as available until an
-  // actual run reports an auth, quota, or rate-limit failure.
+  // Retained only to recognize and migrate agents that were previously parked
+  // on Grok. It is deliberately absent from every selectable fallback order.
   xai: { adapterType: "grok_local", quotaTelemetry: false },
 };
 
 const PROVIDER_FALLBACK_ORDER = {
-  anthropic: ["anthropic", "openai", "xai"],
-  openai: ["openai", "xai", "anthropic"],
-  xai: ["xai", "openai", "anthropic"],
+  anthropic: ["anthropic", "anthropic_personal"],
+  anthropic_personal: ["anthropic_personal", "anthropic"],
+  // Retained only so agents parked on retired Codex or Grok lanes are migrated
+  // back into the active dual-Claude chain. Neither is selectable afterward.
+  openai: ["anthropic", "anthropic_personal"],
+  xai: ["anthropic", "anthropic_personal"],
 };
 
 const ADAPTER_TO_PROVIDER = Object.fromEntries(
-  Object.entries(PROVIDERS).map(([provider, value]) => [value.adapterType, provider]),
+  Object.entries(PROVIDERS)
+    .filter(([, value]) => value.family !== "anthropic")
+    .map(([provider, value]) => [value.adapterType, provider]),
 );
+const ROUTABLE_ADAPTERS = new Set(Object.values(PROVIDERS).map((value) => value.adapterType));
 
 const DEFAULT_CODEX_CONFIG = {
   graceSec: 15,
@@ -50,6 +64,7 @@ const QUOTA_FAILURE_PATTERNS = [
   /no auth credentials for cli-chat-proxy/i,
   /(?:grok|xai).*(?:not authenticated|authentication required|unauthorized)/i,
   /(?:not authenticated|authentication required|unauthorized).*(?:grok|xai)/i,
+  /(?:authentication[_ -]?error|invalid authentication|\b401\b|unauthorized|authentication required|not authenticated)/i,
 ];
 
 const PRIORITY_ORDER = { critical: 0, high: 1, medium: 2, low: 3 };
@@ -103,6 +118,7 @@ export function stabilizeQuotaState(
   reservePercent = 15,
   now = Date.now(),
   staleMs = 15 * 60_000,
+  reservePercentByProvider = {},
 ) {
   const incoming = new Map(
     (Array.isArray(entries) ? entries : []).map((entry) => [entry?.provider, entry]),
@@ -113,8 +129,11 @@ export function stabilizeQuotaState(
   const unknownProviders = [];
 
   for (const provider of Object.keys(PROVIDERS)) {
+    const providerReserve = Number.isFinite(reservePercentByProvider?.[provider])
+      ? Number(reservePercentByProvider[provider])
+      : reservePercent;
     if (PROVIDERS[provider].quotaTelemetry === false) {
-      quota[provider] = summarizeQuota({ provider, ok: true, windows: [] }, reservePercent);
+      quota[provider] = summarizeQuota({ provider, ok: true, windows: [] }, providerReserve);
       continue;
     }
     const entry = incoming.get(provider);
@@ -128,7 +147,7 @@ export function stabilizeQuotaState(
         entry: cleanEntry,
         updatedAt: new Date(now).toISOString(),
       };
-      quota[provider] = summarizeQuota(cleanEntry, reservePercent);
+      quota[provider] = summarizeQuota(cleanEntry, providerReserve);
       continue;
     }
 
@@ -138,8 +157,8 @@ export function stabilizeQuotaState(
     const fresh = Number.isFinite(cachedAt) && now - cachedAt <= staleMs;
     if (!fresh) unknownProviders.push(provider);
     quota[provider] = fresh
-      ? summarizeQuota(cached.entry, reservePercent)
-      : summarizeQuota({ provider, ok: true, windows: [] }, reservePercent);
+      ? summarizeQuota(cached.entry, providerReserve)
+      : summarizeQuota({ provider, ok: true, windows: [] }, providerReserve);
   }
 
   return { quota, cache, degradedProviders, unknownProviders };
@@ -161,6 +180,7 @@ export function preferredProvider(agent, issue, configuredPrimary) {
   if (/research|market|competitive|demand|strategy|synthesis|thesis|writing|brief/i.test(text)) {
     return "anthropic";
   }
+  if (agent?.adapterType === "claude_local") return "anthropic";
   return ADAPTER_TO_PROVIDER[agent?.adapterType] ?? "openai";
 }
 
@@ -211,8 +231,44 @@ export function withObservedProviderFailure(quota, provider) {
 
 export function routableAgents(agents) {
   return (Array.isArray(agents) ? agents : []).filter(
-    (agent) => Boolean(ADAPTER_TO_PROVIDER[agent?.adapterType]),
+    (agent) => ROUTABLE_ADAPTERS.has(agent?.adapterType),
   );
+}
+
+export function providerForAgent(agent, claudeProfiles = {}) {
+  if (agent?.adapterType !== "claude_local") {
+    return ADAPTER_TO_PROVIDER[agent?.adapterType] ?? null;
+  }
+  const configDirValue = agent?.adapterConfig?.env?.CLAUDE_CONFIG_DIR;
+  const configDir = typeof configDirValue === "string"
+    ? configDirValue
+    : configDirValue?.type === "plain" && typeof configDirValue.value === "string"
+      ? configDirValue.value
+      : null;
+  if (typeof configDir === "string" && configDir.trim()) {
+    const match = Object.entries(claudeProfiles).find(
+      ([, profile]) => resolve(String(profile?.configDir ?? "")) === resolve(configDir.trim()),
+    );
+    if (match) return match[0];
+  }
+  // Legacy Claude agents without an explicit profile used the existing
+  // ~/.claude login, which is now the personal fallback lane.
+  return Object.hasOwn(claudeProfiles, "anthropic_personal")
+    ? "anthropic_personal"
+    : "anthropic";
+}
+
+export function needsProviderConfigRefresh(agent, provider, claudeProfiles = {}) {
+  const profile = claudeProfiles?.[provider];
+  if (PROVIDERS[provider]?.family !== "anthropic" || !profile) return false;
+  if (
+    typeof profile.model === "string"
+    && profile.model.trim()
+    && agent?.adapterConfig?.model !== profile.model.trim()
+  ) {
+    return true;
+  }
+  return false;
 }
 
 function sortIssues(issues) {
@@ -244,17 +300,33 @@ function mergeSingleConcurrency(runtimeConfig) {
   };
 }
 
-export function targetConfig(provider, savedConfig) {
+export function targetConfig(provider, savedConfig, claudeProfiles = {}) {
+  let target;
   if (savedConfig && typeof savedConfig === "object") {
     if (provider === "xai" && savedConfig.model === "grok-4.6") {
       const { model: _legacyPinnedModel, ...usingGrokBuildDefault } = savedConfig;
-      return usingGrokBuildDefault;
+      target = usingGrokBuildDefault;
+    } else {
+      target = savedConfig;
     }
-    return savedConfig;
+  } else if (provider === "openai") target = DEFAULT_CODEX_CONFIG;
+  else if (provider === "xai") target = DEFAULT_GROK_CONFIG;
+  else target = { dangerouslySkipPermissions: true };
+
+  const profile = claudeProfiles?.[provider];
+  if (PROVIDERS[provider]?.family === "anthropic" && profile?.configDir) {
+    return {
+      ...target,
+      ...(typeof profile.model === "string" && profile.model.trim()
+        ? { model: profile.model.trim() }
+        : {}),
+      env: {
+        ...(target?.env && typeof target.env === "object" ? target.env : {}),
+        CLAUDE_CONFIG_DIR: resolve(String(profile.configDir)),
+      },
+    };
   }
-  if (provider === "openai") return DEFAULT_CODEX_CONFIG;
-  if (provider === "xai") return DEFAULT_GROK_CONFIG;
-  return { dangerouslySkipPermissions: true };
+  return target;
 }
 
 function nowIso() {
@@ -268,6 +340,74 @@ export class QuotaAwareAgentRouter {
     this.statePath = resolve(config.statePath);
     this.logPath = resolve(config.logPath);
     this.state = { version: 1, agents: {}, processedQuotaRunIds: [] };
+    this.execFile = config.execFile ?? execFileAsync;
+    this.claudeQuotaCache = null;
+  }
+
+  currentProvider(agent) {
+    return providerForAgent(agent, this.config.claudeProfiles);
+  }
+
+  async probeClaudeProfile(provider, profile) {
+    const tsxCommand = resolve(
+      this.config.claudeQuotaProbeCommand
+        ?? `${repositoryRoot}/node_modules/.pnpm/node_modules/.bin/tsx`,
+    );
+    const probeScript = resolve(
+      this.config.claudeQuotaProbeScript
+        ?? `${repositoryRoot}/packages/adapters/claude-local/src/cli/quota-probe.ts`,
+    );
+    try {
+      const { stdout } = await this.execFile(
+        tsxCommand,
+        [probeScript, "--json", "--oauth-only"],
+        {
+          cwd: repositoryRoot,
+          env: {
+            ...process.env,
+            CLAUDE_CONFIG_DIR: resolve(String(profile.configDir)),
+          },
+          timeout: this.config.claudeQuotaProbeTimeoutMs ?? 20_000,
+          maxBuffer: 2 * 1024 * 1024,
+        },
+      );
+      const result = JSON.parse(stdout);
+      const oauth = result?.oauth;
+      return {
+        provider,
+        ok: oauth?.ok === true,
+        windows: Array.isArray(oauth?.windows) ? oauth.windows : [],
+        ...(oauth?.ok === true ? {} : { error: oauth?.error ?? "Claude quota probe failed" }),
+      };
+    } catch (error) {
+      return {
+        provider,
+        ok: false,
+        windows: [],
+        error: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  async claudeQuotaEntries() {
+    const profiles = Object.entries(this.config.claudeProfiles ?? {})
+      .filter(([provider, profile]) => (
+        PROVIDERS[provider]?.family === "anthropic"
+        && profile?.configDir
+        && profile?.quotaSource !== "paperclip"
+      ));
+    if (!profiles.length) return [];
+
+    const now = Date.now();
+    const cacheMs = this.config.claudeQuotaPollMs ?? 60_000;
+    if (this.claudeQuotaCache && now - this.claudeQuotaCache.updatedAt < cacheMs) {
+      return this.claudeQuotaCache.entries;
+    }
+    const entries = await Promise.all(
+      profiles.map(([provider, profile]) => this.probeClaudeProfile(provider, profile)),
+    );
+    this.claudeQuotaCache = { updatedAt: now, entries };
+    return entries;
   }
 
   async log(event, details = {}) {
@@ -353,7 +493,7 @@ export class QuotaAwareAgentRouter {
   }
 
   ensureAgentState(company, agent) {
-    const currentProvider = ADAPTER_TO_PROVIDER[agent.adapterType];
+    const currentProvider = this.currentProvider(agent);
     const configuredPrimary = this.config.primaryProviderByAgent?.[agent.id]
       ?? this.config.defaultPrimaryProvider;
     const initialPrimary = Object.hasOwn(PROVIDERS, configuredPrimary)
@@ -395,19 +535,27 @@ export class QuotaAwareAgentRouter {
 
   async switchAgent(company, agent, targetProvider, reason) {
     const state = this.ensureAgentState(company, agent);
-    const currentProvider = ADAPTER_TO_PROVIDER[agent.adapterType];
+    const currentProvider = this.currentProvider(agent);
     if (currentProvider) state.configs[currentProvider] = agent.adapterConfig ?? {};
 
     const updated = await this.api(`/agents/${agent.id}`, {
       method: "PATCH",
       body: JSON.stringify({
         adapterType: PROVIDERS[targetProvider].adapterType,
-        adapterConfig: targetConfig(targetProvider, state.configs[targetProvider]),
+        adapterConfig: targetConfig(
+          targetProvider,
+          state.configs[targetProvider],
+          this.config.claudeProfiles,
+        ),
         replaceAdapterConfig: true,
         runtimeConfig: mergeSingleConcurrency(agent.runtimeConfig),
       }),
     });
-    state.configs[targetProvider] = updated.adapterConfig ?? targetConfig(targetProvider);
+    state.configs[targetProvider] = updated.adapterConfig ?? targetConfig(
+      targetProvider,
+      undefined,
+      this.config.claudeProfiles,
+    );
     state.lastSwitchAt = nowIso();
     state.lastSwitchReason = reason;
     await this.saveState();
@@ -501,12 +649,21 @@ export class QuotaAwareAgentRouter {
     ]);
     this.state.companies ??= {};
     const companyState = (this.state.companies[companyId] ??= {});
+    const claudeQuota = await this.claudeQuotaEntries();
+    const endpointQuota = Array.isArray(quotaResult)
+      ? quotaResult.map((entry) => (
+        entry?.provider === "anthropic"
+          ? { ...entry, provider: "anthropic_personal" }
+          : entry
+      ))
+      : [];
     const stableQuota = stabilizeQuotaState(
-      quotaResult,
+      claudeQuota.length ? [...endpointQuota, ...claudeQuota] : quotaResult,
       companyState.quotaLastGood,
       this.config.reservePercent ?? 15,
       Date.now(),
       this.config.quotaStaleMs ?? 15 * 60_000,
+      this.config.reservePercentByProvider,
     );
     companyState.quotaLastGood = stableQuota.cache;
     const quota = stableQuota.quota;
@@ -565,11 +722,11 @@ export class QuotaAwareAgentRouter {
       const actionable = assigned.find((issue) => ACTIONABLE_STATUSES.has(issue.status)) ?? quotaIssue;
       const urgent = Boolean(quotaRun) || ["critical", "high"].includes(actionable?.priority);
       const preferred = preferredProvider(agent, actionable, state.primaryProvider);
-      const failedProvider = quotaRun ? ADAPTER_TO_PROVIDER[agent.adapterType] : null;
+      const failedProvider = quotaRun ? this.currentProvider(agent) : null;
       const routingQuota = failedProvider
         ? withObservedProviderFailure(quota, failedProvider)
         : quota;
-      const currentProvider = ADAPTER_TO_PROVIDER[agent.adapterType];
+      const currentProvider = this.currentProvider(agent);
       const target = chooseProviderWithTelemetry({
         preferred,
         current: currentProvider,
@@ -609,7 +766,9 @@ export class QuotaAwareAgentRouter {
 
       state.lastDecisionKey = null;
 
-      if (currentProvider !== target) {
+      const configRefresh = currentProvider === target
+        && needsProviderConfigRefresh(agent, target, this.config.claudeProfiles);
+      if (currentProvider !== target || configRefresh) {
         const lastSwitch = Date.parse(state.lastSwitchAt ?? "");
         const cooldownMs = this.config.switchCooldownMs ?? 60_000;
         if (Number.isFinite(lastSwitch) && Date.now() - lastSwitch < cooldownMs && !quotaRun) continue;
@@ -619,6 +778,8 @@ export class QuotaAwareAgentRouter {
           target,
           quotaRun
             ? `quota failure in run ${quotaRun.id}; ${currentProvider} constrained`
+            : configRefresh
+              ? `${target} account configuration refreshed`
             : target === preferred
               ? `${preferred} capacity available; restored preferred provider`
               : `${preferred} unavailable above reserve threshold`,

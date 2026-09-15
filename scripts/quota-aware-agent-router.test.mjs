@@ -6,7 +6,9 @@ import {
   chooseProvider,
   chooseProviderWithTelemetry,
   isQuotaFailure,
+  needsProviderConfigRefresh,
   preferredProvider,
+  providerForAgent,
   QuotaAwareAgentRouter,
   routableAgents,
   stabilizeQuotaState,
@@ -39,26 +41,53 @@ test("Claude is also blocked when only the five-hour session window is exhausted
   assert.equal(quota.limitingWindows[0].label, "Current session");
 });
 
-test("Grok is used before spending protected Codex or Claude reserve", () => {
+test("Keece Claude falls back only to Electrum Claude", () => {
   const quota = buildQuotaState([
     { provider: "anthropic", ok: true, windows: [{ label: "week", usedPercent: 100 }] },
-    { provider: "openai", ok: true, windows: [{ label: "5h", usedPercent: 97 }] },
+    { provider: "anthropic_personal", ok: true, windows: [{ label: "week", usedPercent: 20 }] },
+    { provider: "openai", ok: true, windows: [{ label: "5h", usedPercent: 30 }] },
   ], 15);
-  assert.equal(chooseProvider({ preferred: "anthropic", quota, urgent: false }), "xai");
-  assert.equal(chooseProvider({ preferred: "anthropic", quota, urgent: true }), "xai");
+  assert.equal(chooseProvider({ preferred: "anthropic", quota, urgent: false }), "anthropic_personal");
+  quota.anthropic_personal.reserveBlocked = true;
+  assert.equal(chooseProvider({ preferred: "anthropic", quota, urgent: false }), null);
 });
 
-test("Codex switches to Grok when its usage reaches the configured 90 percent threshold", () => {
+test("Keece Claude switches to Electrum Claude at the configured 90 percent threshold", () => {
   const quota = buildQuotaState([
-    { provider: "anthropic", ok: true, windows: [{ label: "week", usedPercent: 82 }] },
-    { provider: "openai", ok: true, windows: [{ label: "5h", usedPercent: 90 }] },
+    { provider: "anthropic", ok: true, windows: [{ label: "week", usedPercent: 90 }] },
+    { provider: "anthropic_personal", ok: true, windows: [{ label: "week", usedPercent: 82 }] },
+    { provider: "openai", ok: true, windows: [{ label: "5h", usedPercent: 20 }] },
   ], 10);
-  assert.equal(chooseProvider({ preferred: "openai", quota, urgent: false }), "xai");
+  assert.equal(chooseProvider({ preferred: "anthropic", quota, urgent: false }), "anthropic_personal");
+});
+
+test("per-provider reserve lets Keece Claude run to 95 percent", () => {
+  const result = stabilizeQuotaState(
+    [
+      { provider: "anthropic", ok: true, windows: [{ label: "week", usedPercent: 94 }] },
+      { provider: "anthropic_personal", ok: true, windows: [{ label: "week", usedPercent: 40 }] },
+      { provider: "openai", ok: true, windows: [{ label: "5h", usedPercent: 20 }] },
+    ],
+    {},
+    10,
+    Date.now(),
+    15 * 60_000,
+    { anthropic: 5 },
+  );
+  assert.equal(result.quota.anthropic.reserveBlocked, false);
+  result.quota.anthropic = summarizeQuota({
+    provider: "anthropic",
+    ok: true,
+    windows: [{ label: "week", usedPercent: 95 }],
+  }, 5);
+  assert.equal(result.quota.anthropic.reserveBlocked, true);
+  assert.equal(chooseProvider({ preferred: "anthropic", quota: result.quota }), "anthropic_personal");
 });
 
 test("a provider at hard exhaustion is never selected", () => {
   const quota = buildQuotaState([
     { provider: "anthropic", ok: true, windows: [{ label: "week", usedPercent: 100 }] },
+    { provider: "anthropic_personal", ok: true, windows: [{ label: "week", usedPercent: 100 }] },
     { provider: "openai", ok: true, windows: [{ label: "5h", usedPercent: 100 }] },
     { provider: "xai", ok: true, windows: [{ label: "week", usedPercent: 100 }] },
   ]);
@@ -80,6 +109,7 @@ test("a temporary quota polling failure reuses recent known-good windows", () =>
   const result = stabilizeQuotaState(
     [
       { provider: "anthropic", ok: false, error: "usage endpoint returned 429" },
+      { provider: "anthropic_personal", ok: true, windows: [{ label: "Current week", usedPercent: 20 }] },
       { provider: "openai", ok: true, windows: [{ label: "5h", usedPercent: 5 }] },
     ],
     previous,
@@ -100,7 +130,7 @@ test("missing quota telemetry alone does not mark a provider exhausted", () => {
   assert.equal(result.quota.anthropic.hardBlocked, false);
   assert.equal(result.quota.anthropic.reserveBlocked, false);
   assert.equal(result.quota.anthropic.maxUsedPercent, null);
-  assert.deepEqual(result.unknownProviders, ["anthropic", "openai"]);
+  assert.deepEqual(result.unknownProviders, ["anthropic", "anthropic_personal", "openai"]);
 });
 
 test("unknown telemetry never flips a healthy agent back to the preferred provider", () => {
@@ -134,7 +164,14 @@ test("Grok OAuth failures are treated as provider-unavailable failures", () => {
   }), true);
 });
 
-test("Grok fallback follows the authenticated Grok Build default model", () => {
+test("generic 401 authentication failures trigger provider fallback", () => {
+  assert.equal(isQuotaFailure({
+    errorCode: "acpx_turn_failed",
+    log: "Upstream request failed with HTTP 401 Unauthorized",
+  }), true);
+});
+
+test("legacy Grok state can be normalized during migration without a model pin", () => {
   assert.deepEqual(targetConfig("xai"), {
     graceSec: 20,
     timeoutSec: 0,
@@ -147,17 +184,110 @@ test("Grok fallback follows the authenticated Grok Build default model", () => {
   );
 });
 
+test("Claude account profiles remain distinguishable on the shared adapter", () => {
+  const profiles = {
+    anthropic: { configDir: "/tmp/paperclip-claude" },
+    anthropic_personal: { configDir: "/tmp/personal-claude" },
+  };
+  assert.equal(providerForAgent({
+    adapterType: "claude_local",
+    adapterConfig: { env: { CLAUDE_CONFIG_DIR: { type: "plain", value: "/tmp/paperclip-claude" } } },
+  }, profiles), "anthropic");
+  assert.equal(providerForAgent({
+    adapterType: "claude_local",
+    adapterConfig: { env: { CLAUDE_CONFIG_DIR: "/tmp/personal-claude" } },
+  }, profiles), "anthropic_personal");
+  assert.equal(providerForAgent({ adapterType: "claude_local", adapterConfig: {} }, profiles), "anthropic_personal");
+});
+
+test("Claude profile switching forces the selected credential directory", () => {
+  const profiles = {
+    anthropic: { configDir: "/tmp/paperclip-claude", model: "claude-fable-5" },
+    anthropic_personal: { configDir: "/tmp/personal-claude", model: "claude-fable-5" },
+  };
+  assert.deepEqual(
+    targetConfig("anthropic", {
+      dangerouslySkipPermissions: true,
+      env: { KEEP_ME: "yes", CLAUDE_CONFIG_DIR: "/wrong/account" },
+    }, profiles),
+    {
+      dangerouslySkipPermissions: true,
+      model: "claude-fable-5",
+      env: { KEEP_ME: "yes", CLAUDE_CONFIG_DIR: "/tmp/paperclip-claude" },
+    },
+  );
+});
+
+test("existing Claude agents are reconciled to the configured Fable model", () => {
+  const profiles = {
+    anthropic: { configDir: "/tmp/paperclip-claude", model: "claude-fable-5" },
+  };
+  assert.equal(needsProviderConfigRefresh({
+    adapterType: "claude_local",
+    adapterConfig: { model: "claude-sonnet-5" },
+  }, "anthropic", profiles), true);
+  assert.equal(needsProviderConfigRefresh({
+    adapterType: "claude_local",
+    adapterConfig: { model: "claude-fable-5" },
+  }, "anthropic", profiles), false);
+});
+
+test("Claude profile quotas are polled with isolated credential environments", async () => {
+  const calls = [];
+  const router = new QuotaAwareAgentRouter({
+    statePath: "/tmp/unused",
+    logPath: "/tmp/unused.log",
+    claudeProfiles: {
+      anthropic: { configDir: "/tmp/paperclip-claude" },
+      anthropic_personal: { configDir: "/tmp/personal-claude" },
+    },
+    execFile: async (command, args, options) => {
+      calls.push({ command, args, configDir: options.env.CLAUDE_CONFIG_DIR });
+      return {
+        stdout: JSON.stringify({
+          oauth: { ok: true, windows: [{ label: "Current session", usedPercent: 12 }] },
+        }),
+      };
+    },
+  });
+  const entries = await router.claudeQuotaEntries();
+  assert.deepEqual(entries.map((entry) => [entry.provider, entry.windows[0].usedPercent]), [
+    ["anthropic", 12],
+    ["anthropic_personal", 12],
+  ]);
+  assert.deepEqual(calls.map((call) => call.configDir), [
+    "/tmp/paperclip-claude",
+    "/tmp/personal-claude",
+  ]);
+  assert.equal(calls.every((call) => call.args.includes("--oauth-only")), true);
+});
+
+test("the dedicated Claude profile leads the fleet-wide fallback chain", () => {
+  const quota = buildQuotaState([
+    { provider: "anthropic", ok: true, windows: [{ label: "5h", usedPercent: 10 }] },
+    { provider: "openai", ok: true, windows: [{ label: "5h", usedPercent: 20 }] },
+    { provider: "xai", ok: true, windows: [] },
+    { provider: "anthropic_personal", ok: true, windows: [{ label: "5h", usedPercent: 5 }] },
+  ], 10);
+  assert.equal(chooseProvider({ preferred: "anthropic", quota }), "anthropic");
+  quota.anthropic.reserveBlocked = true;
+  assert.equal(chooseProvider({ preferred: "anthropic", quota }), "anthropic_personal");
+  quota.anthropic_personal.reserveBlocked = true;
+  assert.equal(chooseProvider({ preferred: "anthropic", quota }), null);
+});
+
 test("one agent's observed failure does not poison shared fleet quota state", () => {
   const quota = buildQuotaState([
     { provider: "anthropic", ok: true, windows: [{ label: "week", usedPercent: 50 }] },
+    { provider: "anthropic_personal", ok: true, windows: [{ label: "week", usedPercent: 20 }] },
     { provider: "openai", ok: true, windows: [{ label: "5h", usedPercent: 80 }] },
   ], 10);
-  const affectedAgentQuota = withObservedProviderFailure(quota, "openai");
+  const affectedAgentQuota = withObservedProviderFailure(quota, "anthropic");
 
-  assert.equal(affectedAgentQuota.openai.hardBlocked, true);
-  assert.equal(chooseProvider({ preferred: "openai", quota: affectedAgentQuota }), "xai");
-  assert.equal(quota.openai.hardBlocked, false);
-  assert.equal(chooseProvider({ preferred: "openai", quota }), "openai");
+  assert.equal(affectedAgentQuota.anthropic.hardBlocked, true);
+  assert.equal(chooseProvider({ preferred: "anthropic", quota: affectedAgentQuota }), "anthropic_personal");
+  assert.equal(quota.anthropic.hardBlocked, false);
+  assert.equal(chooseProvider({ preferred: "anthropic", quota }), "anthropic");
 });
 
 test("task fit prefers Codex for engineering and Claude for research", () => {
@@ -165,27 +295,28 @@ test("task fit prefers Codex for engineering and Claude for research", () => {
   assert.equal(preferredProvider({ role: "researcher" }, { title: "Demand evidence pass" }), "anthropic");
 });
 
-test("configured Codex-first policy overrides task-fit routing", () => {
+test("legacy configured Codex preference can still be recognized for migration", () => {
   assert.equal(
     preferredProvider({ role: "researcher" }, { title: "Demand evidence pass" }, "openai"),
     "openai",
   );
 });
 
-test("cheap model-profile runs use the same fleet-wide Grok fallback", () => {
+test("cheap model-profile runs use the same Claude account fallback chain", () => {
   const issue = {
     title: "Summarize routine status",
     assigneeAdapterOverrides: { modelProfile: "cheap" },
   };
   const quota = buildQuotaState([
     { provider: "anthropic", ok: true, windows: [{ label: "week", usedPercent: 92 }] },
-    { provider: "openai", ok: true, windows: [{ label: "5h", usedPercent: 90 }] },
+    { provider: "anthropic_personal", ok: true, windows: [{ label: "week", usedPercent: 40 }] },
+    { provider: "openai", ok: true, windows: [{ label: "5h", usedPercent: 20 }] },
   ], 10);
-  const preferred = preferredProvider({ role: "operator" }, issue, "openai");
-  assert.equal(chooseProvider({ preferred, quota, urgent: false }), "xai");
+  const preferred = preferredProvider({ role: "operator" }, issue, "anthropic");
+  assert.equal(chooseProvider({ preferred, quota, urgent: false }), "anthropic_personal");
 });
 
-test("all present and future Claude, Codex, and Grok agents are routable without an allowlist", () => {
+test("legacy Grok agents remain discoverable only so the router can migrate them", () => {
   assert.deepEqual(
     routableAgents([
       { id: "existing", adapterType: "claude_local" },
@@ -218,11 +349,11 @@ test("instance discovery visits every active organisation", async () => {
   assert.deepEqual(visited, ["one", "two"]);
 });
 
-test("the default primary policy is applied to existing and future agents", () => {
+test("the default Keece Claude primary policy is applied to existing and future agents", () => {
   const router = new QuotaAwareAgentRouter({
     statePath: "/tmp/unused",
     logPath: "/tmp/unused.log",
-    defaultPrimaryProvider: "openai",
+    defaultPrimaryProvider: "anthropic",
   });
   const company = { id: "company", name: "Company" };
   const existingClaude = router.ensureAgentState(company, {
@@ -235,8 +366,8 @@ test("the default primary policy is applied to existing and future agents", () =
     adapterType: "grok_local",
     adapterConfig: {},
   });
-  assert.equal(existingClaude.primaryProvider, "openai");
-  assert.equal(futureGrok.primaryProvider, "openai");
+  assert.equal(existingClaude.primaryProvider, "anthropic");
+  assert.equal(futureGrok.primaryProvider, "anthropic");
 });
 
 test("a pruned historical run log does not abort routing for its organisation", async () => {
