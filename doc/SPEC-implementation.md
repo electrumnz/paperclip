@@ -617,7 +617,10 @@ run context fails closed before mutation. A run may attempt at most 20 cross-iss
 updates, or issue-thread interaction resolutions across one shared counter. The
 server records each attempt with its source issue, target issue, run, count, and
 rollout mode, and fails closed with the cap in the error once enforcement is
-active. Writes to the run's own source issue are not counted. Assignee self-comments do not
+active. A verified unscoped `heartbeat_timer` run has no source issue, so every
+issue mutation it attempts consumes this same counter and records
+`sourceKind: heartbeat_timer`; missing or forged run context still fails closed.
+Writes to the run's own source issue are not counted. Assignee self-comments do not
 wake the assignee, and a non-assignee comment cannot mint a mention grant.
 
 Agent-authored issue comments persist the responsible user derived from the
