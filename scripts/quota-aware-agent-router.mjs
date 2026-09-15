@@ -7,6 +7,16 @@ import { pathToFileURL } from "node:url";
 export const PROVIDERS = {
   anthropic: { adapterType: "claude_local" },
   openai: { adapterType: "codex_local" },
+  // Grok Build exposes subscription use through OAuth but does not currently
+  // expose quota windows through Paperclip. Treat it as available until an
+  // actual run reports an auth, quota, or rate-limit failure.
+  xai: { adapterType: "grok_local", quotaTelemetry: false },
+};
+
+const PROVIDER_FALLBACK_ORDER = {
+  anthropic: ["anthropic", "openai", "xai"],
+  openai: ["openai", "xai", "anthropic"],
+  xai: ["xai", "openai", "anthropic"],
 };
 
 const ADAPTER_TO_PROVIDER = Object.fromEntries(
@@ -17,6 +27,14 @@ const DEFAULT_CODEX_CONFIG = {
   graceSec: 15,
   timeoutSec: 0,
   dangerouslyBypassApprovalsAndSandbox: true,
+};
+
+const DEFAULT_GROK_CONFIG = {
+  model: "grok-4.6",
+  graceSec: 20,
+  timeoutSec: 0,
+  alwaysApprove: true,
+  disableWebSearch: true,
 };
 
 const QUOTA_FAILURE_PATTERNS = [
@@ -30,6 +48,9 @@ const QUOTA_FAILURE_PATTERNS = [
   /too many requests/i,
   /insufficient[_ -]?quota/i,
   /(?:credits?|quota) (?:are )?(?:exhausted|depleted)/i,
+  /no auth credentials for cli-chat-proxy/i,
+  /(?:grok|xai).*(?:not authenticated|authentication required|unauthorized)/i,
+  /(?:not authenticated|authentication required|unauthorized).*(?:grok|xai)/i,
 ];
 
 const PRIORITY_ORDER = { critical: 0, high: 1, medium: 2, low: 3 };
@@ -70,7 +91,9 @@ export function buildQuotaState(entries, reservePercent = 15) {
     ]),
   );
   for (const provider of Object.keys(PROVIDERS)) {
-    byProvider[provider] ??= summarizeQuota(null, reservePercent);
+    byProvider[provider] ??= PROVIDERS[provider].quotaTelemetry === false
+      ? summarizeQuota({ provider, ok: true, windows: [] }, reservePercent)
+      : summarizeQuota(null, reservePercent);
   }
   return byProvider;
 }
@@ -91,6 +114,10 @@ export function stabilizeQuotaState(
   const unknownProviders = [];
 
   for (const provider of Object.keys(PROVIDERS)) {
+    if (PROVIDERS[provider].quotaTelemetry === false) {
+      quota[provider] = summarizeQuota({ provider, ok: true, windows: [] }, reservePercent);
+      continue;
+    }
     const entry = incoming.get(provider);
     if (entry?.ok === true) {
       const cleanEntry = {
@@ -134,16 +161,15 @@ export function preferredProvider(agent, issue, configuredPrimary) {
   if (/research|market|competitive|demand|strategy|synthesis|thesis|writing|brief/i.test(text)) {
     return "anthropic";
   }
-  if (configuredPrimary === "anthropic" || configuredPrimary === "openai") return configuredPrimary;
+  if (Object.hasOwn(PROVIDERS, configuredPrimary)) return configuredPrimary;
   return ADAPTER_TO_PROVIDER[agent?.adapterType] ?? "openai";
 }
 
 export function chooseProvider({ preferred, quota, urgent = false }) {
-  const alternate = preferred === "anthropic" ? "openai" : "anthropic";
-  if (!quota[preferred]?.reserveBlocked) return preferred;
-  if (!quota[alternate]?.reserveBlocked) return alternate;
-  if (urgent && !quota[preferred]?.hardBlocked) return preferred;
-  if (urgent && !quota[alternate]?.hardBlocked) return alternate;
+  const candidates = PROVIDER_FALLBACK_ORDER[preferred] ?? Object.keys(PROVIDERS);
+  const available = candidates.find((provider) => !quota[provider]?.reserveBlocked);
+  if (available) return available;
+  if (urgent) return candidates.find((provider) => !quota[provider]?.hardBlocked) ?? null;
   return null;
 }
 
@@ -204,7 +230,9 @@ function mergeSingleConcurrency(runtimeConfig) {
 
 function targetConfig(provider, savedConfig) {
   if (savedConfig && typeof savedConfig === "object") return savedConfig;
-  return provider === "openai" ? DEFAULT_CODEX_CONFIG : { dangerouslySkipPermissions: true };
+  if (provider === "openai") return DEFAULT_CODEX_CONFIG;
+  if (provider === "xai") return DEFAULT_GROK_CONFIG;
+  return { dangerouslySkipPermissions: true };
 }
 
 function nowIso() {
