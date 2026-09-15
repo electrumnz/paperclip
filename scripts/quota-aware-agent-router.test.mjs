@@ -11,6 +11,7 @@ import {
   routableAgents,
   stabilizeQuotaState,
   summarizeQuota,
+  targetConfig,
   withObservedProviderFailure,
 } from "./quota-aware-agent-router.mjs";
 
@@ -131,6 +132,19 @@ test("Grok OAuth failures are treated as provider-unavailable failures", () => {
     errorCode: "adapter_failed",
     log: "Grok is not authenticated: No auth credentials for cli-chat-proxy",
   }), true);
+});
+
+test("Grok fallback follows the authenticated Grok Build default model", () => {
+  assert.deepEqual(targetConfig("xai"), {
+    graceSec: 20,
+    timeoutSec: 0,
+    alwaysApprove: true,
+    disableWebSearch: true,
+  });
+  assert.deepEqual(
+    targetConfig("xai", { model: "grok-4.6", alwaysApprove: true }),
+    { alwaysApprove: true },
+  );
 });
 
 test("one agent's observed failure does not poison shared fleet quota state", () => {

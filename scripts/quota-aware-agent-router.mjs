@@ -30,7 +30,6 @@ const DEFAULT_CODEX_CONFIG = {
 };
 
 const DEFAULT_GROK_CONFIG = {
-  model: "grok-4.6",
   graceSec: 20,
   timeoutSec: 0,
   alwaysApprove: true,
@@ -245,8 +244,14 @@ function mergeSingleConcurrency(runtimeConfig) {
   };
 }
 
-function targetConfig(provider, savedConfig) {
-  if (savedConfig && typeof savedConfig === "object") return savedConfig;
+export function targetConfig(provider, savedConfig) {
+  if (savedConfig && typeof savedConfig === "object") {
+    if (provider === "xai" && savedConfig.model === "grok-4.6") {
+      const { model: _legacyPinnedModel, ...usingGrokBuildDefault } = savedConfig;
+      return usingGrokBuildDefault;
+    }
+    return savedConfig;
+  }
   if (provider === "openai") return DEFAULT_CODEX_CONFIG;
   if (provider === "xai") return DEFAULT_GROK_CONFIG;
   return { dangerouslySkipPermissions: true };
@@ -365,6 +370,9 @@ export class QuotaAwareAgentRouter {
     entry.companyId = company.id;
     entry.companyName = company.name;
     if (Object.hasOwn(PROVIDERS, configuredPrimary)) entry.primaryProvider = configuredPrimary;
+    if (entry.configs.xai?.model === "grok-4.6") {
+      entry.configs.xai = targetConfig("xai", entry.configs.xai);
+    }
     if (currentProvider && !entry.configs[currentProvider]) {
       entry.configs[currentProvider] = agent.adapterConfig ?? {};
     }
