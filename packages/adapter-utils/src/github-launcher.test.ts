@@ -10,6 +10,20 @@ const exec = promisify(execFile);
 const cleanups: Array<() => Promise<unknown>> = [];
 afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); });
 
+// The launcher's broker bearer is `PAPERCLIP_GITHUB_BRIDGE_TOKEN || PAPERCLIP_API_KEY
+// || PAPERCLIP_GITHUB_BROKER_TOKEN`, deliberately: the bridge token and the run's own
+// API key are the identities the real broker authenticates, and the narrow capability
+// rides in `x-paperclip-github-capability` instead (see the route — it prefers that
+// header and only falls back to the bearer). `githubBrokerEnvironment` scrubs Git and
+// GitHub credentials, not those two, so a test that inherits `process.env` from a host
+// where either is set sends the *host's* token to its own fixture server. That passes
+// on a clean CI runner and fails on every Paperclip agent host, where
+// `PAPERCLIP_API_KEY` is always in the environment. Blank them so the fixture
+// capability is the only token the launcher can reach.
+function launcherEnvironment(overrides: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  return { ...process.env, PAPERCLIP_GITHUB_BRIDGE_TOKEN: "", PAPERCLIP_API_KEY: "", ...overrides };
+}
+
 describe("managed GitHub launchers", () => {
   it.each(["broker-offline", "config-unwritable", "capability-rejected"])("keeps real local Git usable when %s", async (failure) => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-github-failure-"));
@@ -25,10 +39,10 @@ describe("managed GitHub launchers", () => {
     else cleanups.push(() => new Promise<void>(resolve => server.close(() => resolve())));
     const configRoot = path.join(root, "config");
     if (failure === "config-unwritable") await writeFile(configRoot, "not a directory");
-    const result = await exec(path.join(bin, "git"), ["status", "--porcelain"], { cwd: root, env: {
-      ...process.env, ...githubBrokerEnvironment({ GH_TOKEN: "host-must-not-leak" }, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
+    const result = await exec(path.join(bin, "git"), ["status", "--porcelain"], { cwd: root, env: launcherEnvironment({
+      ...githubBrokerEnvironment({ GH_TOKEN: "host-must-not-leak" }, { url: `http://127.0.0.1:${port}`, token: "private-capability" }),
       GH_CONFIG_DIR: configRoot, PATH: `${bin}:${process.env.PATH}`,
-    } });
+    }) });
     expect(result.stderr).toContain(failure === "broker-offline" ? "broker_transport_unavailable" : failure === "config-unwritable" ? "configuration_directory_unavailable" : "capability_rejected");
     expect(result.stderr).not.toMatch(/host-must-not-leak|private-capability/);
   });
@@ -47,7 +61,7 @@ describe("managed GitHub launchers", () => {
     await new Promise<void>(resolve => server.listen(0,"127.0.0.1",resolve));
     cleanups.push(() => new Promise<void>((resolve,reject) => server.close(error => error ? reject(error) : resolve())));
     const {port} = server.address() as {port:number};
-    const result = await exec(path.join(bin,"gh"), [], {env:{...process.env,...githubBrokerEnvironment({GH_TOKEN:"host-token"},{url:`http://127.0.0.1:${port}`,token:"run-capability"}),PATH:`${bin}:${realBin}:${process.env.PATH}`}});
+    const result = await exec(path.join(bin,"gh"), [], {env:launcherEnvironment({...githubBrokerEnvironment({GH_TOKEN:"host-token"},{url:`http://127.0.0.1:${port}`,token:"run-capability"}),PATH:`${bin}:${realBin}:${process.env.PATH}`})});
     expect(JSON.parse(result.stdout)).toEqual({token:null});
     expect(result.stderr).toContain("More than one managed GitHub identity matches this run");
     expect(result.stderr).not.toMatch(/host-token|must-not-be-used|run-capability/);
@@ -66,9 +80,16 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     let user: string | null = "A", captures = 0;
     let heldCapture: (() => void) | null = null;
     let releaseCapture: (() => void) | null = null;
+    // Recorded, not asserted here. An `expect` inside this callback throws on the
+    // server's event-loop turn rather than the test's, so vitest reports it as an
+    // unhandled exception attributed to whichever file happened to be running —
+    // which is how a launcher bug read as a failure in an unrelated suite.
+    const authorizations: Array<string | undefined> = [];
+    const capabilities: Array<string | string[] | undefined> = [];
     const server = createServer((req, res) => {
       captures++;
-      expect(req.headers.authorization).toBe("Bearer run-capability");
+      authorizations.push(req.headers.authorization);
+      capabilities.push(req.headers["x-paperclip-github-capability"]);
       const selected = user;
       res.setHeader("content-type", "application/json");
       const finish = () => res.end(JSON.stringify(selected ? { status: "available", env: {
@@ -82,9 +103,9 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
     cleanups.push(() => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())));
     const address = server.address() as { port: number };
-    const env: NodeJS.ProcessEnv = { ...process.env, ...githubBrokerEnvironment({
+    const env: NodeJS.ProcessEnv = launcherEnvironment({ ...githubBrokerEnvironment({
       GH_TOKEN: "ambient-host-token", GIT_AUTHOR_NAME: "Host", GIT_AUTHOR_EMAIL: "host@example.test",
-    }, { url: `http://127.0.0.1:${address.port}`, token: "run-capability" }), PATH: `${bin}:${realBin}:${process.env.PATH}` };
+    }, { url: `http://127.0.0.1:${address.port}`, token: "run-capability" }), PATH: `${bin}:${realBin}:${process.env.PATH}` });
     const git = async (...args: string[]) => (await exec(path.join(bin, "git"), args, { cwd: repo, env })).stdout.trim();
     await git("init");
     await git("commit", "--allow-empty", "-m", "A");
@@ -113,5 +134,18 @@ process.stdout.write(JSON.stringify({identity, token:process.env.GH_TOKEN ?? nul
     expect(await git("status", "--porcelain")).toBe(""); // unrelated public/local Git still works
     expect(env.GH_TOKEN).toBe("");
     expect(env.GIT_AUTHOR_NAME).toBe("");
+
+    // Every capture carried the narrow capability in the header the broker route
+    // actually verifies. This is the assertion that was previously made on the
+    // bearer, which is only a fallback carrier and therefore environment-dependent.
+    expect(capabilities.length).toBe(captures);
+    expect(new Set(capabilities)).toEqual(new Set(["run-capability"]));
+    // And no capture carried anything the launcher was supposed to have scrubbed.
+    // `credential-A`/`credential-B` are broker *responses*; if one comes back up on a
+    // later request the launcher is replaying a resolved credential as its own identity.
+    for (const authorization of authorizations) {
+      expect(authorization).toBe("Bearer run-capability");
+      expect(authorization).not.toMatch(/ambient-host-token|credential-A|credential-B/);
+    }
   });
 });
