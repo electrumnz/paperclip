@@ -53,6 +53,7 @@ import {
 } from "../services/native-runtime/status-arbiter.js";
 import {
   commitNativeStatusDecision,
+  NativeStatusRaceError,
   type NativeStatusCommitFailpoint,
 } from "../services/native-runtime/status-decision-committer.js";
 import {
@@ -2061,6 +2062,55 @@ describe("P6-31 Section 18.13 executable status-authority corpus", () => {
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, seeded.runId));
     return seeded;
   }
+
+  it("refuses a native status decision that clears a hold owned by the board", async () => {
+    const template = corpus.fixtures.find((candidate) => candidate.mode === "native")!;
+    const seeded = await seedFixture({
+      ...template,
+      id: `hold-ownership-${randomUUID()}`,
+      given: { ...template.given, priorIssueStatus: "in_progress" },
+    });
+
+    // A board-owned hold placed after checkout. The completing run's agent does
+    // not own it, so the run must not be able to clear it at end-of-run.
+    await db
+      .update(issues)
+      .set({
+        unblockDescriptor: {
+          owner: "board",
+          action: "Board must triage this hold before it clears",
+        },
+      })
+      .where(eq(issues.id, seeded.issueId));
+
+    await expect(
+      commitNativeStatusDecision({
+        db,
+        companyId,
+        issueId: seeded.issueId,
+        runId: seeded.runId,
+        assessmentId: seeded.assessmentId,
+        priorStatus: "in_progress",
+        priorStatusVersion: 0,
+        priorDecisionId: null,
+        decision: {
+          policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION,
+          statusAction: "in_review",
+          toStatus: "in_review",
+          reasonCode: "completion_review_required",
+          // Clearing the hold: the descriptor is explicitly null.
+          unblockDescriptor: null,
+          effects: [],
+        },
+      }),
+    ).rejects.toBeInstanceOf(NativeStatusRaceError);
+
+    const [issue] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, seeded.issueId));
+    expect(issue!.unblockDescriptor).toMatchObject({ owner: "board" });
+  });
 
   it("retires a proven automatic review and applies the current successful completion exactly once", async () => {
     const seeded = await seedAutomaticReview();

@@ -174,6 +174,62 @@ describeEmbeddedPostgres("stale issue execution lock routes", () => {
     });
   });
 
+  it.each(["queued", "running"] as const)(
+    "skips and audits an external non-terminal status write while a %s run owns the issue",
+    async (runStatus) => {
+      const { companyId, agentId, currentRunId } =
+        await seedCompanyAgentAndRuns();
+      const issueId = randomUUID();
+      await db.insert(issues).values({
+        id: issueId,
+        companyId,
+        title: "Live execution lock",
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        checkoutRunId: currentRunId,
+        executionRunId: currentRunId,
+        executionLockedAt: new Date(),
+      });
+      await db
+        .update(heartbeatRuns)
+        .set({ status: runStatus, contextSnapshot: { issueId } })
+        .where(eq(heartbeatRuns.id, currentRunId));
+
+      // Non-terminal external writes stay refused while another run holds the
+      // lock. Terminal writes are exempt — see the dedicated
+      // `issue-terminal-transition-live-lock-routes.test.ts` suite, which
+      // covers `cancelled` and `done`.
+      const res = await request(createApp(boardActor(companyId)))
+        .patch(`/api/issues/${issueId}`)
+        .send({ status: "in_review" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(409);
+      expect(res.body).toMatchObject({
+        code: "issue_status_write_live_lock",
+        activeRunId: currentRunId,
+        retryAfter: "active_run_release",
+      });
+      expect(
+        (await db.select().from(issues).where(eq(issues.id, issueId)))[0]
+          ?.status,
+      ).toBe("in_progress");
+      const audit = await db
+        .select()
+        .from(activityLog)
+        .where(eq(activityLog.action, "issue.status_write_skipped_live_lock"))
+        .then((rows) => rows[0] ?? null);
+      expect(audit).toMatchObject({
+        entityId: issueId,
+        details: expect.objectContaining({
+          requestedStatus: "in_review",
+          activeRunId: currentRunId,
+          resolution: "skipped",
+        }),
+      });
+    },
+  );
+
   it.each([
     { status: "done" as const, title: "Done release preserves status", completedAt: new Date() },
     { status: "cancelled" as const, title: "Cancelled release preserves status", cancelledAt: new Date() },
