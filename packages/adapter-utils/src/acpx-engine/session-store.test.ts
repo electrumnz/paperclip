@@ -21,9 +21,34 @@ const envEchoFixturePath = path.join(repoRoot, "scripts/mcp-fixtures/servers/acp
 // literals: a secret-shaped literal in a test file trips secret scanners
 // (GitHub push protection rejected exactly this), and teaching every scanner to
 // ignore a fixture is worse than not writing one.
-const BOUND_SECRETS: Record<"SUPABASE_KEECE_TOKEN" | "VERCEL_TOKEN_KEECE", string> = {
+//
+// `PAPERCLIP_API_KEY` is here for KEE-234. It is a different and higher class of
+// credential than the other two: those are *capability* (they act on Vercel and
+// Supabase), this one is *authority* — it is what makes a seat that seat to the
+// Paperclip API, so an at-rest copy is readable seat identity. KEE-234 measured
+// 480 of 480 session records carrying a live one, across 26 seats.
+//
+// It is covered here because the fix strips the whole `env` map rather than
+// matching credential names, so no name-shaped case can be "the one it misses".
+// That is the property this fixture exists to hold: the assertion is not "the
+// three known names are absent", it is `session_options.env` is absent entirely.
+// A fourth credential added tomorrow is covered without touching this file.
+const PAPERCLIP_API_KEY_FIXTURE = [
+  Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" }), "utf8").toString("base64url"),
+  Buffer.from(
+    JSON.stringify({ sub: "agent-1", iss: "paperclip", aud: "paperclip-api", exp: 4102444800 }),
+    "utf8",
+  ).toString("base64url"),
+  "b".repeat(43),
+].join(".");
+
+const BOUND_SECRETS: Record<
+  "SUPABASE_KEECE_TOKEN" | "VERCEL_TOKEN_KEECE" | "PAPERCLIP_API_KEY",
+  string
+> = {
   SUPABASE_KEECE_TOKEN: ["sbp", "f".repeat(40)].join("_"),
   VERCEL_TOKEN_KEECE: ["vercel", "fixture", "a".repeat(32)].join("_"),
+  PAPERCLIP_API_KEY: PAPERCLIP_API_KEY_FIXTURE,
 };
 
 const LAUNCH_ENV: Record<string, string> = {
@@ -176,8 +201,14 @@ describe("createCredentialSafeSessionStore", () => {
     const persisted = await readPersistedSessionFiles(stateDir);
     expect(persisted).toHaveLength(1);
     expect(persisted[0]!.text).toContain(BOUND_SECRETS.SUPABASE_KEECE_TOKEN);
+    // KEE-234: the seat-identity token lands on disk too without the wrapper.
+    // This is the control for the KEE-234 assertion specifically — it reproduces
+    // the 480-of-480 measurement in miniature, so "absent above" is attributable
+    // to the wrapper and not to a record shape that never carried the key.
+    expect(persisted[0]!.text).toContain(BOUND_SECRETS.PAPERCLIP_API_KEY);
     expect(storedSessionEnv(persisted[0]!.parsed)).toMatchObject({
       SUPABASE_KEECE_TOKEN: BOUND_SECRETS.SUPABASE_KEECE_TOKEN,
+      PAPERCLIP_API_KEY: BOUND_SECRETS.PAPERCLIP_API_KEY,
     });
   });
 });
