@@ -151,6 +151,13 @@ test("task fit prefers Codex for engineering and Claude for research", () => {
   assert.equal(preferredProvider({ role: "researcher" }, { title: "Demand evidence pass" }), "anthropic");
 });
 
+test("configured Codex-first policy overrides task-fit routing", () => {
+  assert.equal(
+    preferredProvider({ role: "researcher" }, { title: "Demand evidence pass" }, "openai"),
+    "openai",
+  );
+});
+
 test("cheap model-profile runs use the same fleet-wide Grok fallback", () => {
   const issue = {
     title: "Summarize routine status",
@@ -195,6 +202,27 @@ test("instance discovery visits every active organisation", async () => {
   const router = new DiscoveryRouter({ statePath: "/tmp/unused", logPath: "/tmp/unused.log" });
   await router.tick();
   assert.deepEqual(visited, ["one", "two"]);
+});
+
+test("the default primary policy is applied to existing and future agents", () => {
+  const router = new QuotaAwareAgentRouter({
+    statePath: "/tmp/unused",
+    logPath: "/tmp/unused.log",
+    defaultPrimaryProvider: "openai",
+  });
+  const company = { id: "company", name: "Company" };
+  const existingClaude = router.ensureAgentState(company, {
+    id: "existing-claude",
+    adapterType: "claude_local",
+    adapterConfig: {},
+  });
+  const futureGrok = router.ensureAgentState(company, {
+    id: "future-grok",
+    adapterType: "grok_local",
+    adapterConfig: {},
+  });
+  assert.equal(existingClaude.primaryProvider, "openai");
+  assert.equal(futureGrok.primaryProvider, "openai");
 });
 
 test("a pruned historical run log does not abort routing for its organisation", async () => {

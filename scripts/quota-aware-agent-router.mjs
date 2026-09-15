@@ -154,6 +154,7 @@ export function isQuotaFailure(value) {
 }
 
 export function preferredProvider(agent, issue, configuredPrimary) {
+  if (Object.hasOwn(PROVIDERS, configuredPrimary)) return configuredPrimary;
   const text = `${agent?.name ?? ""} ${agent?.role ?? ""} ${issue?.title ?? ""} ${issue?.description ?? ""}`;
   if (/engineer|technical|code|implement|debug|test|build|backend|frontend|ui\b/i.test(text)) {
     return "openai";
@@ -161,7 +162,6 @@ export function preferredProvider(agent, issue, configuredPrimary) {
   if (/research|market|competitive|demand|strategy|synthesis|thesis|writing|brief/i.test(text)) {
     return "anthropic";
   }
-  if (Object.hasOwn(PROVIDERS, configuredPrimary)) return configuredPrimary;
   return ADAPTER_TO_PROVIDER[agent?.adapterType] ?? "openai";
 }
 
@@ -349,16 +349,22 @@ export class QuotaAwareAgentRouter {
 
   ensureAgentState(company, agent) {
     const currentProvider = ADAPTER_TO_PROVIDER[agent.adapterType];
+    const configuredPrimary = this.config.primaryProviderByAgent?.[agent.id]
+      ?? this.config.defaultPrimaryProvider;
+    const initialPrimary = Object.hasOwn(PROVIDERS, configuredPrimary)
+      ? configuredPrimary
+      : currentProvider ?? "openai";
     const entry = (this.state.agents[agent.id] ??= {
       companyId: company.id,
       companyName: company.name,
-      primaryProvider: this.config.primaryProviderByAgent?.[agent.id] ?? currentProvider ?? "openai",
+      primaryProvider: initialPrimary,
       configs: {},
       lastSwitchAt: null,
       lastSwitchReason: null,
     });
     entry.companyId = company.id;
     entry.companyName = company.name;
+    if (Object.hasOwn(PROVIDERS, configuredPrimary)) entry.primaryProvider = configuredPrimary;
     if (currentProvider && !entry.configs[currentProvider]) {
       entry.configs[currentProvider] = agent.adapterConfig ?? {};
     }
