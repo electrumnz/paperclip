@@ -3669,14 +3669,6 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         // `mkdir(recursive)`, which leaves an existing directory's mode alone, so
         // this wins the race by running before any load or save. Narrowing, not
         // a control — see restricted-files.ts.
-        // ACPX's own `FileSessionStore` creates `<stateDir>/sessions` and writes
-        // each record with no mode argument — 0755 and 0644 under the usual
-        // umask — and both calls live inside the vendored package, so the record
-        // files cannot be created at 0600 from here. Creating the directory at
-        // 0700 first is what is reachable: `ensureDir()` in the store is
-        // `mkdir(recursive)`, which leaves an existing directory's mode alone, so
-        // this wins the race by running before any load or save. Narrowing, not
-        // a control — see restricted-files.ts.
         for (const line of await ensureRestrictedDir(path.join(prepared.stateDir, "sessions"))) {
           await ctx.onLog("stderr", `${line}\n`);
         }
