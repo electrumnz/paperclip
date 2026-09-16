@@ -93,6 +93,7 @@ import {
   type AcpRuntimeUsageCost,
   type AcpSessionStore,
 } from "acpx/runtime";
+import { enforceCodexShellSnapshotPolicy } from "./codex-shell-snapshot.js";
 import { ensureRestrictedDir } from "./restricted-files.js";
 import {
   ACPX_DUPLEX_LOSS_CANCEL_DEADLINE_MS,
@@ -1277,6 +1278,14 @@ async function prepareCodexSkillRuntime(input: {
       targetHome: managedCodexHome,
       onLog: input.onLog,
     });
+  // Codex writes the provider launch environment — this run's bound credentials
+  // included — into `$CODEX_HOME/shell_snapshots/*.sh` as plaintext `declare -x`
+  // lines. Pin the policy off on every run, not only on the seed: the managed
+  // home is seeded once from the operator's `~/.codex/config.toml`, and an
+  // operator-supplied `CODEX_HOME` is never seeded at all. Runs on both.
+  for (const line of await enforceCodexShellSnapshotPolicy(effectiveCodexHome)) {
+    await input.onLog("stdout", `${line}\n`);
+  }
   const { allSkills, selectedSkills, desiredSkillNames } = await resolveSelectedRuntimeSkills(input.config, input.moduleDir);
   const skillSetKey = await buildSkillSetKey({ skills: selectedSkills, label: "codex" });
   const skillsHome = path.join(effectiveCodexHome, "skills");
