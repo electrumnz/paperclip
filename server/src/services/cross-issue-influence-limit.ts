@@ -34,6 +34,18 @@ export function crossIssueInfluenceRunContextError() {
   return forbidden(body.error, body.details);
 }
 
+/**
+ * Distinct from `crossIssueInfluenceRunContextError`: that one fires when the
+ * run id header itself is missing, malformed, or doesn't resolve to this
+ * actor's own run — sending the header fixes it. This one fires when the run
+ * id is genuinely correct but the run's own context was never anchored to an
+ * issue, so no header on a retry can ever supply the missing source issue.
+ */
+export function crossIssueInfluenceRunNotIssueScopedError() {
+  const { body } = issueWriteDenialResponse("cross_issue_influence_run_not_issue_scoped");
+  return forbidden(body.error, body.details);
+}
+
 function readRunSourceIssueId(contextSnapshot: unknown) {
   if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
   const context = contextSnapshot as Record<string, unknown>;
@@ -110,7 +122,7 @@ export async function observeCrossIssueInfluence(
     }
 
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    if (!sourceIssueId) throw crossIssueInfluenceRunNotIssueScopedError();
     if (
       sourceIssueId === input.targetIssueId ||
       (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())

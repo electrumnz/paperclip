@@ -31,6 +31,7 @@ export const ISSUE_WRITE_DENIAL_CODES = [
   "issue_write_assignee_run_lock",
   "cross_issue_influence_cap_exceeded",
   "cross_issue_influence_run_context_required",
+  "cross_issue_influence_run_not_issue_scoped",
   "issue_write_attribution_spoof_rejected",
 ] as const;
 
@@ -260,6 +261,25 @@ export function describeIssueWriteDenial(
           `Send the \`X-Paperclip-Run-Id\` header with your current run (\`$PAPERCLIP_RUN_ID\`) ` +
           `and retry.`,
 
+      };
+
+    case "cross_issue_influence_run_not_issue_scoped":
+      return {
+        code,
+        status: 403,
+        tone: "boundary",
+        boundary: "Run not anchored to a source issue",
+        title: "This run has no source issue to write cross-issue from",
+        description:
+          `The run id was valid and matched ${actor}'s own run, but that run's context has ` +
+          `neither an \`issueId\` nor a \`taskId\` — it never started from an issue, so there is ` +
+          `no source to attribute a cross-issue write to. No header can supply that; the run's ` +
+          `context is fixed for its whole lifetime, so this refusal will not change on retry.`,
+        whoCanAct:
+          `${actor}, from a future run that is anchored to a task, or ${assignee} on ${issue} directly.`,
+        sanctionedPath:
+          `${CHILD_ISSUE_PATH}, since issue creation stays open even from an unanchored run — ` +
+          `or write from a run that started from a task.`,
       };
 
     case "issue_write_attribution_spoof_rejected":
