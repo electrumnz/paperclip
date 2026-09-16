@@ -240,6 +240,51 @@ describe.sequential("activity routes", () => {
     });
   });
 
+  it("strips the unsalted secret-proposal fingerprint from an agent's company activity feed", async () => {
+    mockActivityService.list.mockResolvedValue([
+      {
+        id: "activity-1",
+        companyId: "company-1",
+        actorType: "agent",
+        actorId: "agent-1",
+        action: "secret.proposal.created",
+        entityType: "secret_proposal",
+        entityId: "proposal-1",
+        agentId: "agent-1",
+        runId: "run-1",
+        createdAt: "2026-09-16T00:00:00.000Z",
+        details: { key: "SOME_TOKEN", valueFingerprintSha256: "deadbeef", version: 1 },
+      },
+    ]);
+
+    const app = await createApp({
+      type: "agent",
+      agentId: "agent-1",
+      companyId: "company-1",
+      source: "agent_jwt",
+    });
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/companies/company-1/activity"));
+
+    expect(res.status).toBe(200);
+    expect(res.body[0].details).toEqual({ key: "SOME_TOKEN", version: 1 });
+    expect(res.body[0].details.valueFingerprintSha256).toBeUndefined();
+  });
+
+  it("keeps the secret-proposal fingerprint for a board reader's company activity feed", async () => {
+    mockActivityService.list.mockResolvedValue([
+      {
+        id: "activity-1",
+        details: { key: "SOME_TOKEN", valueFingerprintSha256: "deadbeef" },
+      },
+    ]);
+
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).get("/api/companies/company-1/activity"));
+
+    expect(res.status).toBe(200);
+    expect(res.body[0].details).toEqual({ key: "SOME_TOKEN", valueFingerprintSha256: "deadbeef" });
+  });
+
   it("resolves alphanumeric issue identifiers before loading runs", async () => {
     mockIssueService.getByIdentifier.mockResolvedValue({
       id: "issue-uuid-1",
