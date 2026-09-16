@@ -110,9 +110,15 @@ export function applyShellSnapshotPolicy(configToml: string): ShellSnapshotPolic
 
   // An inline `features = { ... }` root assignment cannot be merged with a
   // `[features]` table without reimplementing a TOML parser, and appending the
-  // table anyway would make the file unparseable. Report and leave it alone.
+  // table anyway would make the file unparseable. Report and leave it alone —
+  // unless the inline table already sets `shell_snapshot = false`, in which
+  // case the policy is already in force and there is nothing to enforce; a
+  // config an operator already locked down should not block every launch.
   const inlineIndex = lines.findIndex((line) => isFeaturesInlineTableAssignment(line));
   if (inlineIndex >= 0) {
+    if (inlineFeaturesAlreadyDisableShellSnapshot(withoutManagedBlock)) {
+      return { text: configToml, changed: false };
+    }
     return {
       text: configToml,
       changed: false,
@@ -145,6 +151,20 @@ export function applyShellSnapshotPolicy(configToml: string): ShellSnapshotPolic
   }
 
   return { text: next, changed: true };
+}
+
+// Whether an inline `features = { ... }` table this rewriter will not touch
+// already disables shell snapshots, so blocking the launch would gate a
+// config that is already policy-compliant on this rewriter's TOML support.
+// A config that fails to parse is not "already disabled" — the caller's own
+// read/enforcement path is the one that reports the parse failure.
+function inlineFeaturesAlreadyDisableShellSnapshot(configToml: string): boolean {
+  try {
+    const parsed = parseToml(configToml) as { features?: { shell_snapshot?: unknown } };
+    return parsed.features?.shell_snapshot === false;
+  } catch {
+    return false;
+  }
 }
 
 function removeManagedBlock(configToml: string): string {

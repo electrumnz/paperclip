@@ -119,6 +119,35 @@ describe("applyShellSnapshotPolicy", () => {
     expect(result.unsupported).toContain("inline table");
   });
 
+  it("accepts an inline features table that already disables shell snapshots", () => {
+    const input = "features = { shell_snapshot = false, web_search = true }\n";
+
+    const result = applyShellSnapshotPolicy(input);
+
+    expect(result.changed).toBe(false);
+    expect(result.unsupported).toBeUndefined();
+    expect(result.text).toBe(input);
+  });
+
+  it("accepts a quoted inline features table that already disables shell snapshots", () => {
+    const input = '"features" = { "shell_snapshot" = false }\n';
+
+    const result = applyShellSnapshotPolicy(input);
+
+    expect(result.changed).toBe(false);
+    expect(result.unsupported).toBeUndefined();
+    expect(result.text).toBe(input);
+  });
+
+  it("still refuses an inline features table that leaves shell_snapshot enabled", () => {
+    const input = "features = { shell_snapshot = true, web_search = true }\n";
+
+    const result = applyShellSnapshotPolicy(input);
+
+    expect(result.changed).toBe(false);
+    expect(result.unsupported).toContain("inline table");
+  });
+
   it("matches a features table header followed by a trailing comment", () => {
     const input = 'model = "gpt-5.6-sol"\n\n[features] # operator settings\nweb_search = true\n';
 
