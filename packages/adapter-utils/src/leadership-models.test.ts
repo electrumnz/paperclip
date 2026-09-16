@@ -4,7 +4,9 @@ import {
   LEADERSHIP_ORG_DEPTH,
   OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL,
   OPENCODE_FREE_ROUTER_MODEL,
+  OPENCODE_PARETO_CODE_MODEL,
   OPENROUTER_FREE_ROUTER_MODEL,
+  OPENROUTER_PARETO_CODE_MODEL,
   isLeadershipOrgDepth,
 } from "./leadership-models.js";
 
@@ -28,5 +30,7 @@ describe("leadership model lanes", () => {
     expect(DEEPSEEK_FLASH_LATEST_MODEL).toBe("~deepseek/deepseek-flash-latest");
     expect(OPENCODE_FREE_ROUTER_MODEL).toBe("openrouter/openrouter/free");
     expect(OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL).toBe("openrouter/~deepseek/deepseek-flash-latest");
+    expect(OPENROUTER_PARETO_CODE_MODEL).toBe("openrouter/pareto-code");
+    expect(OPENCODE_PARETO_CODE_MODEL).toBe("openrouter/openrouter/pareto-code");
   });
 });
