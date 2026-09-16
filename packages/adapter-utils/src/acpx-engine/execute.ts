@@ -87,8 +87,10 @@ import {
   type AcpRuntimeTurnResult,
   type AcpRuntimeUsageBreakdown,
   type AcpRuntimeUsageCost,
+  type AcpSessionStore,
 } from "acpx/runtime";
 import { ensureRestrictedDir } from "./restricted-files.js";
+import { createCredentialSafeSessionStore } from "./session-store.js";
 import {
   DEFAULT_ACP_ENGINE_AGENT,
   DEFAULT_ACP_ENGINE_MODE,
@@ -3669,6 +3671,14 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         for (const line of await ensureRestrictedDir(path.join(prepared.stateDir, "sessions"))) {
           await ctx.onLog("stderr", `${line}\n`);
         }
+        const persistedRuntimeStore = createRuntimeStore({ stateDir: prepared.stateDir });
+        // `load` re-injects this run's launch environment (ACPX resumes from the
+        // stored session options, not the options passed to ensureSession) and
+        // `save` keeps that environment out of the on-disk record entirely.
+        const runtimeStore: AcpSessionStore = createCredentialSafeSessionStore({
+          persisted: persistedRuntimeStore,
+          launchEnv: prepared.env,
+        });
         const runtimeOptions: PaperclipAcpRuntimeOptions = {
           cwd: prepared.cwd,
           // Host-only spawn cwd for the relay proxy on the remote process-session
@@ -3677,7 +3687,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           // fingerprint / compat key are unaffected — this redirects ONLY the host
           // `spawn()` `chdir`, not the in-sandbox data path.
           spawnCwd: prepared.hostSpawnCwd,
-          sessionStore: createRuntimeStore({ stateDir: prepared.stateDir }),
+          sessionStore: runtimeStore,
           agentRegistry: prepared.agentRegistry,
           permissionMode: prepared.permissionMode,
           nonInteractivePermissions: prepared.nonInteractivePermissions,
