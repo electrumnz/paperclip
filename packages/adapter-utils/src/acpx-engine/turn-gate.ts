@@ -177,6 +177,84 @@ export function readTurnGateBudgetExemption(context: Record<string, unknown> | n
   return candidates.some((candidate) => budgetSectionDeclaresLongJob(candidate));
 }
 
+/**
+ * The follow-up turn the engine runs after a gate cancel.
+ *
+ * The ACP runtime cannot deliver a message into a turn that is already running:
+ * `AcpRuntimeTurn` exposes only `requestId`, `events`, `result`, `cancel()` and
+ * `closeStream()`. So both stages are delivered the same way — cancel the turn at
+ * a clean boundary, then start a short second turn on the same (persistent)
+ * session, which continues the conversation rather than replaying it.
+ *
+ * This is also what makes the handback possible at all. The engine cannot write
+ * the handback itself: it does not know what changed or what the working tree
+ * looks like. Only the agent can, and only if it is given another turn in which
+ * to do it. A cancel with no follow-up turn is the rework generator KEE-440
+ * forbids.
+ */
+export interface TurnGateFollowUp {
+  readonly kind: "soft_checkpoint" | "hard_stop";
+  /** The prompt text for the second turn. */
+  readonly prompt: string;
+  /**
+   * Whether the gate keeps counting during the follow-up turn. True after a soft
+   * checkpoint, so a run that continues past the checkpoint still meets the hard
+   * stop. False after a hard stop: the handback turn must be allowed to finish,
+   * and gating it again could leave the run with no handback at all.
+   */
+  readonly gated: boolean;
+  /** The cancel reason for the first turn. Recorded in the run log, not shown to the agent. */
+  readonly cancelReason: string;
+}
+
+// Written as instructions to the agent, in the imperative. The run has already
+// done `toolCalls` tool calls when it reads this, so the text leads with where it
+// is and what is required, not with an explanation of the mechanism.
+export function buildTurnGateFollowUp(decision: TurnGateDecision, thresholds: TurnGateThresholds): TurnGateFollowUp {
+  if (decision.kind === "soft_checkpoint") {
+    const hardLine =
+      thresholds.hardToolCalls > 0
+        ? ` This run stops for good at ${thresholds.hardToolCalls} tool calls, so you have about ${Math.max(thresholds.hardToolCalls - decision.toolCalls, 0)} left.`
+        : "";
+    return {
+      kind: "soft_checkpoint",
+      gated: true,
+      cancelReason: `paperclip turn gate soft checkpoint at ${decision.toolCalls} tool calls`,
+      prompt: [
+        `[Paperclip turn gate] You have made ${decision.toolCalls} tool calls, which reaches the soft checkpoint of ${decision.threshold}.${hardLine}`,
+        "",
+        "Do this now, in order:",
+        "",
+        "1. Write durable progress to the issue — a comment saying what you have done so far, what the working tree looks like, and what the next action is. Write it even if the work feels unfinished; especially then. This comment is the whole point of the checkpoint: it is what lets the next run pick up instead of starting again.",
+        "2. Then decide, and say which you chose:",
+        "   - If the remaining steps are few and you can name them, finish them and end the run normally.",
+        "   - Otherwise hand back now. Leave the issue in a clear state with a next action, and stop.",
+        "",
+        "Do not start a new line of investigation, a refactor, or a broad search. If you are mid-edit, finish that edit or revert it — do not leave the tree half-written.",
+      ].join("\n"),
+    };
+  }
+  return {
+    kind: "hard_stop",
+    gated: false,
+    cancelReason: `paperclip turn gate hard stop at ${decision.toolCalls} tool calls${decision.forced ? " (forced: no clean boundary)" : ""}`,
+    prompt: [
+      `[Paperclip turn gate] You have made ${decision.toolCalls} tool calls, which reaches the hard stop of ${decision.threshold}. This run is over. You have no discretion here.`,
+      "",
+      "Start no new work. Do not read another file, run another search, or make another edit — except the one write below.",
+      "",
+      "Write a handback comment on the issue now, containing:",
+      "",
+      "- **Status** — what state the work is actually in.",
+      "- **What changed** — files, branches, commits. Name them.",
+      "- **Working tree** — clean, dirty, or mid-edit; committed or not; pushed or not.",
+      "- **Next action** — the single next thing the run after this one should do.",
+      "",
+      "Be accurate rather than tidy. If something is half-done or broken, say so — the next run inherits it. Then end your turn.",
+    ].join("\n"),
+  };
+}
+
 /** The normalized tool-call fields the gate needs. The engine supplies these from its ACP events. */
 export interface TurnGateToolCallEvent {
   readonly toolCallId: string;
