@@ -1,4 +1,4 @@
-import { envBindingSchema, type SecretProjectionClass, type SecretVersionSelector } from "@paperclipai/shared";
+import { envBindingSchema, envBindingSecretRefSchema, type SecretProjectionClass, type SecretVersionSelector } from "@paperclipai/shared";
 
 interface AgentSecretBindingSyncService {
   syncSecretRefsForTarget?: (
@@ -143,6 +143,19 @@ export function collectUserSecretRefs(adapterConfig: unknown): Array<{
   }
 
   return refs;
+}
+
+export function getSecretRefAtConfigPath(
+  adapterConfig: unknown,
+  configPath: string,
+): { secretId: string } | null {
+  const config = asRecord(adapterConfig);
+  if (!config) return null;
+  const raw = configPath.startsWith("env.")
+    ? asRecord(config.env)?.[configPath.slice("env.".length)]
+    : config[configPath];
+  const parsed = envBindingSecretRefSchema.safeParse(raw);
+  return parsed.success ? { secretId: parsed.data.secretId } : null;
 }
 
 export function removeSecretRefAtConfigPath(

@@ -20,7 +20,7 @@ import { validate } from "../middleware/validate.js";
 import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getAccessibleResource } from "./authz.js";
 import { logActivity, secretService, agentService } from "../services/index.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
-import { removeSecretRefAtConfigPath } from "../services/agent-secret-bindings.js";
+import { getSecretRefAtConfigPath, removeSecretRefAtConfigPath } from "../services/agent-secret-bindings.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
@@ -1178,6 +1178,15 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
     const agent = await agentsSvc.getById(binding.targetId);
     if (!agent || agent.companyId !== secret.companyId) {
       res.status(404).json({ error: "Secret binding not found" });
+      return;
+    }
+
+    const currentRef = getSecretRefAtConfigPath(agent.adapterConfig, binding.configPath);
+    if (!currentRef || currentRef.secretId !== secretId) {
+      res.status(409).json({
+        error: "The agent's configuration changed since this binding was read; refresh and retry",
+        code: "secret_binding_stale",
+      });
       return;
     }
 

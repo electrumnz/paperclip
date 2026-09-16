@@ -165,6 +165,44 @@ describeEmbeddedPostgres("DELETE /secrets/:secretId/bindings/:bindingId", () => 
     ]);
   });
 
+  it("refuses to revoke when the config path no longer holds this binding's secret (stale binding)", async () => {
+    const companyId = await seedCompany();
+    const { secret, agent, binding, envKey } = await seedBoundAgent(companyId);
+    const otherSecret = await secretService(db).create(companyId, {
+      name: `other-${randomUUID()}`,
+      provider: "local_encrypted",
+      value: "other-value",
+    });
+
+    // Bypass agentService.update's binding resync to model the binding row
+    // (company_secret_bindings) going stale relative to adapterConfig — the
+    // scenario a concurrent config write produces mid-request, since a normal
+    // update would delete-and-recreate this exact binding row instead.
+    const current = await agentService(db).getById(agent.id);
+    await db
+      .update(agents)
+      .set({
+        adapterConfig: {
+          ...(current?.adapterConfig as Record<string, unknown>),
+          env: {
+            [envKey]: { type: "secret_ref", secretId: otherSecret.id, version: "latest" },
+          },
+        },
+      })
+      .where(eq(agents.id, agent.id));
+
+    const res = await request(createApp([companyId])).delete(
+      `/api/secrets/${secret.id}/bindings/${binding.id}`,
+    );
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("secret_binding_stale");
+
+    const reloaded = await agentService(db).getById(agent.id);
+    expect(
+      (reloaded?.adapterConfig as { env?: Record<string, unknown> } | undefined)?.env?.[envKey],
+    ).toMatchObject({ secretId: otherSecret.id });
+  });
+
   it("keeps the binding gone after a later unrelated adapterConfig write (replaceAll re-derivation trap)", async () => {
     const companyId = await seedCompany();
     const { secret, agent, binding } = await seedBoundAgent(companyId);
