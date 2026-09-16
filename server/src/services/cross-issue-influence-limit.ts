@@ -43,6 +43,18 @@ function readRunSourceIssueId(contextSnapshot: unknown) {
   return null;
 }
 
+function isUnscopedHeartbeatTimerRun(input: {
+  invocationSource: string;
+  contextSnapshot: unknown;
+}) {
+  if (input.invocationSource !== "timer") return false;
+  if (!input.contextSnapshot || typeof input.contextSnapshot !== "object" || Array.isArray(input.contextSnapshot)) {
+    return false;
+  }
+  const context = input.contextSnapshot as Record<string, unknown>;
+  return context.wakeReason === "heartbeat_timer" && context.wakeSource === "timer";
+}
+
 export function evaluateCrossIssueInfluenceLimit(input: {
   priorCount: number;
   now?: Date;
@@ -91,6 +103,7 @@ export async function observeCrossIssueInfluence(
         companyId: heartbeatRuns.companyId,
         agentId: heartbeatRuns.agentId,
         responsibleUserId: heartbeatRuns.responsibleUserId,
+        invocationSource: heartbeatRuns.invocationSource,
         contextSnapshot: heartbeatRuns.contextSnapshot,
       })
       .from(heartbeatRuns)
@@ -110,10 +123,17 @@ export async function observeCrossIssueInfluence(
     }
 
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    const sourceKind = sourceIssueId
+      ? "issue"
+      : isUnscopedHeartbeatTimerRun(run)
+        ? "heartbeat_timer"
+        : null;
+    if (!sourceKind) throw crossIssueInfluenceRunContextError();
     if (
-      sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      sourceIssueId && (
+        sourceIssueId === input.targetIssueId ||
+        (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      )
     ) {
       return null;
     }
@@ -143,6 +163,7 @@ export async function observeCrossIssueInfluence(
       entityId: input.targetIssueId,
       details: {
         kind: input.kind,
+        sourceKind,
         sourceIssueId,
         targetIssueId: input.targetIssueId,
         targetIssueIdentifier: input.targetIssueIdentifier ?? null,
@@ -159,6 +180,7 @@ export async function observeCrossIssueInfluence(
       companyId: input.companyId,
       runId: input.runId,
       agentId: input.agentId,
+      sourceKind,
       sourceIssueId,
       targetIssueId: input.targetIssueId,
       kind: input.kind,
