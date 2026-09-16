@@ -523,6 +523,65 @@ describe("shared ACPX engine runtime behavior", () => {
     ]);
   });
 
+  it("drops a session config option the ACP session does not advertise instead of failing the run", async () => {
+    class FakeAcpRuntimeError extends Error {
+      readonly code = "ACP_BACKEND_UNSUPPORTED_CONTROL";
+      constructor(message: string) {
+        super(message);
+        this.name = "AcpRuntimeError";
+      }
+    }
+
+    const logs: Array<{ stream: string; text: string }> = [];
+    const configOptions: Array<{ key: string; value: string }> = [];
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () => ({
+        ensureSession: async () => ({
+          backendSessionId: "backend-session",
+          agentSessionId: "agent-session",
+          runtimeSessionName: "runtime-session",
+        }),
+        startTurn: () => ({
+          events: (async function* () {
+            yield { type: "done", stopReason: "end_turn" };
+          })(),
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+          cancel: async () => {},
+        }),
+        setConfigOption: async ({ key, value }: { key: string; value: string }) => {
+          if (key === "effort") {
+            throw new FakeAcpRuntimeError(
+              "ACP session paperclip:test does not advertise config option 'effort'. Supported config options: mode, model.",
+            );
+          }
+          configOptions.push({ key, value });
+        },
+        close: async () => {},
+      }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-1",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "gemini", model: "gemini-2.5-pro", thinkingEffort: "high" },
+      context: {},
+      onLog: async (stream: "stdout" | "stderr", text: string) => {
+        logs.push({ stream, text });
+      },
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.errorCode).toBeFalsy();
+    // The supported option still lands; only the unadvertised one is dropped.
+    expect(configOptions).toEqual([{ key: "model", value: "gemini-2.5-pro" }]);
+    const warning = logs.find(
+      (entry) => entry.stream === "stderr" && entry.text.includes("does not advertise config option 'effort'"),
+    );
+    expect(warning).toBeTruthy();
+  });
+
   it("does not inject CODEX_CONFIG or session config when Codex overrides are absent", async () => {
     const { configOptions, meta } = await runExecutor({ agent: "codex" });
 

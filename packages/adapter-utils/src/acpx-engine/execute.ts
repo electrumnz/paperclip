@@ -2327,11 +2327,33 @@ async function applySessionConfigOptions(input: {
     throw new Error(message);
   }
   for (const option of options) {
-    await input.runtime.setConfigOption({
-      handle: input.handle,
-      key: option.key,
-      value: option.value,
-    });
+    try {
+      await input.runtime.setConfigOption({
+        handle: input.handle,
+        key: option.key,
+        value: option.value,
+      });
+    } catch (err) {
+      // The advertised config surface varies by ACP agent build (some sessions
+      // of the same agent advertise `effort`, some do not), so an unsupported
+      // option here is not a fixed capability gap — retrying later can succeed
+      // with the same config unchanged. Drop the option and keep the session
+      // alive rather than failing the whole run over one optional control.
+      const code = isAcpRuntimeError(err)
+        ? err.code
+        : err && typeof err === "object" && typeof (err as { code?: unknown }).code === "string"
+          ? (err as { code: string }).code
+          : null;
+      if (code === "ACP_BACKEND_UNSUPPORTED_CONTROL") {
+        const message = err instanceof Error ? err.message : String(err);
+        await input.onLog(
+          "stderr",
+          `[paperclip] ACPX ${input.prepared.acpxAgent} session does not advertise config option '${option.key}' for this session; skipping. ${message}\n`,
+        );
+        continue;
+      }
+      throw err;
+    }
     await input.onLog(
       "stdout",
       `[paperclip] Applied ACPX ${input.prepared.acpxAgent} config ${option.key}=${option.value}\n`,
