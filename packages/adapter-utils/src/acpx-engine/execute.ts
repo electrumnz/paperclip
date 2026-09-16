@@ -88,6 +88,7 @@ import {
   type AcpRuntimeUsageBreakdown,
   type AcpRuntimeUsageCost,
 } from "acpx/runtime";
+import { ensureRestrictedDir } from "./restricted-files.js";
 import {
   DEFAULT_ACP_ENGINE_AGENT,
   DEFAULT_ACP_ENGINE_MODE,
@@ -3649,6 +3650,25 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         processIdentitySink.current = ctx.onSpawn;
         flushChildStderr(childStderrState);
         childStderrState.logPath = prepared.childStderrLogPath;
+        // ACPX's own `FileSessionStore` creates `<stateDir>/sessions` and writes
+        // each record with no mode argument — 0755 and 0644 under the usual
+        // umask — and both calls live inside the vendored package, so the record
+        // files cannot be created at 0600 from here. Creating the directory at
+        // 0700 first is what is reachable: `ensureDir()` in the store is
+        // `mkdir(recursive)`, which leaves an existing directory's mode alone, so
+        // this wins the race by running before any load or save. Narrowing, not
+        // a control — see restricted-files.ts.
+        // ACPX's own `FileSessionStore` creates `<stateDir>/sessions` and writes
+        // each record with no mode argument — 0755 and 0644 under the usual
+        // umask — and both calls live inside the vendored package, so the record
+        // files cannot be created at 0600 from here. Creating the directory at
+        // 0700 first is what is reachable: `ensureDir()` in the store is
+        // `mkdir(recursive)`, which leaves an existing directory's mode alone, so
+        // this wins the race by running before any load or save. Narrowing, not
+        // a control — see restricted-files.ts.
+        for (const line of await ensureRestrictedDir(path.join(prepared.stateDir, "sessions"))) {
+          await ctx.onLog("stderr", `${line}\n`);
+        }
         const runtimeOptions: PaperclipAcpRuntimeOptions = {
           cwd: prepared.cwd,
           // Host-only spawn cwd for the relay proxy on the remote process-session
