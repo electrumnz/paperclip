@@ -117,6 +117,26 @@ describe("applyShellSnapshotPolicy", () => {
     expect(result.text).toBe(input);
     expect(result.unsupported).toContain("inline table");
   });
+
+  it("matches a features table header followed by a trailing comment", () => {
+    const input = 'model = "gpt-5.6-sol"\n\n[features] # operator settings\nweb_search = true\n';
+
+    const result = applyShellSnapshotPolicy(input);
+
+    expect(result.text.match(/^\[features\]/gm)).toHaveLength(1);
+    expect(parsedFeatures(result.text)).toEqual({ shell_snapshot: false, web_search: true });
+  });
+
+  it("does not accumulate a managed comment across repeated runs against an existing table", () => {
+    const input = "[features]\nweb_search = true\n";
+
+    const first = applyShellSnapshotPolicy(input);
+    const second = applyShellSnapshotPolicy(first.text);
+
+    expect(second.changed).toBe(false);
+    expect(second.text).toBe(first.text);
+    expect(first.text.match(/managed by paperclip/g)).toHaveLength(1);
+  });
 });
 
 describe("enforceCodexShellSnapshotPolicy", () => {
@@ -153,5 +173,39 @@ describe("enforceCodexShellSnapshotPolicy", () => {
     expect(notes).toHaveLength(1);
     expect(notes[0]).toContain("Left Codex shell snapshots enabled");
     expect(await readConfig(home)).toBe("features = { web_search = true }\n");
+  });
+
+  it("creates a new config.toml owner-only, since it may carry provider secrets", async () => {
+    const home = await createCodexHome();
+
+    await enforceCodexShellSnapshotPolicy(home);
+
+    const mode = (await fs.stat(path.join(home, "config.toml"))).mode & 0o777;
+    expect(mode).toBe(0o600);
+  });
+
+  it("preserves the existing config.toml's file mode across the rewrite", async () => {
+    const home = await createCodexHome('model = "gpt-5.6-sol"\n');
+    await fs.chmod(path.join(home, "config.toml"), 0o640);
+
+    await enforceCodexShellSnapshotPolicy(home);
+
+    const mode = (await fs.stat(path.join(home, "config.toml"))).mode & 0o777;
+    expect(mode).toBe(0o640);
+  });
+
+  it("does not collide when two invocations race on the same Codex home", async () => {
+    const home = await createCodexHome('model = "gpt-5.6-sol"\n');
+
+    const [first, second] = await Promise.all([
+      enforceCodexShellSnapshotPolicy(home),
+      enforceCodexShellSnapshotPolicy(home),
+    ]);
+
+    expect([...first, ...second].some((line) => line.includes("Could not write"))).toBe(false);
+    expect(parseToml(await readConfig(home))).toMatchObject({
+      model: "gpt-5.6-sol",
+      features: { shell_snapshot: false },
+    });
   });
 });

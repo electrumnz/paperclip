@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 
@@ -33,7 +34,10 @@ const MANAGED_KEY_COMMENT =
   "# managed by paperclip: the launch environment must not be snapshotted";
 
 const TABLE_HEADER = /^\s*\[/;
-const FEATURES_TABLE_HEADER = /^\s*\[\s*features\s*\]\s*$/;
+// A trailing `# comment` after the closing bracket is valid TOML; the previous
+// anchored-to-end-of-line regex missed it and fell through to appending a
+// second, TOML-invalid `[features]` table onto an already-valid config.
+const FEATURES_TABLE_HEADER = /^\s*\[\s*features\s*\]\s*(#.*)?$/;
 const SHELL_SNAPSHOT_KEY = /^\s*shell_snapshot\s*=/;
 const DOTTED_SHELL_SNAPSHOT_KEY = /^\s*features\s*\.\s*shell_snapshot\s*=/;
 const FEATURES_INLINE_TABLE = /^\s*features\s*=/;
@@ -113,6 +117,9 @@ function setKeyInFeaturesTable(lines: string[], headerIndex: number): string {
     }
     if (insideFeatures && TABLE_HEADER.test(line)) insideFeatures = false;
     if (insideFeatures && SHELL_SNAPSHOT_KEY.test(line)) continue;
+    // A managed comment from a previous run sits right above the key it
+    // documents. Drop it too, or every re-run appends another copy.
+    if (insideFeatures && line === MANAGED_KEY_COMMENT) continue;
     result.push(line);
   }
   return ensureTrailingNewline(result.join("\n"));
@@ -145,8 +152,16 @@ function ensureTrailingNewline(text: string): string {
 export async function enforceCodexShellSnapshotPolicy(codexHome: string): Promise<string[]> {
   const configPath = path.join(codexHome, "config.toml");
   let current = "";
+  // `config.toml` can carry literal provider secrets (expanded env vars in
+  // `[model_providers]` env_key entries). Preserve its existing mode across the
+  // rewrite, or default to owner-only for a file we create ourselves — the
+  // temp file this function writes must never end up more permissive than
+  // that, since a rename does not widen a file's mode but a fresh 0o666 minus
+  // umask temp file can.
+  let existingMode: number | null = null;
   try {
     current = await fs.readFile(configPath, "utf8");
+    existingMode = (await fs.stat(configPath)).mode & 0o777;
   } catch (err) {
     if (!isMissingFile(err)) {
       return [
@@ -166,8 +181,11 @@ export async function enforceCodexShellSnapshotPolicy(codexHome: string): Promis
 
   try {
     await fs.mkdir(codexHome, { recursive: true });
-    const tempPath = `${configPath}.paperclip-${process.pid}.tmp`;
-    await fs.writeFile(tempPath, policy.text, "utf8");
+    // A PID-only suffix collides between concurrent runs sharing one company
+    // Codex home: one writer's rename can land on the other's still-open temp
+    // file. A random suffix per invocation makes the temp path unique instead.
+    const tempPath = `${configPath}.paperclip-${process.pid}-${crypto.randomBytes(6).toString("hex")}.tmp`;
+    await fs.writeFile(tempPath, policy.text, { encoding: "utf8", mode: existingMode ?? 0o600 });
     await fs.rename(tempPath, configPath);
   } catch (err) {
     return [
