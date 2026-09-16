@@ -42,6 +42,33 @@ function csvCell(value: unknown): string {
   return /[",\r\n]/.test(safe) ? `"${safe.replaceAll('"', '""')}"` : safe;
 }
 
+/**
+ * Detail keys that must stay board-only even on the seat-readable `/activity`
+ * feed. `valueFingerprintSha256` (on `secret.proposal.created`) is a full,
+ * unsalted SHA-256 of the proposed secret value — harmless for a high-entropy
+ * token, but an offline guessing oracle for a low-entropy one. It doesn't
+ * match the generic secret-field redaction patterns (no "secret"/"token"/etc.
+ * substring), so it survives write-time sanitization untouched (KEE-546).
+ */
+const SEAT_SENSITIVE_ACTIVITY_DETAIL_KEYS = new Set(["valueFingerprintSha256"]);
+
+function redactSeatSensitiveDetails<T extends { details: unknown }>(rows: T[]): T[] {
+  return rows.map((row) => {
+    if (!row.details || typeof row.details !== "object" || Array.isArray(row.details)) return row;
+    const details = row.details as Record<string, unknown>;
+    let changed = false;
+    const next: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(details)) {
+      if (SEAT_SENSITIVE_ACTIVITY_DETAIL_KEYS.has(key)) {
+        changed = true;
+        continue;
+      }
+      next[key] = value;
+    }
+    return changed ? { ...row, details: next } : row;
+  });
+}
+
 function readNested(value: unknown, ...keys: string[]): string | null {
   let cursor: unknown = value;
   for (const key of keys) {
@@ -230,9 +257,11 @@ export function activityRoutes(db: Db) {
       entityType: req.query.entityType as string | undefined,
       entityId: req.query.entityId as string | undefined,
       limit: normalizeActivityLimit(Number(req.query.limit)),
+      before: req.query.before as string | undefined,
     };
-    const result = await svc.list(filters);
-    res.json(result);
+    const { rows, nextCursor } = await svc.list(filters);
+    if (nextCursor) res.set("X-Next-Cursor", nextCursor);
+    res.json(req.actor.type === "board" ? rows : redactSeatSensitiveDetails(rows));
   });
 
   router.get("/companies/:companyId/audit/agent-actions", async (req, res) => {

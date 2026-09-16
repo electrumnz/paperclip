@@ -112,9 +112,16 @@ describeEmbeddedPostgres("activity service", () => {
       },
     ]);
 
-    const result = await activityService(db).list({ companyId, limit: 2 });
+    const svc = activityService(db);
+    const firstPage = await svc.list({ companyId, limit: 2 });
 
-    expect(result.map((event) => event.action)).toEqual(["test.newest", "test.middle"]);
+    expect(firstPage.rows.map((event) => event.action)).toEqual(["test.newest", "test.middle"]);
+    expect(firstPage.nextCursor).not.toBeNull();
+
+    const secondPage = await svc.list({ companyId, limit: 2, before: firstPage.nextCursor ?? undefined });
+
+    expect(secondPage.rows.map((event) => event.action)).toEqual(["test.oldest"]);
+    expect(secondPage.nextCursor).toBeNull();
   });
 
   it("returns compact usage and result summaries for issue runs", async () => {
