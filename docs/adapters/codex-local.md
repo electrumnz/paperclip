@@ -136,6 +136,36 @@ needs a maintainer security review before merge. Treat this docs section as
 the follow-up implementation spec, not as authorization to add the warning in
 a docs-only change.
 
+## Shell Snapshot Policy
+
+Codex's shell-snapshot feature writes the provider process's launch
+environment — including this run's bound credentials — to
+`$CODEX_HOME/shell_snapshots/*.sh` as plaintext `declare -x NAME="value"`
+lines. On a single-host install every agent seat runs as the same OS account,
+so any seat can read any other seat's snapshot file. Paperclip disables the
+feature rather than letting it persist credentials to disk (KEE-192).
+
+- **Which homes are modified:** every effective `CODEX_HOME` an ACPX-engine
+  Codex run uses — the engine's managed company home (seeded once from the
+  operator's `~/.codex/config.toml`) and any operator-supplied `CODEX_HOME`
+  override (which is never seeded, so this is the only place the policy
+  reaches it). Enforcement runs on every run, not only at seed time.
+- **Enforced setting:** `features.shell_snapshot = false` in `config.toml`,
+  merged into an existing `[features]` table or appended as a managed block if
+  the file has none. The rewrite is idempotent — re-running it does not
+  duplicate the table or the managed comment.
+- **Permissions:** `config.toml` is always rewritten owner-only (`0600`),
+  whatever mode it had before. A rewrite is treated as the moment to correct a
+  group- or world-readable file left by an operator or a seed step, not to
+  carry that exposure forward.
+- **Warning-only behavior:** enforcement fails open. If the existing config
+  declares `features` as an inline table (`features = { ... }`), which this
+  rewriter cannot safely merge without a full TOML parser, or if the file
+  can't be read or written, Paperclip logs a warning to the run's stdout and
+  launches Codex anyway rather than blocking every run in a company on a
+  config file it can't parse. Operators with an inline-table `features`
+  config should set `shell_snapshot = false` there by hand.
+
 ## Manual Local CLI
 
 For manual local CLI usage outside heartbeat runs (for example running as `codexcoder` directly), use:
