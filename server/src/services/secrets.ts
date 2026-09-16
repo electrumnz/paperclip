@@ -1715,6 +1715,7 @@ export function secretService(db: Db | DbTransaction) {
         runId: context.heartbeatRunId,
         issueId: effectiveIssueId,
         details: {
+          key: envKeyFromConfigPath(context.configPath),
           configPath: context.configPath,
           outcome: "success",
           version: resolution.manifestEntry.version,
@@ -1737,6 +1738,7 @@ export function secretService(db: Db | DbTransaction) {
         runId: context.heartbeatRunId,
         issueId: effectiveIssueId,
         details: {
+          key: envKeyFromConfigPath(context.configPath),
           configPath: context.configPath,
           outcome: "failure",
           errorCode,

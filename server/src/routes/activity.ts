@@ -257,9 +257,11 @@ export function activityRoutes(db: Db) {
       entityType: req.query.entityType as string | undefined,
       entityId: req.query.entityId as string | undefined,
       limit: normalizeActivityLimit(Number(req.query.limit)),
+      before: req.query.before as string | undefined,
     };
-    const result = await svc.list(filters);
-    res.json(req.actor.type === "board" ? result : redactSeatSensitiveDetails(result));
+    const { rows, nextCursor } = await svc.list(filters);
+    if (nextCursor) res.set("X-Next-Cursor", nextCursor);
+    res.json(req.actor.type === "board" ? rows : redactSeatSensitiveDetails(rows));
   });
 
   router.get("/companies/:companyId/audit/agent-actions", async (req, res) => {
