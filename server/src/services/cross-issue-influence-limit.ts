@@ -43,16 +43,48 @@ function readRunSourceIssueId(contextSnapshot: unknown) {
   return null;
 }
 
-function isUnscopedHeartbeatTimerRun(input: {
+/**
+ * Classifies a run that carries no issue anchor.
+ *
+ * Two wake classes legitimately have no source issue: the scheduler's own timer
+ * wake, and the board dispatching an idle agent to go find work. Both are
+ * dispatched by the control plane rather than by an agent, so attribution
+ * (company, agent, run) is still intact and the cap still counts per run — the
+ * only thing missing is a source issue, which never existed for either.
+ *
+ * Returns null for anything else, so the guard stays fail-closed by default.
+ */
+function readUnscopedRunSourceKind(input: {
   invocationSource: string;
   contextSnapshot: unknown;
-}) {
-  if (input.invocationSource !== "timer") return false;
+}): "heartbeat_timer" | "board_automation" | null {
   if (!input.contextSnapshot || typeof input.contextSnapshot !== "object" || Array.isArray(input.contextSnapshot)) {
-    return false;
+    return null;
   }
   const context = input.contextSnapshot as Record<string, unknown>;
-  return context.wakeReason === "heartbeat_timer" && context.wakeSource === "timer";
+
+  if (
+    input.invocationSource === "timer" &&
+    context.wakeReason === "heartbeat_timer" &&
+    context.wakeSource === "timer"
+  ) {
+    return "heartbeat_timer";
+  }
+
+  // Board-dispatched idle wakes ("idle with actionable work…") carry a free-text
+  // wakeReason, so there is no reason string to match on. The structural signal
+  // is an automation run the board triggered: an agent-triggered automation run
+  // does not qualify, so an agent cannot mint an unanchored run to step around
+  // the issue anchor.
+  if (
+    input.invocationSource === "automation" &&
+    context.wakeSource === "automation" &&
+    context.triggeredBy === "board"
+  ) {
+    return "board_automation";
+  }
+
+  return null;
 }
 
 export function evaluateCrossIssueInfluenceLimit(input: {
@@ -123,11 +155,7 @@ export async function observeCrossIssueInfluence(
     }
 
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    const sourceKind = sourceIssueId
-      ? "issue"
-      : isUnscopedHeartbeatTimerRun(run)
-        ? "heartbeat_timer"
-        : null;
+    const sourceKind = sourceIssueId ? "issue" : readUnscopedRunSourceKind(run);
     if (!sourceKind) throw crossIssueInfluenceRunContextError();
     if (
       sourceIssueId && (

@@ -254,11 +254,18 @@ export function describeIssueWriteDenial(
         description:
           `Every agent comment and task update is attributed to a heartbeat run so the ` +
           `cross-issue cap can be counted and the audit trail can name who acted for whom. ` +
-          `This request arrived without a valid run, so it could not be contained.`,
-        whoCanAct: `${actor}, once the request carries its own run id.`,
+          `Either this request carried no valid run id, or its run has no issue anchor and ` +
+          `is not a control-plane wake that is allowed to write without one.`,
+        whoCanAct: `${actor}, from a run that can be attributed to an issue.`,
+        // Do not promise the header as a general remedy. It only helps the
+        // missing/malformed run-id case; when the run itself has no issue
+        // anchor, resending it changes nothing and the agent burns calls
+        // discovering that. Name both cases and the way out of each.
         sanctionedPath:
-          `Send the \`X-Paperclip-Run-Id\` header with your current run (\`$PAPERCLIP_RUN_ID\`) ` +
-          `and retry.`,
+          `If the run id was missing, send \`X-Paperclip-Run-Id\` (\`$PAPERCLIP_RUN_ID\`) and ` +
+          `retry. If it was already sent, the run has no issue anchor — resending will not ` +
+          `help. Do this work from a run woken on the target issue, or open a new issue ` +
+          `(issue creation is not gated by this check) and continue there.`,
 
       };
 
