@@ -217,6 +217,62 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
+  it("counts every write from a board-dispatched unscoped idle run", async () => {
+    const fake = counterDb(0, {
+      invocationSource: "automation",
+      contextSnapshot: {
+        wakeReason: "Idle with actionable work after quota recovery",
+        wakeSource: "automation",
+        triggeredBy: "board",
+      },
+    });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "update",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).resolves.toMatchObject({
+      allowed: true,
+      mode: "enforce",
+      count: 1,
+    });
+    expect(fake.inserted).toEqual([
+      expect.objectContaining({
+        action: "issue.cross_issue_influence_observed",
+        details: expect.objectContaining({
+          sourceKind: "board_automation",
+          sourceIssueId: null,
+        }),
+      }),
+    ]);
+  });
+
+  it("refuses an unscoped automation run the board did not trigger", async () => {
+    const fake = counterDb(0, {
+      invocationSource: "automation",
+      contextSnapshot: {
+        wakeReason: "Idle with actionable work after quota recovery",
+        wakeSource: "automation",
+        triggeredBy: "agent",
+      },
+    });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+    })).rejects.toMatchObject({
+      status: 403,
+      details: { code: "cross_issue_influence_run_context_required" },
+    });
+    expect(fake.inserted).toEqual([]);
+  });
+
   it.each([
     ["missing", null],
     ["wrong-agent", { agentId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" }],
