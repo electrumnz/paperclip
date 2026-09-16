@@ -4651,6 +4651,28 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "delete",
+  path: "/api/secrets/{secretId}/bindings/{bindingId}",
+  tags: ["secrets"],
+  summary: "Revoke a single secret binding",
+  description:
+    "Removes the secret ref at the binding's configPath from the target's adapterConfig and " +
+    "writes it through the normal config-revision path, so the binding-row projection " +
+    "reconciles and the secret stops projecting into the target's runtime. Only targetType " +
+    "\"agent\" is supported today; other target types return 422.",
+  request: {
+    params: z.object({ secretId: z.string(), bindingId: z.string() }),
+  },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    422: r.unprocessable,
+  },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/companies/{companyId}/user-secret-definitions",
   tags: ["secrets"],
