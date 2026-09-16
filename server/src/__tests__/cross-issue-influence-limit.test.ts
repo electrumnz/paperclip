@@ -212,9 +212,45 @@ describe("cross-issue influence limit rollout", () => {
       kind: "comment",
     })).rejects.toMatchObject({
       status: 403,
-      details: { code: "cross_issue_influence_run_context_required" },
+      // Spoofed timer markers leave this run with no sourceKind at all, and
+      // its context is fixed for its lifetime — so no header can rescue it
+      // and it now takes the KEE-567 run_not_issue_scoped code.
+      details: { code: "cross_issue_influence_run_not_issue_scoped" },
     });
     expect(fake.inserted).toEqual([]);
+  });
+
+  // KEE-601: PR #8's split of the 403 wrote its throw against the pre-KEE-159
+  // file and fired on `!sourceIssueId`, which is true for the legitimate
+  // heartbeat_timer run too. This is the regression this rebase must not
+  // reintroduce: an unscoped verified timer run is still allowed, and the new
+  // permanent code must not swallow it.
+  it("still allows an unscoped heartbeat timer run through the KEE-567 not-issue-scoped throw", async () => {
+    const fake = counterDb(0, {
+      invocationSource: "timer",
+      contextSnapshot: {
+        wakeReason: "heartbeat_timer",
+        wakeSource: "timer",
+      },
+    });
+
+    await expect(observeCrossIssueInfluence(fake.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "update",
+      now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+    })).resolves.toMatchObject({ allowed: true, mode: "enforce", count: 1 });
+    expect(fake.inserted).toEqual([
+      expect.objectContaining({
+        action: "issue.cross_issue_influence_observed",
+        details: expect.objectContaining({
+          sourceKind: "heartbeat_timer",
+          sourceIssueId: null,
+        }),
+      }),
+    ]);
   });
 
   it.each([
@@ -253,7 +289,7 @@ describe("cross-issue influence limit rollout", () => {
     expect(fake.inserted).toEqual([]);
   });
 
-  it("fails closed when the persisted run has no source issue", async () => {
+  it("fails closed with a distinct code when the persisted run has no source issue", async () => {
     const fake = counterDb(0, { contextSnapshot: {} });
 
     await expect(observeCrossIssueInfluence(fake.db as never, {
@@ -264,8 +300,34 @@ describe("cross-issue influence limit rollout", () => {
       kind: "update",
     })).rejects.toMatchObject({
       status: 403,
-      details: { code: "cross_issue_influence_run_context_required" },
+      details: { code: "cross_issue_influence_run_not_issue_scoped" },
     });
     expect(fake.inserted).toEqual([]);
+  });
+
+  it("gives an unanchored run a different code from a missing or mismatched run, since the header fix only works for the latter", async () => {
+    const unanchored = counterDb(0, { contextSnapshot: {} });
+    const missingRun = counterDb(0, null);
+
+    const unanchoredRejection = await observeCrossIssueInfluence(unanchored.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+    }).catch((error) => error);
+    const missingRunRejection = await observeCrossIssueInfluence(missingRun.db as never, {
+      companyId: "22222222-2222-4222-8222-222222222222",
+      runId: "11111111-1111-4111-8111-111111111111",
+      agentId: "33333333-3333-4333-8333-333333333333",
+      targetIssueId: "55555555-5555-4555-8555-555555555555",
+      kind: "comment",
+    }).catch((error) => error);
+
+    expect(unanchoredRejection.details.code).toBe("cross_issue_influence_run_not_issue_scoped");
+    expect(missingRunRejection.details.code).toBe("cross_issue_influence_run_context_required");
+    expect(unanchoredRejection.details.code).not.toBe(missingRunRejection.details.code);
+    // The unanchored copy must not claim the header retry works — that is the KEE-567 defect.
+    expect(unanchoredRejection.message).not.toContain("X-Paperclip-Run-Id");
   });
 });
