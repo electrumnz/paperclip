@@ -184,14 +184,14 @@ describe("enforceCodexShellSnapshotPolicy", () => {
     expect(mode).toBe(0o600);
   });
 
-  it("preserves the existing config.toml's file mode across the rewrite", async () => {
+  it("tightens an existing config.toml to owner-only across the rewrite", async () => {
     const home = await createCodexHome('model = "gpt-5.6-sol"\n');
     await fs.chmod(path.join(home, "config.toml"), 0o640);
 
     await enforceCodexShellSnapshotPolicy(home);
 
     const mode = (await fs.stat(path.join(home, "config.toml"))).mode & 0o777;
-    expect(mode).toBe(0o640);
+    expect(mode).toBe(0o600);
   });
 
   it("does not collide when two invocations race on the same Codex home", async () => {

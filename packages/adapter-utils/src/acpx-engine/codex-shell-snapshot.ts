@@ -153,15 +153,12 @@ export async function enforceCodexShellSnapshotPolicy(codexHome: string): Promis
   const configPath = path.join(codexHome, "config.toml");
   let current = "";
   // `config.toml` can carry literal provider secrets (expanded env vars in
-  // `[model_providers]` env_key entries). Preserve its existing mode across the
-  // rewrite, or default to owner-only for a file we create ourselves — the
-  // temp file this function writes must never end up more permissive than
-  // that, since a rename does not widen a file's mode but a fresh 0o666 minus
-  // umask temp file can.
-  let existingMode: number | null = null;
+  // `[model_providers]` env_key entries). Always write it back owner-only,
+  // whatever mode it had before — a rewrite is exactly the moment to correct
+  // a config.toml an operator or seed step left group- or world-readable,
+  // not to carry that exposure forward.
   try {
     current = await fs.readFile(configPath, "utf8");
-    existingMode = (await fs.stat(configPath)).mode & 0o777;
   } catch (err) {
     if (!isMissingFile(err)) {
       return [
@@ -185,7 +182,7 @@ export async function enforceCodexShellSnapshotPolicy(codexHome: string): Promis
     // Codex home: one writer's rename can land on the other's still-open temp
     // file. A random suffix per invocation makes the temp path unique instead.
     const tempPath = `${configPath}.paperclip-${process.pid}-${crypto.randomBytes(6).toString("hex")}.tmp`;
-    await fs.writeFile(tempPath, policy.text, { encoding: "utf8", mode: existingMode ?? 0o600 });
+    await fs.writeFile(tempPath, policy.text, { encoding: "utf8", mode: 0o600 });
     await fs.rename(tempPath, configPath);
   } catch (err) {
     return [
