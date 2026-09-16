@@ -17,6 +17,7 @@ import {
   isCodexLocalManualModel,
 } from "@paperclipai/adapter-codex-local";
 import {
+  OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL,
   PAPERCLIP_RUNNER_IDLE_TIMEOUT_DEFAULT_MS,
   PAPERCLIP_RUNNER_IDLE_TIMEOUT_MAX_MS,
   PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
@@ -31,7 +32,7 @@ const inputClass =
   "w-full rounded-md border border-border px-2.5 py-1.5 bg-transparent outline-none text-sm font-mono placeholder:text-muted-foreground/40";
 const instructionsFileHint =
   "Absolute path to a markdown file (e.g. AGENTS.md) that defines this agent's behavior. Injected into the system prompt at runtime. Note: Codex may still auto-apply repo-scoped AGENTS.md files from the workspace.";
-const defaultOpenCodeRunnerModel = "openrouter/deepseek/deepseek-v4-flash-0731";
+const defaultOpenCodeRunnerModel = OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL;
 const defaultAcpxClaudeModel = "claude-sonnet-5";
 const defaultClaudeManagedModel = "claude-sonnet-5";
 const defaultAwsAgentCoreModel = "global.anthropic.claude-sonnet-4-6";

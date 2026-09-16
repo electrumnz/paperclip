@@ -1,3 +1,8 @@
+import {
+  OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL,
+  OPENCODE_FREE_ROUTER_MODEL,
+} from "@paperclipai/adapter-utils";
+
 export const type = "opencode_local";
 export const label = "OpenCode";
 
@@ -42,7 +47,12 @@ export const SANDBOX_INSTALL_COMMAND =
   'fi; ' +
   'fi';
 
-export const DEFAULT_OPENCODE_LOCAL_MODEL = "openai/gpt-5.2-codex";
+/**
+ * OpenCode is the adapter the non-leadership lane runs on, because it is the
+ * only local adapter that routes through OpenRouter. Its default is the cheap
+ * lane; frontier models stay available in the picker for leadership agents.
+ */
+export const DEFAULT_OPENCODE_LOCAL_MODEL = OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL;
 
 export function isValidOpenCodeModelId(value: unknown): value is string {
   if (typeof value !== "string") return false;
@@ -52,7 +62,9 @@ export function isValidOpenCodeModelId(value: unknown): value is string {
 }
 
 export const models: Array<{ id: string; label: string }> = [
-  { id: DEFAULT_OPENCODE_LOCAL_MODEL, label: DEFAULT_OPENCODE_LOCAL_MODEL },
+  { id: DEFAULT_OPENCODE_LOCAL_MODEL, label: "OpenRouter · DeepSeek Flash (latest)" },
+  { id: OPENCODE_FREE_ROUTER_MODEL, label: "OpenRouter · Free Models Router" },
+  { id: "openai/gpt-5.2-codex", label: "openai/gpt-5.2-codex" },
   { id: "openai/gpt-5.5", label: "openai/gpt-5.5" },
   { id: "openai/gpt-5.4", label: "openai/gpt-5.4" },
   { id: "openai/gpt-5.4-mini", label: "openai/gpt-5.4-mini" },

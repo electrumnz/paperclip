@@ -2,6 +2,10 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  NON_LEADERSHIP_ADAPTER_TYPE,
+  OPENCODE_FREE_ROUTER_MODEL,
+} from "@paperclipai/adapter-utils";
 import { readPaperclipSkillSyncPreference, writePaperclipSkillSyncPreference } from "@paperclipai/adapter-utils/server-utils";
 import { and, desc, eq, ne } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -413,9 +417,11 @@ const DEFINITIONS = validateBuiltInAgentDefinitions([
     defaultStatus: "paused",
     defaultManager: "single_root_agent",
     allowedAdapterTypes: ["claude_local", "codex_local", "gemini_local", "opencode_local", "process"],
-    defaultAdapterType: "claude_local",
+    // Read-and-report only, and its own instructions promise the low-cost lane:
+    // the Free Models Router costs nothing and a retry is cheap when it is busy.
+    defaultAdapterType: NON_LEADERSHIP_ADAPTER_TYPE,
     defaultAdapterConfig: {
-      model: "claude-haiku-4-5",
+      model: OPENCODE_FREE_ROUTER_MODEL,
     },
     defaultBudgetMonthlyCents: 0,
     bundle: {

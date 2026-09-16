@@ -4,6 +4,7 @@ import { stampClaudeAgentIdHeader } from "./claude-agent-id-header.js";
 import {
   buildSandboxNpmInstallCommand,
   getAdapterSessionManagement,
+  OPENCODE_FREE_ROUTER_MODEL,
   PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
 } from "@paperclipai/adapter-utils";
 import type { AdapterLoginCapability } from "@paperclipai/adapter-utils";
@@ -478,19 +479,22 @@ const paperclipRunnerAdapter: ServerAdapterModule = {
   sessionCodec: codexSessionCodec,
   models: [
     ...codexModels,
-    { id: DEFAULT_OPENCODE_RUNNER_MODEL, label: "OpenRouter · DeepSeek V4 Flash 0731" },
+    { id: DEFAULT_OPENCODE_RUNNER_MODEL, label: "OpenRouter · DeepSeek Flash (latest)" },
+    { id: OPENCODE_FREE_ROUTER_MODEL, label: "OpenRouter · Free Models Router" },
     { id: QUALIFIED_ACPX_RUNNER_MODELS.claude, label: "Claude Sonnet 5" },
     { id: "global.anthropic.claude-sonnet-4-6", label: "Amazon Bedrock · Claude Sonnet 4.6 (global)" },
   ],
   listModels: async () => [
     ...await listCodexModels(),
-    { id: DEFAULT_OPENCODE_RUNNER_MODEL, label: "OpenRouter · DeepSeek V4 Flash 0731" },
+    { id: DEFAULT_OPENCODE_RUNNER_MODEL, label: "OpenRouter · DeepSeek Flash (latest)" },
+    { id: OPENCODE_FREE_ROUTER_MODEL, label: "OpenRouter · Free Models Router" },
     { id: QUALIFIED_ACPX_RUNNER_MODELS.claude, label: "Claude Sonnet 5" },
     { id: "global.anthropic.claude-sonnet-4-6", label: "Amazon Bedrock · Claude Sonnet 4.6 (global)" },
   ],
   refreshModels: async () => [
     ...await refreshCodexModels(),
-    { id: DEFAULT_OPENCODE_RUNNER_MODEL, label: "OpenRouter · DeepSeek V4 Flash 0731" },
+    { id: DEFAULT_OPENCODE_RUNNER_MODEL, label: "OpenRouter · DeepSeek Flash (latest)" },
+    { id: OPENCODE_FREE_ROUTER_MODEL, label: "OpenRouter · Free Models Router" },
     { id: QUALIFIED_ACPX_RUNNER_MODELS.claude, label: "Claude Sonnet 5" },
     { id: "global.anthropic.claude-sonnet-4-6", label: "Amazon Bedrock · Claude Sonnet 4.6 (global)" },
   ],

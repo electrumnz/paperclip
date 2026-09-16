@@ -318,6 +318,7 @@ async function buildCatalogTeam(
   }));
   const localSkillSlugs = collectSlugs(graph.skills, "skill", errors);
   const rootAgentSlugs = validateLocalReferences(candidate.absolutePath, parsed.frontmatter, graph, agentSlugs, projectSlugs, errors);
+  const agentOrgDepths = collectAgentOrgDepths(graph, rootAgentSlugs);
   const requiredSkills = collectRequiredSkills(candidate.absolutePath, parsed.frontmatter, graph, catalogSkills, agentSlugs, localSkillSlugs, errors);
   const envInputs = collectEnvInputs(graph);
   const sourceRefs = collectSourceRefs(parsed.frontmatter, requiredSkills);
@@ -350,6 +351,7 @@ async function buildCatalogTeam(
     },
     rootAgentSlugs,
     agentSlugs: agentSlugs.sort(),
+    agentOrgDepths,
     projectSlugs: projectSlugs.sort(),
     requiredSkills,
     envInputs,
@@ -534,6 +536,40 @@ function validateLocalReferences(
   }
 
   return Array.from(new Set(rootAgentSlugs.filter(Boolean))).sort();
+}
+
+/**
+ * Walk `reportsTo` up to the team manager so every agent gets a 1-based depth.
+ * An agent with no manager is a root at depth 1; `validateLocalReferences` has
+ * already rejected a `reportsTo` that names an agent the package does not ship,
+ * and the `seen` guard stops a cycle rather than counting round it forever.
+ * Slug errors are reported by `collectSlugs`, so they are swallowed here.
+ */
+function collectAgentOrgDepths(
+  graph: TeamPackageGraph,
+  rootAgentSlugs: string[],
+): Record<string, number | undefined> {
+  const roots = new Set(rootAgentSlugs);
+  const managerBySlug = new Map<string, string | null>();
+  for (const agent of graph.agents) {
+    const slug = readSlug(agent, "agent", []);
+    const reportsTo = asString(agent.frontmatter.reportsTo);
+    managerBySlug.set(slug, reportsTo && reportsTo !== "null" ? reportsTo : null);
+  }
+
+  const depths: Record<string, number> = {};
+  for (const slug of managerBySlug.keys()) {
+    const seen = new Set<string>([slug]);
+    let depth = 1;
+    let cursor = roots.has(slug) ? null : managerBySlug.get(slug) ?? null;
+    while (cursor && managerBySlug.has(cursor) && !seen.has(cursor)) {
+      seen.add(cursor);
+      depth += 1;
+      cursor = roots.has(cursor) ? null : managerBySlug.get(cursor) ?? null;
+    }
+    depths[slug] = depth;
+  }
+  return Object.fromEntries(Object.entries(depths).sort(([a], [b]) => a.localeCompare(b)));
 }
 
 function collectRequiredSkills(

@@ -161,7 +161,7 @@ describe("buildPaperclipRunnerConfig", () => {
       },
     }))).toMatchObject({
       provider: "opencode",
-      model: "openrouter/deepseek/deepseek-v4-flash-0731",
+      model: "openrouter/~deepseek/deepseek-flash-latest",
       opencodePermissionMode: "allow",
       codexPermissionMode: "never",
       acpxPermissionMode: "approve-reads",

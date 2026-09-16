@@ -21,6 +21,12 @@ import type {
   CompanyPortabilitySource,
 } from "@paperclipai/shared";
 import { normalizeAgentUrlKey } from "@paperclipai/shared";
+import {
+  isLeadershipOrgDepth,
+  LEADERSHIP_ORG_DEPTH,
+  NON_LEADERSHIP_ADAPTER_TYPE,
+  OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL,
+} from "@paperclipai/adapter-utils";
 import { parseFrontmatterMarkdown } from "@paperclipai/shared/frontmatter";
 import { conflict, forbidden, HttpError, notFound, unprocessable } from "../errors.js";
 import { agentService } from "./agents.js";
@@ -89,6 +95,8 @@ export interface CatalogTeamPreparedSource {
   skillPreparations: CatalogTeamSkillPreparation[];
   warnings: string[];
   errors: string[];
+  /** Depth the team's own root sits at once grafted, 1 when it becomes a company root. */
+  rootOrgDepth: number;
 }
 
 interface CatalogTargetManagerReference {
@@ -696,18 +704,44 @@ function defaultSafeCatalogAdapterType() {
  * install without manual adapter flags. Explicit caller overrides win and are
  * left untouched (both `adapterType` and `adapterConfig`). This is scoped to the
  * catalog install path; the generic portability fallback is unchanged.
+ *
+ * Only the senior leadership team — the top {@link LEADERSHIP_ORG_DEPTH} layers
+ * of the installed org chart — gets the frontier default adapter. Everyone below
+ * runs on OpenCode against DeepSeek Flash latest, so a company's ICs do not each
+ * arrive on a flagship model.
  */
 function withSafeCatalogAdapterDefaults(
-  agentSlugs: string[],
+  team: Pick<CatalogTeam, "agentSlugs" | "agentOrgDepths">,
   callerOverrides: CompanyPortabilityImport["adapterOverrides"],
   defaultAdapterType: string,
+  rootOrgDepth: number,
 ): Record<string, CompanyPortabilityAdapterOverride> {
   const merged: Record<string, CompanyPortabilityAdapterOverride> = { ...(callerOverrides ?? {}) };
-  for (const slug of agentSlugs) {
+  for (const slug of team.agentSlugs) {
     if (merged[slug]) continue;
-    merged[slug] = { adapterType: defaultAdapterType };
+    merged[slug] = isLeadershipOrgDepth(catalogAgentOrgDepth(team, slug, rootOrgDepth))
+      ? { adapterType: defaultAdapterType }
+      : {
+          adapterType: NON_LEADERSHIP_ADAPTER_TYPE,
+          adapterConfig: { model: OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL },
+        };
   }
   return merged;
+}
+
+/** Depth an agent lands at in the target company, counting from the company root. */
+function catalogAgentOrgDepth(
+  team: Pick<CatalogTeam, "agentOrgDepths">,
+  slug: string,
+  rootOrgDepth: number,
+): number {
+  const withinTeam = team.agentOrgDepths?.[slug];
+  // A manifest built before org depths existed leaves the team flat one layer
+  // under its root, which is the safer read: nobody is silently promoted.
+  const depth = typeof withinTeam === "number" && Number.isInteger(withinTeam) && withinTeam >= 1
+    ? withinTeam
+    : 2;
+  return depth + rootOrgDepth - 1;
 }
 
 function buildPortabilityInput(
@@ -808,7 +842,29 @@ export function teamsCatalogService(db: Db) {
       skillPreparations: skillPrep.preparations,
       warnings,
       errors,
+      rootOrgDepth: await resolveRootOrgDepth(targetManager),
     };
+  }
+
+  /**
+   * Depth the team's own root lands at. With no target manager the root becomes
+   * a company root (1); grafted under an existing agent it sits one below that
+   * agent's own depth. The `seen` guard keeps a cyclic `reportsTo` chain from
+   * looping rather than trusting the data to be a tree.
+   */
+  async function resolveRootOrgDepth(
+    targetManager: CatalogTargetManagerReference | null,
+  ): Promise<number> {
+    if (!targetManager) return 1;
+    const seen = new Set<string>();
+    let managerDepth = 1;
+    let cursor: string | null = targetManager.agentId;
+    while (cursor && !seen.has(cursor)) {
+      seen.add(cursor);
+      cursor = (await agents.getById(cursor))?.reportsTo ?? null;
+      if (cursor) managerDepth += 1;
+    }
+    return managerDepth + 1;
   }
 
   async function logCatalogEvent(
@@ -913,9 +969,10 @@ export function teamsCatalogService(db: Db) {
     const importInput: CompanyPortabilityImport = {
       ...buildPortabilityInput(companyId, prepared.source, options),
       adapterOverrides: withSafeCatalogAdapterDefaults(
-        prepared.team.agentSlugs,
+        prepared.team,
         options.adapterOverrides,
         defaultAdapterType,
+        prepared.rootOrgDepth,
       ),
       secretValues: options.secretValues,
     };
@@ -929,12 +986,23 @@ export function teamsCatalogService(db: Db) {
     const defaultedAdapterSlugs = prepared.team.agentSlugs.filter(
       (slug) => !options.adapterOverrides?.[slug],
     );
+    const leadershipSlugs = defaultedAdapterSlugs.filter((slug) =>
+      isLeadershipOrgDepth(catalogAgentOrgDepth(prepared.team, slug, prepared.rootOrgDepth)),
+    );
+    const nonLeadershipSlugs = defaultedAdapterSlugs.filter(
+      (slug) => !leadershipSlugs.includes(slug),
+    );
     const warnings = [
       ...prepared.warnings,
       ...importPreview.warnings,
-      ...(defaultedAdapterSlugs.length > 0
+      ...(leadershipSlugs.length > 0
         ? [
-            `Catalog agents without explicit overrides (${defaultedAdapterSlugs.join(", ")}) default to ${defaultAdapterType}. Pass adapterOverrides or PAPERCLIP_TEAMS_CATALOG_DEFAULT_ADAPTER_TYPE to use a different supported adapter.`,
+            `Catalog agents in the top ${LEADERSHIP_ORG_DEPTH} org-chart layers without explicit overrides (${leadershipSlugs.join(", ")}) default to ${defaultAdapterType}. Pass adapterOverrides or PAPERCLIP_TEAMS_CATALOG_DEFAULT_ADAPTER_TYPE to use a different supported adapter.`,
+          ]
+        : []),
+      ...(nonLeadershipSlugs.length > 0
+        ? [
+            `Catalog agents below the top ${LEADERSHIP_ORG_DEPTH} org-chart layers without explicit overrides (${nonLeadershipSlugs.join(", ")}) default to ${NON_LEADERSHIP_ADAPTER_TYPE} on ${OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL}. Pass adapterOverrides to put them on a different model.`,
           ]
         : []),
     ];
