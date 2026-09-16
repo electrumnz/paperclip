@@ -125,6 +125,9 @@ importers:
       '@types/node':
         specifier: ^24.0.0
         version: 24.13.3
+      smol-toml:
+        specifier: ^1.4.2
+        version: 1.8.0
       typescript:
         specifier: ^7.0.2
         version: 7.0.2
@@ -7530,6 +7533,10 @@ packages:
     resolution: {integrity: sha512-7ZmEpBeEoPLc+hqZ/StAnCO/hulgEPANzPyZgOM/CZ5zc3b0ApSp3URavY5POM/OKyi5d9+UC/Q21OoiYC2kJw==}
     engines: {node: '>=18'}
     hasBin: true
+
+  smol-toml@1.8.0:
+    resolution: {integrity: sha512-kCZr2V3ch9i00x8zXRhjUNVcjG9ijES5dDudkXvUVCT5QlJNQWElSJdZqyPemffHoLNUYwOcou0Fy+ojN0uHSQ==}
+    engines: {node: '>= 18'}
 
   sonic-boom@4.2.1:
     resolution: {integrity: sha512-w6AxtubXa2wTXAUsZMMWERrsIRAdrK0Sc+FUytWvYAhBJLyuI4llrMIC1DtlNSdI99EI86KZum2MMq3EAZlF9Q==}
@@ -15017,6 +15024,8 @@ snapshots:
       - bare-abort-controller
       - bare-buffer
       - react-native-b4a
+
+  smol-toml@1.8.0: {}
 
   sonic-boom@4.2.1:
     dependencies:
