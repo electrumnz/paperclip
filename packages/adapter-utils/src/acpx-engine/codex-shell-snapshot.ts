@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
+import { parse as parseToml } from "smol-toml";
 
 /**
  * Codex shell snapshots serialize the provider process environment into
@@ -34,13 +35,54 @@ const MANAGED_KEY_COMMENT =
   "# managed by paperclip: the launch environment must not be snapshotted";
 
 const TABLE_HEADER = /^\s*\[/;
-// A trailing `# comment` after the closing bracket is valid TOML; the previous
+
+// TOML keys may be bare (`shell_snapshot`) or quoted (`"shell_snapshot"`,
+// `'shell_snapshot'`); a rewriter that only matches the bare form silently
+// ignores a quoted `[features]` table or a quoted `shell_snapshot` key and
+// goes on to append a second, colliding `[features]` table — TOML-invalid,
+// and it breaks every Codex run reading the file.
+const BARE_KEY = "[A-Za-z0-9_-]+";
+const DOUBLE_QUOTED_KEY = '"(?:[^"\\\\]|\\\\.)*"';
+const SINGLE_QUOTED_KEY = "'[^']*'";
+const KEY_TOKEN = `(?:${DOUBLE_QUOTED_KEY}|${SINGLE_QUOTED_KEY}|${BARE_KEY})`;
+
+function unquoteKey(token: string): string {
+  if (token.length >= 2 && token.startsWith('"') && token.endsWith('"')) {
+    return token.slice(1, -1).replace(/\\(.)/g, "$1");
+  }
+  if (token.length >= 2 && token.startsWith("'") && token.endsWith("'")) {
+    return token.slice(1, -1);
+  }
+  return token;
+}
+
+// A trailing `# comment` after the closing bracket is valid TOML; a previous
 // anchored-to-end-of-line regex missed it and fell through to appending a
 // second, TOML-invalid `[features]` table onto an already-valid config.
-const FEATURES_TABLE_HEADER = /^\s*\[\s*features\s*\]\s*(#.*)?$/;
-const SHELL_SNAPSHOT_KEY = /^\s*shell_snapshot\s*=/;
-const DOTTED_SHELL_SNAPSHOT_KEY = /^\s*features\s*\.\s*shell_snapshot\s*=/;
-const FEATURES_INLINE_TABLE = /^\s*features\s*=/;
+const TABLE_HEADER_NAME = new RegExp(`^\\s*\\[\\s*(${KEY_TOKEN})\\s*\\]\\s*(#.*)?$`);
+const ASSIGNMENT_KEY = new RegExp(`^\\s*(${KEY_TOKEN})\\s*=`);
+const DOTTED_KEY_ASSIGNMENT = new RegExp(`^\\s*(${KEY_TOKEN})\\s*\\.\\s*(${KEY_TOKEN})\\s*=`);
+
+function isFeaturesTableHeader(line: string): boolean {
+  const match = TABLE_HEADER_NAME.exec(line);
+  return match !== null && unquoteKey(match[1]) === "features";
+}
+
+function isShellSnapshotAssignment(line: string): boolean {
+  const match = ASSIGNMENT_KEY.exec(line);
+  return match !== null && unquoteKey(match[1]) === "shell_snapshot";
+}
+
+function isDottedShellSnapshotAssignment(line: string): boolean {
+  const match = DOTTED_KEY_ASSIGNMENT.exec(line);
+  return match !== null && unquoteKey(match[1]) === "features" && unquoteKey(match[2]) === "shell_snapshot";
+}
+
+function isFeaturesInlineTableAssignment(line: string): boolean {
+  if (isDottedShellSnapshotAssignment(line)) return false;
+  const match = ASSIGNMENT_KEY.exec(line);
+  return match !== null && unquoteKey(match[1]) === "features";
+}
 
 export type ShellSnapshotPolicyResult = {
   /** The config text with the policy applied, or the input unchanged. */
@@ -69,9 +111,7 @@ export function applyShellSnapshotPolicy(configToml: string): ShellSnapshotPolic
   // An inline `features = { ... }` root assignment cannot be merged with a
   // `[features]` table without reimplementing a TOML parser, and appending the
   // table anyway would make the file unparseable. Report and leave it alone.
-  const inlineIndex = lines.findIndex(
-    (line) => FEATURES_INLINE_TABLE.test(line) && !DOTTED_SHELL_SNAPSHOT_KEY.test(line),
-  );
+  const inlineIndex = lines.findIndex((line) => isFeaturesInlineTableAssignment(line));
   if (inlineIndex >= 0) {
     return {
       text: configToml,
@@ -80,12 +120,31 @@ export function applyShellSnapshotPolicy(configToml: string): ShellSnapshotPolic
     };
   }
 
-  const headerIndex = lines.findIndex((line) => FEATURES_TABLE_HEADER.test(line));
+  const headerIndex = lines.findIndex((line) => isFeaturesTableHeader(line));
   const next = headerIndex >= 0
     ? setKeyInFeaturesTable(lines, headerIndex)
     : appendManagedBlock(lines);
 
-  return { text: next, changed: next !== configToml };
+  if (next === configToml) {
+    return { text: next, changed: false };
+  }
+
+  // The rewrite above is line-oriented, not a real TOML parser — quoting,
+  // nesting or an operator table shape it didn't anticipate can still turn
+  // valid input into invalid output. Codex reads this file at startup, so
+  // parse the candidate before it ever replaces the file on disk; a rewrite
+  // that doesn't parse is reported, not written.
+  try {
+    parseToml(next);
+  } catch (err) {
+    return {
+      text: configToml,
+      changed: false,
+      unsupported: `rewriting config.toml would produce invalid TOML: ${errorText(err)}`,
+    };
+  }
+
+  return { text: next, changed: true };
 }
 
 function removeManagedBlock(configToml: string): string {
@@ -109,14 +168,14 @@ function setKeyInFeaturesTable(lines: string[], headerIndex: number): string {
   for (const [index, line] of lines.entries()) {
     // A root-level `features.shell_snapshot = ...` dotted key collides with the
     // table key below, so it goes wherever it sits in the file.
-    if (DOTTED_SHELL_SNAPSHOT_KEY.test(line)) continue;
+    if (isDottedShellSnapshotAssignment(line)) continue;
     if (index === headerIndex) {
       insideFeatures = true;
       result.push(line, MANAGED_KEY_COMMENT, "shell_snapshot = false");
       continue;
     }
     if (insideFeatures && TABLE_HEADER.test(line)) insideFeatures = false;
-    if (insideFeatures && SHELL_SNAPSHOT_KEY.test(line)) continue;
+    if (insideFeatures && isShellSnapshotAssignment(line)) continue;
     // A managed comment from a previous run sits right above the key it
     // documents. Drop it too, or every re-run appends another copy.
     if (insideFeatures && line === MANAGED_KEY_COMMENT) continue;
@@ -129,7 +188,7 @@ function appendManagedBlock(lines: string[]): string {
   const body = lines.join("\n").replace(/\n+$/, "");
   const withoutDottedKey = body
     .split("\n")
-    .filter((line) => !DOTTED_SHELL_SNAPSHOT_KEY.test(line))
+    .filter((line) => !isDottedShellSnapshotAssignment(line))
     .join("\n")
     .replace(/\n+$/, "");
   // A TOML table header swallows every root key that follows it, so the managed
@@ -145,9 +204,19 @@ function ensureTrailingNewline(text: string): string {
 }
 
 /**
+ * Thrown when the shell-snapshot policy cannot be guaranteed for a Codex
+ * launch. The caller must not launch Codex when this is thrown: a snapshot
+ * written before the policy is confirmed in force would record this run's
+ * credentials to disk in plaintext, so an unreadable/unwritable/unsupported
+ * config blocks the launch instead of warning and proceeding anyway.
+ */
+export class CodexShellSnapshotPolicyError extends Error {}
+
+/**
  * Apply the shell-snapshot policy to a Codex home's `config.toml` in place.
  * Creates the file when the home has none. Returns the lines to report on the
- * run log; an empty array means the policy was already in force.
+ * run log; an empty array means the policy was already in force. Throws
+ * {@link CodexShellSnapshotPolicyError} rather than launching Codex unprotected.
  */
 export async function enforceCodexShellSnapshotPolicy(codexHome: string): Promise<string[]> {
   const configPath = path.join(codexHome, "config.toml");
@@ -161,18 +230,20 @@ export async function enforceCodexShellSnapshotPolicy(codexHome: string): Promis
     current = await fs.readFile(configPath, "utf8");
   } catch (err) {
     if (!isMissingFile(err)) {
-      return [
-        `[paperclip] Could not read "${configPath}" to disable Codex shell snapshots: ${errorText(err)}`,
-      ];
+      throw new CodexShellSnapshotPolicyError(
+        `Could not read "${configPath}" to enforce the Codex shell-snapshot policy: ${errorText(err)}. ` +
+          "Refusing to launch Codex without snapshot protection.",
+      );
     }
   }
 
   const policy = applyShellSnapshotPolicy(current);
   if (policy.unsupported) {
-    return [
-      `[paperclip] Left Codex shell snapshots enabled: ${policy.unsupported}. ` +
-        "Set features.shell_snapshot = false there by hand — snapshots record this run's credentials to disk.",
-    ];
+    throw new CodexShellSnapshotPolicyError(
+      `Cannot enforce the Codex shell-snapshot policy: ${policy.unsupported}. ` +
+        `Set features.shell_snapshot = false in "${configPath}" by hand, then retry — ` +
+        "refusing to launch Codex without snapshot protection.",
+    );
   }
   if (!policy.changed) return [];
 
@@ -185,9 +256,10 @@ export async function enforceCodexShellSnapshotPolicy(codexHome: string): Promis
     await fs.writeFile(tempPath, policy.text, { encoding: "utf8", mode: 0o600 });
     await fs.rename(tempPath, configPath);
   } catch (err) {
-    return [
-      `[paperclip] Could not write "${configPath}" to disable Codex shell snapshots: ${errorText(err)}`,
-    ];
+    throw new CodexShellSnapshotPolicyError(
+      `Could not write "${configPath}" to enforce the Codex shell-snapshot policy: ${errorText(err)}. ` +
+        "Refusing to launch Codex without snapshot protection.",
+    );
   }
   return [
     `[paperclip] Disabled Codex shell snapshots in "${configPath}" (they record the launch environment, credentials included).`,

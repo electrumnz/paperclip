@@ -5,6 +5,7 @@ import { parse as parseToml } from "smol-toml";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   applyShellSnapshotPolicy,
+  CodexShellSnapshotPolicyError,
   enforceCodexShellSnapshotPolicy,
 } from "./codex-shell-snapshot.js";
 
@@ -137,6 +138,63 @@ describe("applyShellSnapshotPolicy", () => {
     expect(second.text).toBe(first.text);
     expect(first.text.match(/managed by paperclip/g)).toHaveLength(1);
   });
+
+  it("writes into a quoted [\"features\"] table header instead of declaring it twice", () => {
+    const input = 'model = "gpt-5.6-sol"\n\n["features"]\nweb_search = true\n';
+
+    const result = applyShellSnapshotPolicy(input);
+
+    expect(result.changed).toBe(true);
+    expect(result.text.match(/features/g)?.length).toBeGreaterThan(0);
+    expect(result.text).not.toMatch(/^\[features\]$/m);
+    expect(parsedFeatures(result.text)).toEqual({ shell_snapshot: false, web_search: true });
+  });
+
+  it("overrides a quoted 'shell_snapshot' key instead of leaving a duplicate", () => {
+    const input = "[features]\n'shell_snapshot' = true\nweb_search = true\n";
+
+    const result = applyShellSnapshotPolicy(input);
+
+    expect(result.text.match(/shell_snapshot/g)).toHaveLength(1);
+    expect(parsedFeatures(result.text)).toEqual({ shell_snapshot: false, web_search: true });
+  });
+
+  it("replaces a quoted dotted key \"features\".\"shell_snapshot\"", () => {
+    const input = '"features"."shell_snapshot" = true\nmodel = "gpt-5.6-sol"\n';
+
+    const result = applyShellSnapshotPolicy(input);
+
+    expect(result.text).not.toContain('"features"."shell_snapshot"');
+    expect(parseToml(result.text)).toMatchObject({
+      model: "gpt-5.6-sol",
+      features: { shell_snapshot: false },
+    });
+  });
+
+  it("refuses to rewrite a quoted inline features table rather than breaking the file", () => {
+    const input = '"features" = { web_search = true }\n';
+
+    const result = applyShellSnapshotPolicy(input);
+
+    expect(result.changed).toBe(false);
+    expect(result.text).toBe(input);
+    expect(result.unsupported).toContain("inline table");
+  });
+
+  it("reports rather than writes when the rewrite would produce invalid TOML", () => {
+    // Two `[features]` headers is invalid TOML; only the first is recognized by
+    // the line-oriented rewrite, so the naive rewrite would leave the second
+    // header's body orphaned under a duplicate table. The output-validation
+    // step must catch this before it ever reaches disk.
+    const input = "[features]\nweb_search = true\n[features]\nother = true\n";
+
+    const result = applyShellSnapshotPolicy(input);
+
+    expect(() => parseToml(input)).toThrow();
+    expect(result.changed).toBe(false);
+    expect(result.text).toBe(input);
+    expect(result.unsupported).toContain("invalid TOML");
+  });
 });
 
 describe("enforceCodexShellSnapshotPolicy", () => {
@@ -165,14 +223,30 @@ describe("enforceCodexShellSnapshotPolicy", () => {
     expect(await readConfig(home)).toBe(afterFirst);
   });
 
-  it("reports an inline features table instead of silently leaving snapshots on", async () => {
+  it("blocks the launch instead of starting Codex unprotected on an inline features table", async () => {
     const home = await createCodexHome("features = { web_search = true }\n");
 
-    const notes = await enforceCodexShellSnapshotPolicy(home);
-
-    expect(notes).toHaveLength(1);
-    expect(notes[0]).toContain("Left Codex shell snapshots enabled");
+    await expect(enforceCodexShellSnapshotPolicy(home)).rejects.toThrow(
+      CodexShellSnapshotPolicyError,
+    );
+    await expect(enforceCodexShellSnapshotPolicy(home)).rejects.toThrow(
+      /refusing to launch codex/i,
+    );
     expect(await readConfig(home)).toBe("features = { web_search = true }\n");
+  });
+
+  it("blocks the launch when config.toml cannot be read", async () => {
+    const home = await createCodexHome('model = "gpt-5.6-sol"\n');
+    const configPath = path.join(home, "config.toml");
+    await fs.chmod(configPath, 0o000);
+
+    try {
+      await expect(enforceCodexShellSnapshotPolicy(home)).rejects.toThrow(
+        CodexShellSnapshotPolicyError,
+      );
+    } finally {
+      await fs.chmod(configPath, 0o600);
+    }
   });
 
   it("creates a new config.toml owner-only, since it may carry provider secrets", async () => {
