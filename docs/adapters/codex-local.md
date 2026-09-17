@@ -158,13 +158,35 @@ feature rather than letting it persist credentials to disk (KEE-192).
   whatever mode it had before. A rewrite is treated as the moment to correct a
   group- or world-readable file left by an operator or a seed step, not to
   carry that exposure forward.
-- **Warning-only behavior:** enforcement fails open. If the existing config
-  declares `features` as an inline table (`features = { ... }`), which this
-  rewriter cannot safely merge without a full TOML parser, or if the file
-  can't be read or written, Paperclip logs a warning to the run's stdout and
-  launches Codex anyway rather than blocking every run in a company on a
-  config file it can't parse. Operators with an inline-table `features`
-  config should set `shell_snapshot = false` there by hand.
+- **Fail-closed enforcement:** if the existing config can't be read or
+  written, Paperclip refuses to launch Codex at all rather than starting a run
+  whose credentials could be snapshotted; the run fails with an explicit
+  `CodexShellSnapshotPolicyError`. The same applies when the config declares
+  `features` as an inline table (`features = { ... }`) that this rewriter
+  cannot safely merge — unless the inline table already sets
+  `shell_snapshot = false`, in which case the policy is already in force and
+  the launch proceeds. A compliant config an operator locked down by hand
+  never blocks a launch.
+
+### Upgrading from builds that persisted credentials
+
+This change stops new credential persistence; it does not scrub what older
+builds already wrote. Two on-disk surfaces predate it:
+
+- **Session records** (`<stateDir>/sessions/<acpxRecordId>.json`): builds
+  before the credential-safe session store persisted the whole launch
+  environment, bound credentials included. A resumed session loads with this
+  run's environment injected fresh, so a record that still contains an old
+  environment keeps working — and keeps the old values at rest until that
+  record is saved again, which strips it. Untouched legacy records and any
+  backups taken before the upgrade therefore need a separate cleanup decision
+  (delete or re-save them); do not treat a successful resumable session as
+  evidence that an old copy was removed.
+- **Shell snapshots** (`$CODEX_HOME/shell_snapshots/*.sh`): snapshot files
+  written by runs before the policy was enforced are not cleaned up by
+  upgrading, and Paperclip's rewrite removes only the config key, not the
+  existing files. Check `shell_snapshots/` under each `CODEX_HOME` (the
+  managed home and any override) and delete leftovers by hand.
 
 ## Manual Local CLI
 
