@@ -250,7 +250,7 @@ describe("teamsCatalogService", () => {
     );
   });
 
-  it("injects safe claude_local adapter defaults for every bundled agent when no overrides are supplied", async () => {
+  it("gives the top two org-chart layers the safe claude_local default and puts the rest on the cheap lane", async () => {
     const svc = teamsCatalogService({} as any);
 
     await svc.installCatalogTeam("company-1", "core-exec-team");
@@ -259,7 +259,8 @@ describe("teamsCatalogService", () => {
     expect(importInput.adapterOverrides).toEqual({
       ceo: { adapterType: "claude_local" },
       cto: { adapterType: "claude_local" },
-      qa: { adapterType: "claude_local" },
+      // QA reports to the CTO, so it sits at layer 3 and drops off the frontier model.
+      qa: { adapterType: "opencode_local", adapterConfig: { model: "openrouter/~deepseek/deepseek-flash-latest" } },
     });
   });
 
@@ -275,7 +276,7 @@ describe("teamsCatalogService", () => {
       expect(importInput.adapterOverrides).toEqual({
         ceo: { adapterType: "opencode_local" },
         cto: { adapterType: "opencode_local" },
-        qa: { adapterType: "opencode_local" },
+        qa: { adapterType: "opencode_local", adapterConfig: { model: "openrouter/~deepseek/deepseek-flash-latest" } },
       });
     } finally {
       if (previousDefault === undefined) {
@@ -304,6 +305,37 @@ describe("teamsCatalogService", () => {
     });
   });
 
+  it("shifts a pod's layers down when it installs under an existing manager", async () => {
+    mockAgentService.getById.mockImplementation(async (id: string) =>
+      id === "manager-1"
+        ? { id: "manager-1", companyId: "company-1", name: "CEO", reportsTo: null }
+        : null);
+    const svc = teamsCatalogService({} as any);
+
+    await svc.installCatalogTeam("company-1", "product-engineering", {
+      targetManagerAgentId: "manager-1",
+    });
+
+    const [importInput] = mockCompanyPortabilityService.importBundle.mock.calls.at(-1)!;
+    // Grafted under the company CEO, the pod CTO is layer 2 and its reports are layer 3.
+    expect(importInput.adapterOverrides).toEqual({
+      cto: { adapterType: "claude_local" },
+      qa: { adapterType: "opencode_local", adapterConfig: { model: "openrouter/~deepseek/deepseek-flash-latest" } },
+      "senior-coder": { adapterType: "opencode_local", adapterConfig: { model: "openrouter/~deepseek/deepseek-flash-latest" } },
+    });
+  });
+
+  it("warns separately about the leadership and cheap adapter lanes", async () => {
+    const svc = teamsCatalogService({} as any);
+
+    const result = await svc.installCatalogTeam("company-1", "core-exec-team");
+
+    expect(result.warnings).toEqual(expect.arrayContaining([
+      expect.stringContaining("top 2 org-chart layers"),
+      expect.stringContaining("openrouter/~deepseek/deepseek-flash-latest"),
+    ]));
+  });
+
   it("never sends a forbidden process adapter type from the default catalog path", async () => {
     const svc = teamsCatalogService({} as any);
 
@@ -330,7 +362,7 @@ describe("teamsCatalogService", () => {
     expect(importInput.adapterOverrides).toEqual({
       ceo: { adapterType: "claude_local" },
       cto: { adapterType: "opencode_local", adapterConfig: { model: "anthropic/claude-opus-4" } },
-      qa: { adapterType: "claude_local" },
+      qa: { adapterType: "opencode_local", adapterConfig: { model: "openrouter/~deepseek/deepseek-flash-latest" } },
     });
     // Caller-supplied object must not be mutated in place.
     expect(callerOverrides).toEqual({

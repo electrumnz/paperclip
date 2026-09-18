@@ -33,6 +33,23 @@ describe("shipped teams catalog", () => {
     expect(optionalKeys).toEqual(EXPECTED_OPTIONAL_KEYS);
   });
 
+  it("measures every agent's org-chart depth from its team manager", () => {
+    const byKey = new Map(catalogTeams.map((team) => [team.key, team]));
+
+    expect(byKey.get("paperclipai/bundled/company-defaults/core-exec-team")?.agentOrgDepths)
+      .toEqual({ ceo: 1, cto: 2, qa: 3 });
+    expect(byKey.get("paperclipai/bundled/software-development/product-engineering")?.agentOrgDepths)
+      .toEqual({ cto: 1, qa: 2, "senior-coder": 2 });
+
+    for (const team of catalogTeams) {
+      // Every agent is measured, every root sits at 1, and nothing is unreachable.
+      expect(Object.keys(team.agentOrgDepths).sort()).toEqual([...team.agentSlugs].sort());
+      for (const rootSlug of team.rootAgentSlugs) {
+        expect(team.agentOrgDepths[rootSlug]).toBe(1);
+      }
+    }
+  });
+
   it("keeps every shipped team free of executable scripts and external sources in Phase B", () => {
     const risky = catalogTeams.filter(
       (team) => team.trustLevel === "scripts_executables" || team.trustLevel === "external_sources",

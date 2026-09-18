@@ -100,6 +100,7 @@ export const catalogTeamSchema = z.object({
   }),
   rootAgentSlugs: z.array(z.string()),
   agentSlugs: z.array(z.string()),
+  agentOrgDepths: z.record(z.string(), z.number().int().positive()).optional(),
   projectSlugs: z.array(z.string()),
   requiredSkills: z.array(catalogTeamSkillRequirementSchema),
   envInputs: z.array(catalogTeamEnvInputSummarySchema),
