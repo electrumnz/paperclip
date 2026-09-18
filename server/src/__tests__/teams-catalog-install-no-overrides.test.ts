@@ -65,7 +65,7 @@ describeEmbeddedPostgres("teams catalog install with no caller adapter overrides
     return new Map(rows.map((row) => [row.name, row]));
   }
 
-  it("installs core-exec-team end-to-end with no caller overrides and creates 3 claude_local agents", async () => {
+  it("installs core-exec-team end-to-end with no caller overrides and splits agents by org-chart layer", async () => {
     const companyId = await seedEmptyCompany();
     const svc = teamsCatalogService(db);
 
@@ -77,8 +77,12 @@ describeEmbeddedPostgres("teams catalog install with no caller adapter overrides
     const byName = await listAdapterTypesByName(companyId);
     expect(byName.size).toBe(3);
 
+    // The CEO is layer 1 and the CTO layer 2, so both keep the frontier
+    // adapter. QA reports to the CTO at layer 3 and drops to the low-cost lane.
+    expect(byName.get("CEO")?.adapterType).toBe("claude_local");
+    expect(byName.get("CTO")?.adapterType).toBe("claude_local");
+    expect(byName.get("QA")?.adapterType).toBe("opencode_local");
     const adapterTypes = Array.from(byName.values()).map((row) => row.adapterType);
-    expect(adapterTypes).toEqual(["claude_local", "claude_local", "claude_local"]);
     expect(adapterTypes).not.toContain("process");
     expect(adapterTypes).not.toContain("http");
   });
@@ -116,7 +120,7 @@ describeEmbeddedPostgres("teams catalog install with no caller adapter overrides
     expect(byName.get("CTO")?.permissions).toMatchObject({ canCreateAgents: true });
   });
 
-  it("honors an explicit caller adapter override for a single slug while defaulting the rest to claude_local", async () => {
+  it("honors an explicit caller adapter override for a single slug while defaulting the rest by org-chart layer", async () => {
     const companyId = await seedEmptyCompany();
     const svc = teamsCatalogService(db);
 
@@ -132,9 +136,9 @@ describeEmbeddedPostgres("teams catalog install with no caller adapter overrides
     expect(byName.size).toBe(3);
     const ctoRow = Array.from(byName.values()).find((row) => row.role === "engineering-manager" || row.name === "CTO");
     expect(ctoRow?.adapterType).toBe("opencode_local");
-    const otherAdapters = Array.from(byName.values())
-      .filter((row) => row !== ctoRow)
-      .map((row) => row.adapterType);
-    expect(otherAdapters).toEqual(["claude_local", "claude_local"]);
+    // The override settles the CTO. The other two still follow their layer:
+    // the CEO keeps the frontier adapter, QA at layer 3 does not.
+    expect(byName.get("CEO")?.adapterType).toBe("claude_local");
+    expect(byName.get("QA")?.adapterType).toBe("opencode_local");
   });
 });
