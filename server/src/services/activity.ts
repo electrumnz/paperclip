@@ -26,6 +26,8 @@ export interface ActivityFilters {
   entityType?: string;
   entityId?: string;
   limit?: number;
+  /** Opaque keyset cursor from a previous page's `nextCursor`; pages strictly older than it. */
+  before?: string;
 }
 
 const DEFAULT_ACTIVITY_LIMIT = 100;
@@ -34,6 +36,36 @@ const MAX_ACTIVITY_LIMIT = 500;
 export function normalizeActivityLimit(limit: number | undefined) {
   if (!Number.isFinite(limit)) return DEFAULT_ACTIVITY_LIMIT;
   return Math.max(1, Math.min(MAX_ACTIVITY_LIMIT, Math.floor(limit ?? DEFAULT_ACTIVITY_LIMIT)));
+}
+
+type ActivityCursor = { createdAt: string; id: string };
+
+/**
+ * `/companies/:companyId/activity` predates cursor support and its response
+ * body is a bare array consumed by the CLI and UI (see activity-parity
+ * tests) — changing that shape is a breaking change. The cursor is instead
+ * threaded through the `before` query param and an `X-Next-Cursor` response
+ * header, so old and new clients both keep working (KEE-546).
+ */
+export function decodeActivityCursor(cursor: string | undefined): ActivityCursor | null {
+  if (!cursor) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as unknown;
+    if (
+      parsed && typeof parsed === "object" &&
+      typeof (parsed as ActivityCursor).createdAt === "string" &&
+      typeof (parsed as ActivityCursor).id === "string"
+    ) {
+      return parsed as ActivityCursor;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function encodeActivityCursor(value: ActivityCursor): string {
+  return Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
 }
 
 export function activityService(db: Db) {
@@ -328,9 +360,10 @@ export function activityService(db: Db) {
   }
 
   return {
-    list: (filters: ActivityFilters) => {
+    list: async (filters: ActivityFilters): Promise<{ rows: (typeof activityLog.$inferSelect)[]; nextCursor: string | null }> => {
       const conditions = [eq(activityLog.companyId, filters.companyId)];
       const limit = normalizeActivityLimit(filters.limit);
+      const cursor = decodeActivityCursor(filters.before);
 
       if (filters.agentId) {
         conditions.push(eq(activityLog.agentId, filters.agentId));
@@ -341,8 +374,17 @@ export function activityService(db: Db) {
       if (filters.entityId) {
         conditions.push(eq(activityLog.entityId, filters.entityId));
       }
+      if (cursor) {
+        conditions.push(or(
+          sql`${activityLog.createdAt} < ${cursor.createdAt}::timestamptz`,
+          and(
+            sql`${activityLog.createdAt} = ${cursor.createdAt}::timestamptz`,
+            sql`${activityLog.id} < ${cursor.id}`,
+          ),
+        )!);
+      }
 
-      return db
+      const rows = await db
         .select({ activityLog })
         .from(activityLog)
         .leftJoin(
@@ -361,9 +403,17 @@ export function activityService(db: Db) {
             ),
           ),
         )
-        .orderBy(desc(activityLog.createdAt))
-        .limit(limit)
-        .then((rows) => rows.map((r) => r.activityLog));
+        .orderBy(desc(activityLog.createdAt), desc(activityLog.id))
+        .limit(limit + 1)
+        .then((r) => r.map((row) => row.activityLog));
+
+      const page = rows.slice(0, limit);
+      const hasMore = rows.length > limit;
+      const last = page[page.length - 1];
+      const nextCursor = hasMore && last
+        ? encodeActivityCursor({ createdAt: new Date(last.createdAt).toISOString(), id: last.id })
+        : null;
+      return { rows: page, nextCursor };
     },
 
     forIssue: (issueId: string) =>
