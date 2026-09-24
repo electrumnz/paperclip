@@ -6613,6 +6613,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       status: "blocked",
       assigneeAgentId: agentId,
     });
+    expect(sourceAfter?.unblockDescriptor).toEqual({
+      owner: "board",
+      action:
+        "Inspect the evidence and choose whether to repair, retry the original owner, explicitly reassign, or resolve the source issue.",
+    });
     expect(action).toMatchObject({
       kind: "deliberate_wait_without_target",
       status: "active",
@@ -13250,6 +13255,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       owner: "board",
       action: recoveryAction.nextAction,
     });
+    expect(issue?.blockedTransitionAt).toBeInstanceOf(Date);
   });
 
   async function seedNativePassiveBoardResponse(
