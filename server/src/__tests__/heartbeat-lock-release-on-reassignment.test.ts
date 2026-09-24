@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
@@ -220,6 +220,77 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
     expect(issue?.executionRunId).toBe(holderRunId);
   });
 
+  it("promotes a new assignee's deferred assignment wake when a stale queued holder is cancelled", async () => {
+    const { companyId, coderAgentId, reviewerAgentId, issueId, holderRunId } =
+      await seedCrossAgentScenario({ holderStatus: "queued" });
+
+    await db
+      .update(agents)
+      .set({
+        runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      })
+      .where(eq(agents.id, reviewerAgentId));
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: reviewerAgentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "running",
+      contextSnapshot: { wakeReason: "test_busy_slot" },
+      startedAt: new Date(),
+    });
+    const [wake] = await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: reviewerAgentId,
+      source: "automation",
+      reason: "issue_execution_deferred",
+      status: "deferred_issue_execution",
+      payload: {
+        issueId,
+        _paperclipWakeContext: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_assigned",
+        },
+      },
+      requestedByActorType: "user",
+      requestedByActorId: "responsible-user",
+    }).returning();
+
+    await heartbeat.resumeQueuedRuns();
+
+    const [holder] = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode, agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, holderRunId));
+    expect(holder).toMatchObject({
+      status: "cancelled",
+      errorCode: "issue_assignee_changed",
+      agentId: coderAgentId,
+    });
+
+    const [promotedWake] = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.id, wake.id));
+    expect(promotedWake).toMatchObject({
+      status: "queued",
+      agentId: reviewerAgentId,
+    });
+    expect(promotedWake.runId).toBeTruthy();
+
+    const [promotedRun] = await db
+      .select()
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, promotedWake.runId!));
+    expect(promotedRun).toMatchObject({
+      status: "queued",
+      agentId: reviewerAgentId,
+      contextSnapshot: { issueId },
+    });
+  });
+
   // Race-guard regression: the cancel UPDATE for the queued holder is pinned
   // to the exact non-running status that was read just above it. If a worker
   // races in and flips the holder from `queued` → `running` between that
@@ -359,4 +430,77 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
       );
     });
   });
+
+  it("continues other task handoffs when one queued promotion fails", async () => {
+    const { companyId, coderAgentId, reviewerAgentId, issueId, holderRunId } =
+      await seedCrossAgentScenario({ holderStatus: "queued" });
+    await db.update(issues).set({ priority: "critical" }).where(eq(issues.id, issueId));
+    await db.update(agents).set({
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+    }).where(eq(agents.id, reviewerAgentId));
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: reviewerAgentId,
+      status: "running",
+      startedAt: new Date(),
+      contextSnapshot: {},
+    });
+    const secondIssueId = randomUUID();
+    const secondRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: secondRunId,
+      companyId,
+      agentId: coderAgentId,
+      status: "queued",
+      contextSnapshot: { issueId: secondIssueId, taskId: secondIssueId, wakeReason: "issue_assigned" },
+    });
+    await db.insert(issues).values({
+      id: secondIssueId,
+      companyId,
+      title: "Independent review handoff",
+      status: "in_review",
+      priority: "medium",
+      assigneeAgentId: reviewerAgentId,
+      executionRunId: secondRunId,
+      executionAgentNameKey: "coder",
+      executionLockedAt: new Date(),
+    });
+    const wakes = await db.insert(agentWakeupRequests).values([issueId, secondIssueId].map((id) => ({
+      companyId,
+      agentId: reviewerAgentId,
+      source: "automation",
+      reason: "issue_execution_deferred",
+      status: "deferred_issue_execution",
+      payload: {
+        issueId: id,
+        _paperclipWakeContext: { issueId: id, taskId: id, wakeReason: "issue_assigned" },
+      },
+      requestedByActorType: "user",
+      requestedByActorId: "responsible-user",
+    }))).returning();
+    const failingWake = wakes.find((wake) => wake.payload?.issueId === issueId)!;
+    const otherWake = wakes.find((wake) => wake.payload?.issueId === secondIssueId)!;
+    await db.execute(sql.raw(`CREATE FUNCTION fail_test_wake_promotion() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.id = '${failingWake.id}' AND NEW.status = 'queued' THEN
+        RAISE EXCEPTION 'injected promotion failure'; END IF; RETURN NEW; END $$`));
+    await db.execute(sql`CREATE TRIGGER fail_test_wake_promotion BEFORE UPDATE ON agent_wakeup_requests
+      FOR EACH ROW EXECUTE FUNCTION fail_test_wake_promotion()`);
+    try {
+      await heartbeat.resumeQueuedRuns();
+      for (const id of [holderRunId, secondRunId]) {
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id));
+        expect(run).toMatchObject({ status: "cancelled", startedAt: null });
+      }
+      const [failed] = await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, failingWake.id));
+      const [promoted] = await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, otherWake.id));
+      expect(failed.status).toBe("deferred_issue_execution");
+      expect(promoted.status).toBe("queued");
+      expect(promoted.runId).toBeTruthy();
+    } finally {
+      await db.execute(sql`DROP TRIGGER fail_test_wake_promotion ON agent_wakeup_requests`);
+      await db.execute(sql`DROP FUNCTION fail_test_wake_promotion()`);
+    }
+  }, 10_000);
 });

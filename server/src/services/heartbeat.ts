@@ -17157,6 +17157,7 @@ export function heartbeatService(
   async function claimQueuedRun(
     run: typeof heartbeatRuns.$inferSelect,
     companyAgents?: AgentOrgRow[],
+    cancelledBeforeClaim?: Array<typeof heartbeatRuns.$inferSelect>,
   ) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
@@ -17301,6 +17302,10 @@ export function heartbeatService(
       });
       if (staleness.outcome === "cancelled") {
         applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+        // A stale queued successor may have held back the new assignee's
+        // deferred wake. It has no executor/finally block to drain that queue.
+        if (cancelledBeforeClaim) cancelledBeforeClaim.push(run);
+        else await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true });
         logger.info(
           { runId: run.id, issueId, errorCode: staleness.errorCode },
           "claimQueuedRun: cancelled stale queued run",
@@ -19797,6 +19802,7 @@ export function heartbeatService(
   async function startNextQueuedRunForAgent(agentId: string) {
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
+    const cancelledBeforeClaim: Array<typeof heartbeatRuns.$inferSelect> = [];
 
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
@@ -19908,7 +19914,7 @@ export function heartbeatService(
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
-        const claimed = await claimQueuedRun(queuedRun, companyAgents);
+        const claimed = await claimQueuedRun(queuedRun, companyAgents, cancelledBeforeClaim);
         if (claimed) claimedRuns.push(claimed);
       }
       if (claimedRuns.length === 0) return [];
@@ -19932,6 +19938,15 @@ export function heartbeatService(
         });
       }
       return claimedRuns;
+    }).finally(async () => {
+      // Promotion can target this same agent. Release its start lock first;
+      // otherwise nested promotion waits on its own lock until the stale timeout.
+      for (const cancelled of cancelledBeforeClaim) {
+        await releaseIssueExecutionAndPromote(cancelled, { suppressImmediateRecovery: true }).catch((err) => {
+          logger.error({ err, runId: cancelled.id },
+            "failed to promote deferred task wake after stale queued cancellation");
+        });
+      }
     });
   }
 
