@@ -194,7 +194,7 @@ const support = externalDatabaseUrl
         unblockDescriptor: {
           owner: "board",
           action:
-            "Automatic recovery stopped. Recorded work is preserved; actions with unverified outcomes will not be repeated.",
+            "Inspect the original failure and choose a recovery action; three execution attempts have been used.",
         },
         blockedTransitionAt: expect.any(Date),
       });

@@ -720,7 +720,11 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
   if (!applies || isAcknowledgedNativeStop(run)) return false;
 
   const existing = await tx
-    .select({ id: issueRecoveryActions.id })
+    .select({
+      id: issueRecoveryActions.id,
+      evidence: issueRecoveryActions.evidence,
+      nextAction: issueRecoveryActions.nextAction,
+    })
     .from(issueRecoveryActions)
     .where(
       and(
@@ -734,9 +738,11 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
     )
     .limit(1);
   let nativeFailureBlock: { runId: string; statusVersion: number } | undefined;
-  const unblockAction =
-    "Inspect the original failure and reconcile the previous execution before continuing. Automatic recovery cannot start another incident.";
   if (issue.status !== "blocked") {
+    // Reuse a valid existing recovery action when one already names the next
+    // step. The native terminal check still owns this blocked projection.
+    const unblockAction = existing[0]?.nextAction?.trim() ||
+      "Inspect the original failure and reconcile the previous execution before continuing. Automatic recovery cannot start another incident.";
     const projected = await issueService(tx).update(
       issue.id,
       {
@@ -764,6 +770,8 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
     }
   }
   if (!existing.length) {
+    const unblockAction =
+      "Inspect the original failure and reconcile the previous execution before continuing. Automatic recovery cannot start another incident.";
     await tx
       .update(nativeRunFinalizations)
       .set({
