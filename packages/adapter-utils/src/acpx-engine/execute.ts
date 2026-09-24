@@ -92,6 +92,7 @@ import {
   type AcpRuntimeUsageCost,
   type AcpSessionStore,
 } from "acpx/runtime";
+import { enforceCodexShellSnapshotPolicy } from "./codex-shell-snapshot.js";
 import {
   ACPX_DUPLEX_LOSS_CANCEL_DEADLINE_MS,
   ACPX_HANDSHAKE_TIMEOUT_MS,
@@ -996,7 +997,7 @@ function isErrnoException(err: unknown, code: string): err is NodeJS.ErrnoExcept
 async function ensureCopiedFile(target: string, source: string): Promise<void> {
   if (await pathExists(target)) return;
   await ensureParentDir(target);
-  await fs.copyFile(source, target);
+  await fs.copyFile(source, target, fs.constants.COPYFILE_EXCL);
 }
 
 async function prepareManagedCodexHome(input: {
@@ -1008,7 +1009,7 @@ async function prepareManagedCodexHome(input: {
   const { sourceHome, targetHome, onLog } = input;
   if (path.resolve(sourceHome) === path.resolve(targetHome)) return targetHome;
 
-  await fs.mkdir(targetHome, { recursive: true });
+  await fs.mkdir(targetHome, { recursive: true, mode: 0o700 });
 
   const authJson = path.join(sourceHome, "auth.json");
   if (await pathExists(authJson)) await ensureSymlink(path.join(targetHome, "auth.json"), authJson);
@@ -1291,6 +1292,14 @@ async function prepareCodexSkillRuntime(input: {
       targetHome: managedCodexHome,
       onLog: input.onLog,
     });
+  // Codex writes the provider launch environment — this run's bound credentials
+  // included — into `$CODEX_HOME/shell_snapshots/*.sh` as plaintext `declare -x`
+  // lines. Pin the policy off on every run, not only on the seed: the managed
+  // home is seeded once from the operator's `~/.codex/config.toml`, and an
+  // operator-supplied `CODEX_HOME` is never seeded at all. Runs on both.
+  for (const line of await enforceCodexShellSnapshotPolicy(effectiveCodexHome)) {
+    await input.onLog("stdout", `${line}\n`);
+  }
   const { allSkills, selectedSkills, desiredSkillNames } = await resolveSelectedRuntimeSkills(input.config, input.moduleDir);
   const skillSetKey = await buildSkillSetKey({ skills: selectedSkills, label: "codex" });
   const skillsHome = path.join(effectiveCodexHome, "skills");
