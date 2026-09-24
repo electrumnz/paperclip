@@ -4,7 +4,7 @@ import { currentConversationCommentCondition } from "../../../services/agent-con
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { extractIssueReferenceIdentifiers } from "@paperclipai/shared";
+import { extractIssueReferenceIdentifiers, type IssueUnblockDescriptor } from "@paperclipai/shared";
 import {
   agentWakeupRequests,
   agents,
@@ -733,6 +733,36 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
       ),
     )
     .limit(1);
+  let nativeFailureBlock: { runId: string; statusVersion: number } | undefined;
+  const unblockAction =
+    "Inspect the original failure and reconcile the previous execution before continuing. Automatic recovery cannot start another incident.";
+  if (issue.status !== "blocked") {
+    const projected = await issueService(tx).update(
+      issue.id,
+      {
+        status: "blocked",
+        unblockDescriptor: { owner: "board", action: unblockAction } satisfies IssueUnblockDescriptor,
+      },
+      tx,
+    );
+    if (projected) {
+      nativeFailureBlock = { runId: run.id, statusVersion: projected.statusVersion };
+      await tx.insert(activityLog).values({
+        companyId: issue.companyId, actorType: "system", actorId: "execution-recovery",
+        action: "issue.updated", entityType: "issue", entityId: issue.id, runId: run.id,
+        details: { status: "blocked", previousStatus: issue.status, reason: "native_continuation_requires_reconciliation" },
+      });
+    }
+  }
+  // Status projection is required even when restart/finalization created the
+  // incident first. Preserve its owner, cause, retry budget, and prior evidence.
+  if (nativeFailureBlock) {
+    for (const action of existing) {
+      await tx.update(issueRecoveryActions).set({
+        evidence: { ...action.evidence, nativeFailureBlock }, updatedAt: now,
+      }).where(and(eq(issueRecoveryActions.id, action.id), eq(issueRecoveryActions.companyId, issue.companyId)));
+    }
+  }
   if (!existing.length) {
     await tx
       .update(nativeRunFinalizations)
@@ -760,9 +790,8 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
       returnOwnerAgentId: run.agentId,
       cause: "native_continuation_requires_reconciliation",
       fingerprint: `native-continuation:${run.id}`,
-      evidence: { runId: run.id, originalFailureCode: run.errorCode },
-      nextAction:
-        "Inspect the original failure and reconcile the previous execution before continuing. Automatic recovery cannot start another incident.",
+      evidence: { runId: run.id, originalFailureCode: run.errorCode, ...(nativeFailureBlock ? { nativeFailureBlock } : {}) },
+      nextAction: unblockAction,
       maxAttempts: 3,
       wakePolicy: null,
       supersedeOnIdentityChange: true,
