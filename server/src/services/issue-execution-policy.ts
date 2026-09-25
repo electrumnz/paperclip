@@ -414,6 +414,21 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
   };
 }
 
+export function hasClearedIssueMonitor(input: {
+  monitorNextCheckAt?: Date | string | null;
+  executionPolicy?: Record<string, unknown> | null;
+  executionState?: Record<string, unknown> | null;
+}): boolean {
+  if (input.monitorNextCheckAt) return false;
+  const policy = input.executionPolicy;
+  if (policy && typeof policy === "object" && !Array.isArray(policy)) {
+    const monitor = (policy as Record<string, unknown>).monitor;
+    if (monitor && typeof monitor === "object" && !Array.isArray(monitor)) return false;
+  }
+  const state = parseIssueExecutionState(input.executionState);
+  return state?.monitor?.status === "cleared" && state.monitor.nextCheckAt == null;
+}
+
 export function parseIssueExecutionState(input: unknown): IssueExecutionState | null {
   if (input == null) return null;
   const parsed = issueExecutionStateSchema.safeParse(input);

@@ -451,6 +451,217 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(runRows).toHaveLength(0);
   });
 
+  it.each([
+    {
+      name: "cleared",
+      executionPolicy: null,
+      executionState: {
+        status: "idle",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: {
+          status: "cleared",
+          nextCheckAt: null,
+          lastTriggeredAt: "2026-09-24T00:00:00.000Z",
+          attemptCount: 1,
+          notes: null,
+          scheduledBy: "assignee",
+          kind: null,
+          serviceName: null,
+          externalRef: null,
+          timeoutAt: null,
+          maxAttempts: null,
+          recoveryPolicy: null,
+          clearedAt: "2026-09-24T00:00:00.000Z",
+          clearReason: "invalid_status",
+        },
+      },
+      monitorNextCheckAt: null,
+    },
+    {
+      name: "scheduled",
+      executionPolicy: {
+        mode: "normal",
+        commentRequired: true,
+        stages: [],
+        monitor: {
+          nextCheckAt: "2026-09-25T00:00:00.000Z",
+          notes: null,
+          scheduledBy: "assignee",
+          kind: null,
+          serviceName: null,
+          externalRef: null,
+          timeoutAt: null,
+          maxAttempts: null,
+          recoveryPolicy: null,
+        },
+      },
+      executionState: {
+        status: "idle",
+        currentStageId: null,
+        currentStageIndex: null,
+        currentStageType: null,
+        currentParticipant: null,
+        returnAssignee: null,
+        reviewRequest: null,
+        completedStageIds: [],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+        monitor: {
+          status: "scheduled",
+          nextCheckAt: "2026-09-25T00:00:00.000Z",
+          lastTriggeredAt: null,
+          attemptCount: 0,
+          notes: null,
+          scheduledBy: "assignee",
+          kind: null,
+          serviceName: null,
+          externalRef: null,
+          timeoutAt: null,
+          maxAttempts: null,
+          recoveryPolicy: null,
+          clearedAt: null,
+          clearReason: null,
+        },
+      },
+      monitorNextCheckAt: new Date("2026-09-25T00:00:00.000Z"),
+    },
+  ])(
+    "treats an assigned $name in-progress monitor as $expectedTimerActionable before adapter execution",
+    async ({ executionPolicy, executionState, monitorNextCheckAt }) => {
+      const expectedTimerActionable = executionState.monitor.status === "scheduled";
+      const { companyId, agentId } = await seedCompanyAndAgent({
+        heartbeatConfig: {
+          enabled: true,
+          skipTimerWhenNoActionableWork: true,
+        },
+      });
+      await db.insert(issues).values({
+        id: randomUUID(),
+        companyId,
+        title: `Assigned ${executionState.monitor.status} monitor`,
+        status: "in_progress",
+        priority: "high",
+        assigneeAgentId: agentId,
+        executionPolicy,
+        executionState,
+        monitorNextCheckAt,
+      });
+
+      const run = await heartbeat.wakeup(agentId, {
+        source: "timer",
+        triggerDetail: "schedule",
+      });
+
+      if (expectedTimerActionable) {
+        expect(run).not.toBeNull();
+        expect(await waitForCondition(() => mockAdapterExecute.mock.calls.length === 1)).toBe(true);
+      } else {
+        expect(run).toBeNull();
+        expect(mockAdapterExecute).not.toHaveBeenCalled();
+      }
+      const expectedWakeupStatus = expectedTimerActionable ? "completed" : "skipped";
+      await waitForCondition(async () => {
+        const [current] = await db
+          .select({ status: agentWakeupRequests.status })
+          .from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.agentId, agentId));
+        return current?.status === expectedWakeupStatus;
+      });
+      const [wakeup] = await db
+        .select({
+          status: agentWakeupRequests.status,
+          reason: agentWakeupRequests.reason,
+        })
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakeup?.status).toBe(expectedWakeupStatus);
+      if (!expectedTimerActionable) {
+        expect(wakeup?.reason).toBe("heartbeat.timer.no_actionable_work");
+      }
+      await waitForCondition(async () => {
+        const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
+        return runs.every((row) => row.status === "succeeded");
+      });
+    },
+  );
+
+  it("keeps todo and later non-cleared in-progress work actionable when candidates exceed one page", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    const clearedExecutionState = {
+      status: "idle",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      monitor: {
+        status: "cleared",
+        nextCheckAt: null,
+        lastTriggeredAt: "2026-09-24T00:00:00.000Z",
+        attemptCount: 1,
+        notes: null,
+        scheduledBy: "assignee",
+        kind: null,
+        serviceName: null,
+        externalRef: null,
+        timeoutAt: null,
+        maxAttempts: null,
+        recoveryPolicy: null,
+        clearedAt: "2026-09-24T00:00:00.000Z",
+        clearReason: "invalid_status",
+      },
+    };
+    await db.insert(issues).values(
+      Array.from({ length: 101 }, (_, index) => ({
+        id: randomUUID(),
+        companyId,
+        title: `Cleared monitor ${index}`,
+        status: "in_progress" as const,
+        priority: "medium" as const,
+        assigneeAgentId: agentId,
+        executionState: clearedExecutionState,
+        monitorNextCheckAt: null,
+      })),
+    );
+    await db.insert(issues).values({
+      id: randomUUID(),
+      companyId,
+      title: "Actionable todo after cleared monitors",
+      status: "todo",
+      priority: "high",
+      assigneeAgentId: agentId,
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).not.toBeNull();
+    expect(await waitForCondition(() => mockAdapterExecute.mock.calls.length === 1)).toBe(true);
+    await waitForCondition(async () => {
+      const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
+      return runs.length === 1 && runs[0]?.status === "succeeded";
+    });
+  });
+
   it("checks guarded issue status and assignee under the enqueue lock", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const parkedIssueId = randomUUID();

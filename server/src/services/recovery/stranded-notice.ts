@@ -32,6 +32,7 @@ const DEFAULT_STRANDED_RECOVERY_NOTICE_TITLE = "Automatic recovery blocked";
 
 const STRANDED_RECOVERY_NOTICE_TITLES_BY_CAUSE: Record<string, string> = {
   workspace_validation_failed: "Workspace validation failed",
+  cleared_monitor_missing_wake_path: "Cleared monitor has no wake path",
   configuration_incomplete: "Configuration incomplete",
   execution_review_participant_recovery: "Review recovery stalled",
 };

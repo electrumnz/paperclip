@@ -407,6 +407,7 @@ import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
+  hasClearedIssueMonitor,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
@@ -16755,8 +16756,22 @@ export function heartbeatService(
   }
 
   async function hasActionableTimerWork(agent: typeof agents.$inferSelect) {
-    const row = await db
-      .select({ id: issues.id })
+    const rows = await db
+      .select({
+        issueCount: sql<number>`count(*)::integer`,
+        actionableTodoCount: sql<number>`count(*) filter (where ${issues.status} = 'todo')::integer`,
+        inProgressRows: sql<Record<string, unknown>[]>`coalesce(
+          jsonb_agg(
+            jsonb_build_object(
+              'status', ${issues.status},
+              'executionPolicy', ${issues.executionPolicy},
+              'executionState', ${issues.executionState},
+              'monitorNextCheckAt', ${issues.monitorNextCheckAt}
+            )
+          ) filter (where ${issues.status} = 'in_progress'),
+          '[]'::jsonb
+        )`,
+      })
       .from(issues)
       .where(
         and(
@@ -16768,10 +16783,24 @@ export function heartbeatService(
           isNull(issues.conversationAgentId),
           nonIdleSlackIssueCondition(),
         ),
-      )
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    return Boolean(row);
+      );
+
+    const [row] = rows;
+    if (!row || row.issueCount === 0) return false;
+    if (row.actionableTodoCount > 0) return true;
+
+    const inProgressRows = Array.isArray(row.inProgressRows) ? row.inProgressRows : [];
+    return inProgressRows.some(
+      (issue) =>
+        !hasClearedIssueMonitor({
+          monitorNextCheckAt:
+            typeof issue.monitorNextCheckAt === "string"
+              ? new Date(issue.monitorNextCheckAt)
+              : null,
+          executionPolicy: issue.executionPolicy as Record<string, unknown> | null,
+          executionState: issue.executionState as Record<string, unknown> | null,
+        }),
+    );
   }
 
   async function markTimerHeartbeatChecked(

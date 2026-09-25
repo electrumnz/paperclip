@@ -103,6 +103,7 @@ import {
 } from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
+  hasClearedIssueMonitor,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../issue-execution-policy.js";
@@ -241,6 +242,7 @@ export type StrandedRecoveryCause =
   | "provider_quota"
   | "codex_output_inactivity_monitor"
   | "workspace_validation_failed"
+  | "cleared_monitor_missing_wake_path"
   | "configuration_incomplete"
   | "native_session_interrupted"
   | "native_runner_process_exited"
@@ -299,6 +301,8 @@ function recoveryCauseTitle(cause: StrandedRecoveryCause) {
       return "output-inactivity retry exhausted";
     case "workspace_validation_failed":
       return "workspace validation failed";
+    case "cleared_monitor_missing_wake_path":
+      return "cleared monitor has no wake path";
     case "configuration_incomplete":
       return "configuration incomplete";
     case "execution_review_participant_recovery":
@@ -2445,6 +2449,10 @@ export function recoveryService(
       input.recoveryCause === "workspace_validation_failed"
         ? readWorkspaceValidationPayload(input.latestRun)
         : null;
+    const clearedMonitor =
+      input.recoveryCause === "cleared_monitor_missing_wake_path"
+        ? parseIssueExecutionState(input.issue.executionState)?.monitor ?? null
+        : null;
     return {
       sourceIssueId: input.issue.id,
       sourceIdentifier: input.issue.identifier,
@@ -2465,6 +2473,7 @@ export function recoveryService(
       maxHandoffAttempts:
         input.successfulRunHandoffEvidence?.maxHandoffAttempts ?? null,
       ...(workspaceValidation ? { workspaceValidation } : {}),
+      ...(clearedMonitor ? { clearedMonitor } : {}),
     };
   }
 
@@ -2533,12 +2542,13 @@ export function recoveryService(
                   ? readWorkspaceValidationPayload(input.latestRun)?.reason ===
                     "git_worktree_branch_incoherence"
                     ? "Board operator: repair the source task git worktree branch incoherence or choose a new execution workspace, then explicitly retry or reassign."
-                    : readWorkspaceValidationPayload(input.latestRun)
-                          ?.reason ===
+                    : readWorkspaceValidationPayload(input.latestRun)?.reason ===
                         "git_worktree_base_materialization_failed"
                       ? "Board operator: repair the project workspace repository URL or clone access, or configure a local checkout cwd, then explicitly retry or reassign."
                       : "Board operator: repair the source task workspace link, project workspace cwd, or git checkout, then explicitly retry or reassign."
-                  : recoveryCause === "configuration_incomplete"
+                  : recoveryCause === "cleared_monitor_missing_wake_path"
+                    ? "Board operator: schedule a new monitor, restore a durable work path, or explicitly retry the original owner."
+                    : recoveryCause === "configuration_incomplete"
                     ? readConfigurationIncompletePayload(input.latestRun)?.reason === "ai_connection_unavailable"
                       ? "Reconnect the selected AI account or choose an available connection, then continue the task."
                       : readConfigurationIncompletePayload(input.latestRun)
@@ -4533,6 +4543,36 @@ export function recoveryService(
       );
       if (activeRecoveryAction?.ownerType === "board") {
         result.skipped += 1;
+        continue;
+      }
+
+      const hasExplicitBlockerPath = await hasPersistedDurableWaitPath(
+        issue,
+        latestRun,
+      );
+      if (
+        issue.status === "in_progress" &&
+        hasClearedIssueMonitor(issue) &&
+        !hasExplicitBlockerPath
+      ) {
+        const updated = await escalateStrandedAssignedIssue({
+          issue,
+          previousStatus: "in_progress",
+          latestRun,
+          recoveryCause: "cleared_monitor_missing_wake_path",
+          notice: {
+            body:
+              "Paperclip found that this issue's monitor was cleared while the issue remained `in_progress`, and no blocker or other durable wait path owns the next action. Moving it to `blocked` so the missing wake path is visible for intervention.",
+            title: "Cleared monitor has no wake path",
+            tone: "danger",
+          },
+        });
+        if (updated) {
+          result.escalated += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
         continue;
       }
 

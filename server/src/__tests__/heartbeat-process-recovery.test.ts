@@ -1338,6 +1338,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     if (input.cause === "execution_review_participant_recovery") {
       expect(action.nextAction).toContain("failed review participant path");
+    } else if (input.cause === "cleared_monitor_missing_wake_path") {
+      expect(action.nextAction).toContain("schedule a new monitor");
     } else if (input.cause === "process_lost") {
       expect(action.nextAction).toContain(
         "explicitly retry the original owner",
@@ -13521,6 +13523,233 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         ),
       );
     expect(recoveryIssues).toHaveLength(0);
+  });
+
+  it("blocks a cleared in-progress monitor instead of manufacturing an issue-bound continuation", async () => {
+    const { companyId, agentId, issueId, runId } =
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "succeeded",
+        livenessState: "advanced",
+      });
+    await db
+      .update(issues)
+      .set({
+        monitorNextCheckAt: null,
+        executionPolicy: null,
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: {
+            status: "cleared",
+            nextCheckAt: null,
+            lastTriggeredAt: "2026-03-19T00:00:00.000Z",
+            attemptCount: 1,
+            notes: null,
+            scheduledBy: "assignee",
+            kind: null,
+            serviceName: null,
+            externalRef: null,
+            timeoutAt: null,
+            maxAttempts: null,
+            recoveryPolicy: null,
+            clearedAt: "2026-03-19T00:05:00.000Z",
+            clearReason: "invalid_status",
+          },
+        },
+      })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({
+      continuationRequeued: 0,
+      escalated: 1,
+      issueIds: [issueId],
+    });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(1);
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(updatedIssue).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
+    await expectSourceScopedStrandedRecoveryAction({
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      previousStatus: "in_progress",
+      cause: "cleared_monitor_missing_wake_path",
+    });
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("monitor was cleared");
+    expect(comments[0]?.presentation).toMatchObject({
+      kind: "system_notice",
+      title: "Cleared monitor has no wake path",
+    });
+  });
+
+  it("keeps a scheduled in-progress monitor eligible and does not escalate it", async () => {
+    const monitorNextCheckAt = new Date("2026-03-20T00:00:00.000Z");
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+      monitorNextCheckAt,
+      resultJson: {
+        summary: "Waiting for the scheduled monitor.",
+        externalWait: { kind: "issue_monitor", durable: true },
+      },
+    });
+    await db
+      .update(issues)
+      .set({
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [],
+          monitor: {
+            nextCheckAt: monitorNextCheckAt.toISOString(),
+            notes: null,
+            scheduledBy: "assignee",
+            kind: null,
+            serviceName: null,
+            externalRef: null,
+            timeoutAt: null,
+            maxAttempts: null,
+            recoveryPolicy: null,
+          },
+        },
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: {
+            status: "scheduled",
+            nextCheckAt: monitorNextCheckAt.toISOString(),
+            lastTriggeredAt: null,
+            attemptCount: 0,
+            notes: null,
+            scheduledBy: "assignee",
+            kind: null,
+            serviceName: null,
+            externalRef: null,
+            timeoutAt: null,
+            maxAttempts: null,
+            recoveryPolicy: null,
+            clearedAt: null,
+            clearReason: null,
+          },
+        },
+      })
+      .where(eq(issues.id, issueId));
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({
+      continuationRequeued: 0,
+      escalated: 0,
+      skipped: 1,
+    });
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(updatedIssue).toMatchObject({
+      status: "in_progress",
+      companyId,
+      assigneeAgentId: agentId,
+      monitorNextCheckAt,
+    });
+  });
+
+  it("preserves a pending blocker on a cleared in-progress monitor for the owner", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    await db
+      .update(issues)
+      .set({
+        monitorNextCheckAt: null,
+        executionPolicy: null,
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: {
+            status: "cleared",
+            nextCheckAt: null,
+            lastTriggeredAt: "2026-03-19T00:00:00.000Z",
+            attemptCount: 1,
+            notes: null,
+            scheduledBy: "assignee",
+            kind: null,
+            serviceName: null,
+            externalRef: null,
+            timeoutAt: null,
+            maxAttempts: null,
+            recoveryPolicy: null,
+            clearedAt: "2026-03-19T00:05:00.000Z",
+            clearReason: "invalid_status",
+          },
+        },
+      })
+      .where(eq(issues.id, issueId));
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      parentId: issueId,
+      title: "Pending blocker",
+      status: "todo",
+      priority: "medium",
+      assigneeUserId: "external-owner",
+      responsibleUserId: "responsible-user",
+      issueNumber: 2,
+      identifier: "PAP-2",
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({
+      continuationRequeued: 0,
+      escalated: 0,
+      skipped: 1,
+    });
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(updatedIssue).toMatchObject({
+      status: "in_progress",
+      companyId,
+      assigneeAgentId: agentId,
+    });
   });
 
   it("preserves a delegated blocker edge as the durable external-wait path", async () => {
