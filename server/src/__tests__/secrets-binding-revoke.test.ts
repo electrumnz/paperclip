@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import express from "express";
 import request from "supertest";
-import { and, eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -38,6 +38,8 @@ if (!embeddedPostgresSupport.supported) {
 describeEmbeddedPostgres("DELETE /secrets/:secretId/bindings/:bindingId", () => {
   let stopDb: (() => Promise<void>) | null = null;
   let db!: ReturnType<typeof createDb>;
+  let lockDb!: ReturnType<typeof createDb>;
+  let connectionString!: string;
   const previousKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
   const secretsTmpDir = path.join(os.tmpdir(), `paperclip-secret-binding-revoke-${randomUUID()}`);
 
@@ -45,8 +47,10 @@ describeEmbeddedPostgres("DELETE /secrets/:secretId/bindings/:bindingId", () => 
     mkdirSync(secretsTmpDir, { recursive: true });
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsTmpDir, "master.key");
     const started = await startEmbeddedPostgresTestDatabase("secret-binding-revoke");
+    connectionString = started.connectionString;
     stopDb = started.cleanup;
-    db = createDb(started.connectionString);
+    lockDb = createDb(connectionString, { maxConnections: 1, applicationName: "secret-binding-revoke-lock" });
+    db = createDb(connectionString);
   }, 20_000);
 
   afterEach(async () => {
@@ -69,6 +73,26 @@ describeEmbeddedPostgres("DELETE /secrets/:secretId/bindings/:bindingId", () => 
     }
     rmSync(secretsTmpDir, { recursive: true, force: true });
   });
+
+  async function blockedAgentLockCount() {
+    const [row] = await db.execute<{ waiting: number }>(sql`
+      SELECT count(*)::int AS waiting
+      FROM pg_stat_activity
+      WHERE state = 'active'
+        AND wait_event_type = 'Lock'
+        AND query ILIKE '%agents%'
+        AND query ILIKE '%for update%'
+    `);
+    return row?.waiting ?? 0;
+  }
+
+  async function waitForBlockedAgentLocks(minimum: number) {
+    for (let attempt = 0; attempt < 80; attempt += 1) {
+      if (await blockedAgentLockCount() >= minimum) return true;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return false;
+  }
 
   async function seedCompany(name = "Revoke Co") {
     const companyId = randomUUID();
@@ -163,6 +187,21 @@ describeEmbeddedPostgres("DELETE /secrets/:secretId/bindings/:bindingId", () => 
         outcome: "revoked",
       }),
     ]);
+
+    expect(await db.select().from(activityLog)).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        companyId,
+        action: "secret.binding_revoked",
+        entityType: "secret",
+        entityId: secret.id,
+        details: expect.objectContaining({
+          bindingId: binding.id,
+          targetType: "agent",
+          targetId: agent.id,
+          configPath: `env.${envKey}`,
+        }),
+      }),
+    ]));
   });
 
   it("refuses to revoke when the config path no longer holds this binding's secret (stale binding)", async () => {
@@ -201,6 +240,56 @@ describeEmbeddedPostgres("DELETE /secrets/:secretId/bindings/:bindingId", () => 
     expect(
       (reloaded?.adapterConfig as { env?: Record<string, unknown> } | undefined)?.env?.[envKey],
     ).toMatchObject({ secretId: otherSecret.id });
+  });
+
+  it("serializes a competing adapterConfig write with the revoke lock", async () => {
+    const companyId = await seedCompany();
+    const { secret, agent, binding, envKey } = await seedBoundAgent(companyId);
+
+    let signalLocked!: () => void;
+    const locked = new Promise<void>((resolve) => {
+      signalLocked = resolve;
+    });
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const lockHeld = lockDb.transaction(async (tx) => {
+      await tx.execute(sql`SELECT id FROM agents WHERE id = ${agent.id} FOR UPDATE`);
+      signalLocked();
+      await gate;
+    });
+    await locked;
+
+    const current = await agentService(db).getById(agent.id);
+    if (!current) throw new Error("Agent fixture disappeared");
+    const competingUpdate = agentService(db).update(
+      agent.id,
+      { adapterConfig: { unrelatedFlag: true } },
+      { expectedUpdatedAt: current.updatedAt },
+    );
+    expect(await waitForBlockedAgentLocks(1)).toBe(true);
+
+    const revoke = request(createApp([companyId]))
+      .delete(`/api/secrets/${secret.id}/bindings/${binding.id}`);
+    releaseGate();
+    const [updateError, res] = await Promise.all([
+      competingUpdate.then(() => null, (error: unknown) => error),
+      revoke,
+    ]);
+    await lockHeld;
+
+    // The pre-revoke update got the lock first, so the revoke must refuse the
+    // now-stale binding. It must never re-read and apply a secret removal over
+    // the unrelated adapterConfig write.
+    expect(res.status).toBe(409);
+    expect(res.body.code).toBe("secret_binding_stale");
+    expect(updateError).toBeNull();
+    const reloaded = await agentService(db).getById(agent.id);
+    expect(reloaded?.adapterConfig).toMatchObject({ unrelatedFlag: true });
+    expect(
+      (reloaded?.adapterConfig as { env?: Record<string, unknown> } | undefined)?.env?.[envKey],
+    ).toBeUndefined();
   });
 
   it("keeps the binding gone after a later unrelated adapterConfig write (replaceAll re-derivation trap)", async () => {
