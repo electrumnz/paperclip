@@ -444,18 +444,26 @@ export function agentService(db: Db) {
     }));
   }
 
-  async function getByIdWithDb(dbClient: Db, id: string, lock = false) {
+  async function getBaseAgentByIdWithDb(dbClient: Db, id: string, lock = false) {
     const selectQuery = dbClient
       .select()
       .from(agents)
       .where(eq(agents.id, id));
-    const row = await (lock ? selectQuery.for("update") : selectQuery)
+    return (lock ? selectQuery.for("update") : selectQuery)
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function getByIdWithDb(dbClient: Db, id: string) {
+    // The parallel public-shape reads below make ordering observable to
+    // sequence-based database fakes. Keep the agent base row first, then read
+    // the company rows and current-month spend in that stable order.
+    const row = await getBaseAgentByIdWithDb(dbClient, id);
     if (!row) return null;
-    const [companyRows, hydrated] = await Promise.all([
-      dbClient.select().from(agents).where(eq(agents.companyId, row.companyId)),
-      hydrateAgentSpend([row], dbClient).then((rows) => rows[0]!),
-    ]);
+    const companyRows = await dbClient
+      .select()
+      .from(agents)
+      .where(eq(agents.companyId, row.companyId));
+    const hydrated = await hydrateAgentSpend([row], dbClient).then((rows) => rows[0]!);
     return normalizeAgentRow(hydrated, companyRows);
   }
 
@@ -739,7 +747,11 @@ export function agentService(db: Db) {
     options: UpdateAgentOptions | undefined,
     txDb: Db,
   ) {
-    const existing = await getByIdWithDb(txDb, id, true);
+    // Use the base row for the optimistic guard and invariant checks. The
+    // hydrated public shape performs extra company/spend reads, which must not
+    // consume the caller's prepared-select result before the write path has
+    // compared its version and locked the row.
+    const existing = await getBaseAgentByIdWithDb(txDb, id, true);
     if (!existing) return null;
     if (
       options?.expectedUpdatedAt &&
