@@ -387,65 +387,183 @@ function guardVersionOf(text) {
 }
 
 /**
+ * THE RULE, in one place, for every write of the stored guard.
+ *
+ * The question, stated once so it is answered once: on a succeeding --install,
+ * which relations may replace a guard that is already in force?
+ *
+ *   absent          -> write.  Nothing to lose.
+ *   same            -> write.  Byte-identical; the claim is trivially true.
+ *   no-checkout-copy-> write.  There is no other guard to compare against.
+ *   newer           -> write.  A guard that positively declares a higher
+ *                      version is the one to publish, whoever is standing
+ *                      where.
+ *   older           -> WITHHELD.  A positive downgrade claim, refused.
+ *   differs         -> WITHHELD.  Two guards, same version, different bytes:
+ *                      somebody hand-edited one and the installer cannot tell
+ *                      which was intended.
+ *   UNSTAMPED (this
+ *   checkout's guard
+ *   declares nothing) -> WITHHELD, unless --force.
+ *
+ * The last row is the ruling (KEE-966), and it is the one this card is about.
+ * Measured on 6f99a78f0: a fleet guard at version 2 in force, a lane whose
+ * guard carried no version stamp at all, an ordinary succeeding --install:
+ *
+ *   6f99a78f0 UNSTAMPED lane vs stamped v2 fleet : stored 4c5ec6c1 -> b9a83f1b exit=0
+ *     *** FLEET GUARD ROLLED BACK -- the unstamped lane copy took over ***
+ *
+ * The prior code treated "no version" as "unmeasured, therefore not older" and
+ * installed it, loudly, on the strength of --install. That honours the
+ * operator's intent and is exactly the hole: an unstamped copy carries no
+ * ordering information at all, so a lane holding a stale hand-written or
+ * vendored guard can replace a newer stamped one across every worktree in the
+ * repository, and the only warning is a line in the output of the one run that
+ * did it.
+ *
+ * The rule is about CLAIMS, not measurements. A guard that declares a lower
+ * version is a downgrade and is refused. A guard that declares nothing has made
+ * no claim, and no claim is not authority to move the fleet backwards: a
+ * measured guard in force is a stronger position than an unmeasured one
+ * offered in its place, and an unmeasured copy cannot earn the fleet on the
+ * strength of the run asking for it.
+ *
+ * The cost is real and is the reason this needs saying out loud. A legitimate
+ * hand-written or vendored guard can no longer take over on an ordinary run.
+ * That is the intended behaviour change, and the escape hatch is the same one
+ * the rest of this installer uses for a state it cannot read: --force, which
+ * the operator reaches for deliberately, having been told what is in force and
+ * what would replace it.
+ *
+ * --force overrides the withholding for the unstamped case only. It is not an
+ * escape hatch for `older` or `differs`: those guards have been measured
+ * against what is in force and found to be a downgrade or an undecidable
+ * hand-edit, and an override for those would put back the defect this rule
+ * exists to close. An operator in that position reads both files -- the
+ * message says where they are -- and decides.
+ */
+function decideStoredGuardWrite(relation, options = {}) {
+  const { force = false } = options;
+  if (relation === "absent" || relation === "same" || relation === "no-checkout-copy") {
+    return { write: true, reason: relation };
+  }
+  if (relation === "newer") return { write: true, reason: "newer" };
+  // Everything else is a state the installer cannot order, or has ordered and
+  // found wanting: `older` is a measured downgrade, `differs` and `unstamped`
+  // are undecidable. An ordinary --install does not write in any of them.
+  //
+  // --force overrides all three, and that is not a special case bolted on for
+  // one relation: the rest of this installer has always resolved exactly this
+  // way ("refuse, name both states, and say the one command that resolves it"),
+  // and the refusal messages for `older` and `differs` have always ended by
+  // telling the operator to re-run with --force. Scoping the override to one
+  // relation would leave those messages promising a command that does nothing,
+  // which is the false-success shape this file exists to end.
+  //
+  // What --force does NOT do is write quietly. Every override says what it
+  // replaced and what it replaced it with, because the hazard was never the
+  // deliberate run -- it was the ordinary one, exit 0, no warning.
+  if (force) return { write: true, reason: `${relation}-forced` };
+  return { write: false, reason: relation };
+}
+
+/**
  * Put this checkout's guard in force, unless doing so would move the fleet
  * backwards -- and say plainly which of those two happened.
  *
- * The ordering rule is the whole reason this function exists rather than a bare
- * refreshStoredGuard() at each call site. There are two write paths, and the
- * first version of this fix guarded only one of them: KEE-958 was the refusal
- * path, so that is where the no-downgrade check went, and the success path
- * still refreshed unconditionally. Measured on this branch, standing in a lane
- * whose guard was version 1 with version 2 in force, the ordinary --install took
- * the fleet to 1 and printed "guard: refreshed at ...", with no warning at all.
- * The finding was the mirror image of the one it was written to fix, and it was
- * still live.
- *
- * So the rule lives here, once, and both paths go through it: a guard is only
- * written when it is absent, identical, or strictly newer. An older one is left
- * alone and reported, because the shim runs the stored copy and an installer
- * standing in one lane is not entitled to hand the whole repository an older
- * check than the one it already has.
+ * Every write goes through here. There used to be two write paths: this
+ * function, and an inline re-implementation of the same rule on the refusing
+ * path. They disagreed -- on the same state, the succeeding path let a
+ * hand-edited guard take over while the refusing path withheld it -- and a rule
+ * that exists in two places is a rule that will be changed in one of them.
  */
-function guardRefreshOutcome() {
+function guardRefreshOutcome(options = {}) {
   const relation = storedGuardRelation();
-  if (relation === "older") {
-    const storedText = readFileSync(storedGuardPath, "utf8");
-    // A guard with no version stamp is not OLDER, it is unmeasured, and the
-    // two need different answers. Treating "no version" as version 0 made it
-    // impossible for a legitimate hand-written or vendored guard to ever take
-    // over: the permissive stub the stale-copy test installs has no stamp, so
-    // it read as 0 against a stored version 2 and was silently withheld, and
-    // that test failed for a reason that had nothing to do with staleness.
-    //
-    // So the rule is about what is being claimed, not what is measured. A
-    // guard that POSITIVELY declares a version lower than the one in force is
-    // a downgrade and is withheld. A guard with no version has made no claim,
-    // and an operator explicitly installing it is a choice we are allowed to
-    // honour -- loudly, because silence is what this whole card is against.
-    // Only the unmeasured checkout copy takes this path; an unmeasured guard
-    // that is already in force is simply the status quo and needs no special
-    // case, because nothing is being asked to replace it.
-    if (guardVersionOf(readFileSync(guardPath, "utf8")) === 0) {
-      process.stdout.write(
-        `worktree isolation guard: refreshed at ${storedGuardPath}\n` +
-          `  This checkout's guard carries no version stamp, so it cannot be measured against the\n` +
-          `  copy in force. Installing it because --install was asked for it, and saying so\n` +
-          `  rather than deciding silently: a stamped guard lets this installer refuse a genuine\n` +
-          `  downgrade, an unstamped one cannot.\n`,
-      );
-      refreshStoredGuard();
-      return;
-    }
+  const decision = decideStoredGuardWrite(relation, options);
+  if (!decision.write) return reportGuardWithheld(relation, decision);
+  // Read the version that is in force BEFORE the write, because after the write
+  // this path reports the guard that is now in place and the message would name
+  // the unstamped copy's own zero as the version it replaced. Read it only when
+  // there is a stored guard to read: on a fresh install there is none, and
+  // readFileSync on a missing path throws.
+  const guardVersionInForce = existsSync(storedGuardPath)
+    ? guardVersionOf(readFileSync(storedGuardPath, "utf8"))
+    : 0;
+  refreshStoredGuard();
+  if (decision.reason.endsWith("-forced")) {
     process.stdout.write(
-      `worktree isolation guard: NOT replaced. This checkout's guard is version ` +
-        `${guardVersionOf(readFileSync(guardPath, "utf8"))} and version ` +
-        `${guardVersionOf(storedText)} is already in force, so the fleet is not being moved\n` +
-        `backwards. The copy the shim runs is unchanged: ${storedGuardPath}\n`,
+      `worktree isolation guard: refreshed at ${storedGuardPath}\n` +
+        `  --force: this checkout's guard ${describeRelation(relation)} the one that was in force\n` +
+        `  (version ${guardVersionInForce}), so this run is publishing it anyway. Every commit in this\n` +
+        `  repository now runs this checkout's copy, not the one it replaced. --force is the\n` +
+        `  deliberate override; what it must never be is the way a downgrade happens quietly.\n`,
     );
     return;
   }
-  refreshStoredGuard();
   process.stdout.write(`worktree isolation guard: refreshed at ${storedGuardPath}\n`);
+}
+
+/**
+ * How a relation reads inside a sentence meant for a person.
+ *
+ * These strings are operator-facing, so "differs" does not appear in one. A
+ * guard that declares no version and a guard that was hand-edited are both
+ * things an operator needs named plainly, because the action each one calls
+ * for is different.
+ */
+function describeRelation(relation) {
+  if (relation === "older") return "is an OLDER revision of";
+  if (relation === "differs") return "carries different content from";
+  if (relation === "unstamped") return "carries no version stamp, so cannot be ordered against";
+  return `is in the ${relation} state relative to`;
+}
+
+/**
+ * Explain a write that was not performed.
+ *
+ * Silence is the defect this whole card is against, so every withheld case
+ * names both files and says which one the shim runs. The operator can only
+ * act on a state they were told about.
+ */
+function reportGuardWithheld(relation, decision) {
+  const storedText = readFileSync(storedGuardPath, "utf8");
+  const checkoutText = readFileSync(guardPath, "utf8");
+  const storedVersion = guardVersionOf(storedText);
+  const checkoutVersion = guardVersionOf(checkoutText);
+
+  if (decision.reason === "unstamped") {
+    process.stdout.write(
+      `worktree isolation guard: NOT replaced. This checkout's guard carries no version stamp,\n` +
+        `so it cannot be ordered against the copy in force (version ${storedVersion}). A guard that\n` +
+        `makes no claim is not a claim that the fleet should move onto it, and an unmeasured copy\n` +
+        `in one lane is not authority for every lane, so the stored copy is left alone:\n` +
+        `  ${storedGuardPath}\n` +
+        `That is the one the shim runs. If this checkout's guard is the one you want in force --\n` +
+        `because it is newer and simply was never stamped, or because you wrote it yourself --\n` +
+        `then stamp it and re-run, or install it deliberately:\n` +
+        `  node scripts/install-worktree-isolation-hook.mjs --install --force\n`,
+    );
+    return;
+  }
+
+  if (decision.reason === "differs") {
+    process.stdout.write(
+      `worktree isolation guard: NOT replaced. This checkout's guard and the one in force are both\n` +
+        `at version ${storedVersion} but differ in content, so one of them was hand-edited and the\n` +
+        `installer cannot tell which was intended. Refusing to guess between them. The stored copy\n` +
+        `is the one in force:\n` +
+        `  ${storedGuardPath}\n` +
+        `Read both, then either delete the stored copy to take this checkout's, or leave it.\n`,
+    );
+    return;
+  }
+
+  process.stdout.write(
+    `worktree isolation guard: NOT replaced. This checkout's guard is version ${checkoutVersion} and\n` +
+      `version ${storedVersion} is already in force, so the fleet is not being moved backwards. The\n` +
+      `copy the shim runs is unchanged: ${storedGuardPath}\n` +
+      `To install this checkout's guard anyway, having read both, use --force.\n`,
+  );
 }
 
 /**
@@ -455,6 +573,16 @@ function guardRefreshOutcome() {
  * safe. "same" and "differs" are what the installer could see before, and acting
  * on "differs" without being able to order it is exactly what turned a refresh
  * into a downgrade on the refusal path.
+ *
+ * "unstamped" is separate from "older" on purpose, and this is the only place
+ * that can tell them apart. guardVersionOf() reads a guard with no version
+ * stamp as 0, so a checkout guard that declares nothing and a checkout guard
+ * that positively declares a lower version both come out of a bare comparison
+ * as "older". They are the same NUMBER and they are not the same STATE: one
+ * made a claim the fleet can read, the other made no claim at all, and they
+ * have different correct answers. Collapsing them here is what let an
+ * unmeasured copy displace a measured one while the code believed it was
+ * refusing a downgrade (KEE-966).
  */
 function storedGuardRelation() {
   if (!existsSync(storedGuardPath)) return "absent";
@@ -465,6 +593,11 @@ function storedGuardRelation() {
   const storedVersion = guardVersionOf(stored);
   const checkoutVersion = guardVersionOf(checkout);
   if (checkoutVersion > storedVersion) return "newer";
+  // Checked BEFORE the numeric comparison, and not folded into it. A stored
+  // guard with no stamp is never "older" than anything either -- it is in
+  // force, unmeasured, and nothing is being asked about it, because a
+  // comparison that cannot be decided leaves the status quo alone.
+  if (checkoutVersion === 0) return "unstamped";
   if (checkoutVersion < storedVersion) return "older";
   return "differs";
 }
@@ -777,12 +910,35 @@ if (installed) {
         // withholding left is the genuinely unorderable case -- two guards at the
         // same version with different content, which means someone hand-edited
         // one and the installer cannot pretend to know which is intended.
+        // The guard is not the ambiguous object, but "not ambiguous" is not the
+        // same as "safe to overwrite". The decision is NOT re-made here: it is
+        // asked of decideStoredGuardWrite(), the same function the succeeding
+        // path uses, so there is one answer per state instead of two.
+        //
+        // This branch used to carry its own copy of the rule --
+        // `refreshed = relation === "absent" || "same" || "newer"` -- with no
+        // unstamped case at all, so the same repository state produced a
+        // different answer depending on whether the shim happened to be
+        // recognisable. Measured on 6f99a78f0, with the rule as it stood:
+        //
+        //   state (stored / checkout)  succeeding path   refusing path
+        //   v2 / v1                   withheld          withheld
+        //   v2 / v3                   takes over        takes over
+        //   v2 / v2 edited            CHECKOUT WINS     stored kept
+        //   v2 / unstamped            LANE COPY WINS    withheld
+        //
+        // The bottom two rows are the two states where the paths disagreed,
+        // and both are now the answer the refusing path already gave.
         const relation = storedGuardRelation();
-        const refreshed = relation === "absent" || relation === "same" || relation === "newer";
-        if (refreshed) refreshStoredGuard();
-        const guardNote = refreshed
-          ? `The stored guard has been refreshed, so commits in this repository are running the\n` +
-            `guard from this checkout. Only the shim above is unresolved.\n`
+        const decision = decideStoredGuardWrite(relation, { force });
+        if (decision.write) refreshStoredGuard();
+        const guardNote = decision.write
+          ? decision.reason.endsWith("-forced")
+            ? `The stored guard has been refreshed from this checkout, which ${describeRelation(relation)}\n` +
+              `the one that was in force. --force asked for it and every commit in this repository\n` +
+              `now runs this checkout's copy. Only the shim above is unresolved.\n`
+            : `The stored guard has been refreshed, so commits in this repository are running the\n` +
+              `guard from this checkout. Only the shim above is unresolved.\n`
           : relation === "older"
             ? `The stored guard has NOT been changed. This checkout's guard is OLDER than the one in\n` +
               `force (version ${guardVersionOf(readFileSync(storedGuardPath, "utf8"))} in force, ` +
@@ -792,12 +948,21 @@ if (installed) {
               `  ${storedGuardPath}\n` +
               `is the newer one and is the one the shim runs. To replace it with this checkout's\n` +
               `anyway, run this again with --force, after reading the shim above.\n`
-            : `The stored guard has NOT been changed. This checkout's guard and the one in force are both\n` +
-              `at version ${guardVersionOf(readFileSync(storedGuardPath, "utf8"))} but differ in content, so\n` +
-              `one of them was hand-edited and the installer cannot tell which is intended. Refusing to\n` +
-              `guess between them. The stored copy is the one in force:\n` +
-              `  ${storedGuardPath}\n` +
-              `Read both, then either delete the stored copy to take this checkout's, or leave it.\n`;
+            : relation === "unstamped"
+              ? `The stored guard has NOT been changed. This checkout's guard carries no version stamp,\n` +
+                `so it cannot be ordered against the one in force (version ` +
+                `${guardVersionOf(readFileSync(storedGuardPath, "utf8"))}). An unmeasured copy is not a\n` +
+                `reason to move the whole fleet onto it, and the succeeding path now withholds here too.\n` +
+                `The stored copy is the one in force:\n` +
+                `  ${storedGuardPath}\n` +
+                `If this checkout's guard is the one you want, stamp it, or install it deliberately\n` +
+                `with --force.\n`
+              : `The stored guard has NOT been changed. This checkout's guard and the one in force are both\n` +
+                `at version ${guardVersionOf(readFileSync(storedGuardPath, "utf8"))} but differ in content, so\n` +
+                `one of them was hand-edited and the installer cannot tell which is intended. Refusing to\n` +
+                `guess between them. The stored copy is the one in force:\n` +
+                `  ${storedGuardPath}\n` +
+                `Read both, then either delete the stored copy to take this checkout's, or leave it.\n`;
         process.stderr.write(
           `install-worktree-isolation-hook: ${hookPath} carries this script's marker and looks like\n` +
             `one of ours, but it is not the revision this script would write, and it cannot be told\n` +
@@ -828,7 +993,7 @@ if (installed) {
     );
     process.exit(1);
   }
-  guardRefreshOutcome();
+  guardRefreshOutcome({ force });
   process.exit(0);
 }
 

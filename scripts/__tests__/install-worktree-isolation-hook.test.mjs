@@ -99,6 +99,39 @@ test.after(() => {
   // Nothing global to clean; each test removes its own fleet.
 });
 
+/**
+ * A guard that is genuinely NEWER, not merely different.
+ *
+ * The version lives on one comment line inside the guard's header block, so a
+ * fixture that wants a newer guard has to say so there. Appending a marker
+ * comment and leaving the version alone does NOT produce a newer guard: it
+ * produces two guards at the same version with different bytes, which is the
+ * hand-edit state, and the installer correctly refuses to choose between those.
+ *
+ * Several tests here used to express "newer" the other way, and passed only
+ * because the succeeding path took the checkout's copy unconditionally. Now
+ * that the rule is the same on both paths, they have to state what they mean.
+ * This helper is that statement.
+ */
+function stampGuardVersion(guardText, version) {
+  return guardText.replace(
+    /^([ \t]*(?:\*[ \t]*)?#?[ \t]*worktree-isolation-guard-version:[ \t]*)\d+/m,
+    `$1${version}`,
+  );
+}
+
+/**
+ * The version a guard claims, read the way the installer reads it.
+ *
+ * Deliberately a re-implementation rather than a copy of the installer's own
+ * expression: a test that imported the regex under test would agree with a
+ * broken regex, and these tests exist to catch that.
+ */
+function versionIn(guardText) {
+  const match = /^[ \t]*(?:\*[ \t]*)?#?[ \t]*worktree-isolation-guard-version:[ \t]*(\d+)[ \t]*$/m.exec(guardText);
+  return match ? Number.parseInt(match[1], 10) : 0;
+}
+
 test("install, check, idempotent re-install, uninstall, check", () => {
   const { root, main } = makeFleet();
   try {
@@ -220,6 +253,7 @@ test("the installed hook allows a real commit in the seat's own lane", () => {
 test("the guard in force is the checkout's, not a stale copy from install time", () => {
   const { root, main } = makeFleet();
   try {
+    const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
     assert.equal(installHook(main, ["--install"]).status, 0);
 
     const worktrees = path.join(root, "keece-issue-worktrees");
@@ -232,9 +266,24 @@ test("the guard in force is the checkout's, not a stale copy from install time",
 
     // A permissive guard is installed, and a permissive guard lets this commit
     // through. Without this control step the test below cannot fail.
+    //
+    // --force is required here and is itself part of what this test records. The
+    // permissive stub carries no version stamp, so under the KEE-966 ruling an
+    // ordinary --install will NOT let it displace the stamped guard already in
+    // force. It used to: this step used to be a plain --install, which is
+    // precisely the hole the ruling closes -- an unmeasured copy taking over a
+    // measured one on an ordinary run. To construct a fleet that genuinely runs
+    // a permissive guard, the operator has to say --force, and now the test has
+    // to as well.
     const permissive = `process.stdout.write("check-worktree-isolation: ok, permissive\\n");\nprocess.exit(0);\n`;
     writeFileSync(path.join(main, "scripts", "check-worktree-isolation.mjs"), permissive);
-    assert.equal(installHook(main, ["--install"]).status, 0);
+    const forcedPermissive = installHook(main, ["--install", "--force"]);
+    assert.equal(forcedPermissive.status, 0, forcedPermissive.stdout + forcedPermissive.stderr);
+    assert.equal(
+      readFileSync(stored, "utf8"),
+      permissive,
+      "control is wrong: --force did not install the permissive guard, so the commit below proves nothing",
+    );
     writeFileSync(path.join(shared, "d.txt"), "d\n");
     git(["add", "d.txt"], shared);
     const permissiveCommit = spawnSync("git", ["commit", "-q", "-m", "permissive"], {
@@ -247,8 +296,27 @@ test("the guard in force is the checkout's, not a stale copy from install time",
     // Now install the real guard. The shared lane must immediately be governed
     // by it. A shim that only ever ran the copy it had at install time would
     // still be running the permissive one, and this commit would land.
+    //
+    // This is the DIRECTION the ruling protects, and it is worth being precise
+    // about, because the ruling's name is "unstamped". Here the STORED copy is
+    // the unstamped one and the CHECKOUT copy is stamped, so this is a normal
+    // install and the stamped guard is written: a measured guard positively
+    // outranks an unmeasured one. The withheld case is the mirror image, where
+    // an unstamped CHECKOUT copy is trying to displace a stamped stored guard.
+    // Both are covered, in this file, in both directions.
     copyFileSync(guardSource, path.join(main, "scripts", "check-worktree-isolation.mjs"));
-    assert.equal(installHook(main, ["--install"]).status, 0);
+    const tighten = installHook(main, ["--install"]);
+    assert.equal(tighten.status, 0, tighten.stdout);
+    assert.equal(
+      readFileSync(stored, "utf8"),
+      readFileSync(guardSource, "utf8"),
+      "a stamped guard could not displace an unmeasured permissive one",
+    );
+    assert.match(
+      tighten.stdout,
+      /guard: refreshed/,
+      "the tightening install did not say it refreshed the guard",
+    );
     writeFileSync(path.join(shared, "e.txt"), "e\n");
     git(["add", "e.txt"], shared);
     const afterTighten = spawnSync("git", ["commit", "-q", "-m", "after-tighten"], {
@@ -322,7 +390,15 @@ test("the stored guard is refreshed when the installer runs again", () => {
 
     // A guard update in the checkout must reach the stored copy, or every lane
     // whose HEAD lacks the guard keeps running a stale version forever.
-    const updated = `${original}\n// guard update marker\n`;
+    //
+    // This fixture has to state a REAL version bump, not just append a comment.
+    // It used to append `// guard update marker` and leave the version alone,
+    // which is two guards at the same version with different bytes -- the
+    // hand-edit state, not a newer guard. The succeeding path took it anyway,
+    // so the test passed while asserting something untrue about the installer.
+    // The marker is kept, because a real guard update does change the body; the
+    // stamp is what makes the claim true.
+    const updated = stampGuardVersion(`${original}\n// guard update marker\n`, versionIn(original) + 1);
     writeFileSync(path.join(main, "scripts", "check-worktree-isolation.mjs"), updated);
     const again = installHook(main, ["--install"]);
     assert.equal(again.status, 0, again.stdout);
@@ -1047,8 +1123,14 @@ test("--check names which guard is in force when the stored copy has drifted", (
     assert.equal(agreed.status, 0, `control: a fleet in step is reported broken: ${agreed.stderr}`);
 
     // Update the guard in the checkout only -- exactly what a `git pull` of a
-    // lane that carries the guard does, with no re-install anywhere.
-    const updated = `${readFileSync(stored, "utf8")}\n// guard update marker\n`;
+    // lane that carries the guard does, with no re-install anywhere. Stamped as
+    // a real version bump: an appended comment alone leaves the version where it
+    // was, which is the hand-edit state and is NOT something a re-install is
+    // expected to resolve.
+    const updated = stampGuardVersion(
+      `${readFileSync(stored, "utf8")}\n// guard update marker\n`,
+      versionIn(readFileSync(stored, "utf8")) + 1,
+    );
     writeFileSync(path.join(main, "scripts", "check-worktree-isolation.mjs"), updated);
 
     const drifted = installHook(main, ["--check"]);
@@ -1186,5 +1268,437 @@ test("--check and --install agree on a whitespace-only edit inside the shim's bl
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// KEE-966: one write path, and the ruling on an unmeasured guard.
+//
+// Everything below is about the moment a write happens. Before this, the
+// installer had two answers to one question: guardRefreshOutcome() on the
+// succeeding path, and an inline copy of the rule on the refusing path. They
+// disagreed in two states, and both disagreements were the wrong way -- the
+// succeeding path wrote where it should have withheld.
+//
+// Measured on 6f99a78f0, same state, two answers:
+//
+//   state (stored / checkout)   succeeding path    refusing path
+//   v2 / v1                     withheld           withheld
+//   v2 / v3                     takes over         takes over
+//   v2 / v2 edited              CHECKOUT WINS      stored kept
+//   v2 / unstamped              LANE COPY WINS     withheld
+//
+// The two bottom rows are what this file closes. A rule that exists in two
+// places is a rule that will be changed in one of them.
+// ---------------------------------------------------------------------------
+
+/**
+ * A guard with the stamp line removed entirely.
+ *
+ * Not "a comment appended": no version line at all, which is what a
+ * hand-written or vendored guard looks like, and what 3 of the 4 guard files on
+ * this host actually are. This is the shape the ruling is about.
+ */
+function unstampGuard(guardText) {
+  return guardText.replace(/^[ \t]*(?:\*[ \t]*)?#?[ \t]*worktree-isolation-guard-version:[ \t]*\d+[ \t]*\n/m, "");
+}
+
+/**
+ * The stale shim, which forces --install onto the refusing path.
+ *
+ * The shim is a real object here, not a mock: the refusal branch is only
+ * reached when the hook carries our marker and is not the revision this script
+ * would write, and the honest way to produce that is to install, then remove a
+ * line this script always emits.
+ */
+function makeShimStale(main) {
+  const hookPath = path.join(main, ".git", "hooks", "pre-commit");
+  const stale = readFileSync(hookPath, "utf8").replace(
+    "# Runs on every commit in every linked worktree of this repository.\n",
+    "",
+  );
+  writeFileSync(hookPath, stale, { mode: 0o755 });
+  return stale;
+}
+
+test("an unstamped lane guard does not displace a stamped fleet guard on a succeeding --install", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
+    const guardInCheckout = path.join(main, "scripts", "check-worktree-isolation.mjs");
+
+    const storedBefore = readFileSync(stored, "utf8");
+    // Read the version rather than assuming 2. This commit raises the guard's
+    // own stamp to 3, and a test that hard-coded the old number would fail for
+    // a reason that has nothing to do with what it is checking.
+    const fleetVersion = versionIn(storedBefore);
+    assert.ok(fleetVersion > 0, "fixture is wrong: the fleet guard carries no version stamp");
+
+    // This checkout's guard now declares nothing: the hand-written or vendored
+    // shape, and the shape of the 3 unstamped lane guards on this host.
+    const unstamped = unstampGuard(storedBefore);
+    assert.equal(versionIn(unstamped), 0, "fixture is wrong: the lane guard is still stamped");
+    writeFileSync(guardInCheckout, unstamped);
+
+    const run = installHook(main, ["--install"]);
+    assert.equal(run.status, 0, run.stdout + run.stderr);
+
+    // The assertion this test exists for. Measured on 6f99a78f0 as
+    // "stored 4c5ec6c1 -> b9a83f1b exit=0, FLEET GUARD ROLLED BACK".
+    assert.equal(
+      readFileSync(stored, "utf8"),
+      storedBefore,
+      "an unstamped lane guard displaced a stamped fleet-wide guard on an ordinary --install",
+    );
+
+    // And it must say so, loudly, naming what is in force and how to override.
+    // Silence is the defect; a refusal nobody can act on is the same defect.
+    assert.match(run.stdout, /NOT replaced/, "the withholding was not reported");
+    assert.match(run.stdout, /no version stamp/, "the report does not say why it withheld");
+    assert.match(
+      run.stdout,
+      new RegExp(`version ${fleetVersion}`),
+      "the report does not say what version is in force",
+    );
+    assert.match(run.stdout, /--force/, "the report does not name the command that overrides this");
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("an unstamped lane guard does not displace a stamped fleet guard on the REFUSING path either", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
+    const guardInCheckout = path.join(main, "scripts", "check-worktree-isolation.mjs");
+
+    const storedBefore = readFileSync(stored, "utf8");
+    const staleShim = makeShimStale(main);
+    writeFileSync(guardInCheckout, unstampGuard(storedBefore));
+
+    const refused = installHook(main, ["--install"]);
+    assert.equal(refused.status, 1, "control: the stale shim should still be refused");
+    assert.equal(readFileSync(path.join(main, ".git", "hooks", "pre-commit"), "utf8"), staleShim);
+    assert.equal(
+      readFileSync(stored, "utf8"),
+      storedBefore,
+      "the refusing path let an unstamped copy replace the stamped fleet guard",
+    );
+    assert.match(refused.stderr, /stored guard has NOT been changed/);
+    assert.match(refused.stderr, /no version stamp/, "the refusal does not say it withheld for this reason");
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("the two write paths agree, state for state", () => {
+  // The property the card is actually about: ONE answer per state, not one
+  // per code path. Each state is driven twice, once down the succeeding path
+  // and once down the refusing path, and the stored guard must end up the same
+  // bytes both times.
+  const { root, main } = makeFleet();
+  try {
+    const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
+    const guardInCheckout = path.join(main, "scripts", "check-worktree-isolation.mjs");
+    assert.equal(installHook(main, ["--install"]).status, 0);
+    const fleet = readFileSync(stored, "utf8");
+    const fleetVersion = versionIn(fleet);
+
+    // A guard one version behind, and one ahead, expressed honestly.
+    const states = {
+      older: stampGuardVersion(fleet, fleetVersion - 1),
+      newer: stampGuardVersion(`${fleet}\n// a later revision\n`, fleetVersion + 1),
+      unstamped: unstampGuard(fleet),
+      differs: `${fleet}\n// somebody hand-edited this copy\n`,
+    };
+
+    for (const [name, guardText] of Object.entries(states)) {
+      for (const refusing of [false, true]) {
+        // Reset the fleet state DIRECTLY, not by running the installer.
+        //
+        // Two earlier versions of this reset used a plain --install after
+        // deleting the hook, and both were wrong in the same way: a --install
+        // cannot restore the fleet guard, it can only move it forward. Once the
+        // `newer` succeeding pass has published v3, the next reset installs v3
+        // again (it is newer than v2, correctly) and the assertion fires on the
+        // test's own bookkeeping rather than on installer behaviour. Writing the
+        // known-good state is what "reset" has to mean for a fixture whose whole
+        // subject is a rule about which copy wins.
+        rmSync(path.join(main, ".git", "hooks", "pre-commit"), { force: true });
+        writeFileSync(guardInCheckout, fleet);
+        writeFileSync(stored, fleet, { mode: 0o755 });
+        const before = readFileSync(stored, "utf8");
+        assert.equal(before, fleet, `fixture is wrong for ${name}: the fleet guard moved`);
+        if (refusing) {
+          // The hook has to EXIST before it can be made stale, and the only
+          // honest way to get a real one is to install it -- so install it with
+          // the checkout's guard in step, then age the shim.
+          assert.equal(
+            installHook(main, ["--install"]).status,
+            0,
+            `fixture is wrong for ${name}: could not install a shim to make stale`,
+          );
+          assert.equal(
+            readFileSync(stored, "utf8"),
+            fleet,
+            `fixture is wrong for ${name}: installing a matching shim moved the guard`,
+          );
+          makeShimStale(main);
+        }
+
+        writeFileSync(guardInCheckout, guardText);
+        const run = installHook(main, ["--install"]);
+        assert.ok(run.status === 0 || run.status === 1, `unexpected status for ${name}`);
+        const after = readFileSync(stored, "utf8");
+        const label = `${name} / ${refusing ? "refusing" : "succeeding"}`;
+
+        if (name === "newer") {
+          assert.equal(after, guardText, `${label}: a genuinely newer guard must take over`);
+        } else {
+          assert.equal(after, before, `${label}: the stored guard must be left alone`);
+        }
+      }
+    }
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("--force installs an unstamped guard, and says what it displaced", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
+    const guardInCheckout = path.join(main, "scripts", "check-worktree-isolation.mjs");
+    const stamped = readFileSync(stored, "utf8");
+    const fleetVersion = versionIn(stamped);
+
+    const unstamped = unstampGuard(stamped);
+    writeFileSync(guardInCheckout, unstamped);
+
+    // This is the behaviour change the ruling makes, and the cost of it: a
+    // hand-written guard can still take over, but only deliberately, and the
+    // run says so instead of replacing a fleet guard on an ordinary --install.
+    const forced = installHook(main, ["--install", "--force"]);
+    assert.equal(forced.status, 0, forced.stdout + forced.stderr);
+    assert.equal(readFileSync(stored, "utf8"), unstamped, "--force did not install the unstamped guard");
+    assert.match(forced.stdout, /refreshed/, "--force did not report the refresh");
+    assert.match(forced.stdout, /--force/, "a forced guard replacement was not identified as one");
+    assert.match(
+      forced.stdout,
+      new RegExp(`version ${fleetVersion}`),
+      "the forced run does not say what it displaced",
+    );
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("a REFUSED --force cannot quietly downgrade the fleet guard", () => {
+  // --force is the override, and the override has to be visible. This is the
+  // pair the ruling is really about: the same state, the same answer, and the
+  // forced run is the only one that writes -- but it writes saying so.
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
+    const guardInCheckout = path.join(main, "scripts", "check-worktree-isolation.mjs");
+    const fleet = readFileSync(stored, "utf8");
+
+    const older = stampGuardVersion(fleet, versionIn(fleet) - 1);
+    writeFileSync(guardInCheckout, older);
+
+    const ordinary = installHook(main, ["--install"]);
+    assert.equal(ordinary.status, 0, ordinary.stdout + ordinary.stderr);
+    assert.equal(readFileSync(stored, "utf8"), fleet, "an ordinary --install downgraded the fleet guard");
+    assert.match(ordinary.stdout, /NOT replaced/);
+    assert.doesNotMatch(ordinary.stdout, /--force: this checkout's guard/, "an ordinary run claimed to be forced");
+
+    const forced = installHook(main, ["--install", "--force"]);
+    assert.equal(forced.status, 0, forced.stdout + forced.stderr);
+    assert.equal(readFileSync(stored, "utf8"), older, "--force did not take the deliberate downgrade");
+    assert.match(
+      forced.stdout,
+      /--force: this checkout's guard is an OLDER revision/,
+      "a forced downgrade was not reported as one",
+    );
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+// The KEE-958 REVERT test, kept (KEE-966 item 3).
+//
+// It is the only test in the project that catches a stamp-based revert
+// regression, and it was carried on the `kee-958-refusal-guard-downgrade` line
+// (0727e4dde) where it orders guards by git ANCESTRY rather than by a version
+// stamp. It passed against 6f99a78f0 unported, which is a fact about the two
+// mechanisms and not about this suite: a revert lane and a stale lane are
+// indistinguishable under a stamp, because both are simply "not newer".
+//
+// So it is reproduced here against the stamp mechanism, with the ancestry
+// fixture assertions kept -- they are what proves the shape is a REVERT and not
+// just a lane that happens to be behind. If the shape stops being a revert, the
+// fixture fails before the assertion under test is reached, which is the point.
+function isAncestorExit(ancestor, descendant, cwd) {
+  return spawnSync("git", ["merge-base", "--is-ancestor", ancestor, descendant], { cwd, encoding: "utf8" }).status;
+}
+
+test("a refusing --install from a REVERTED guard lane does not roll the stored guard back", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
+    const checkoutGuard = path.join(main, "scripts", "check-worktree-isolation.mjs");
+    const current = readFileSync(checkoutGuard, "utf8");
+    // An "older revision" in stamp terms: a LOWER version, honestly declared.
+    // Expressing it as an appended comment would make it `differs`, and the
+    // test would then be measuring the hand-edit rule instead of the revert one.
+    const older = stampGuardVersion(`${current}\n// an older revision of the guard\n`, versionIn(current) - 1);
+
+    // c1: the OLD guard, committed.
+    writeFileSync(checkoutGuard, older);
+    git(["add", "-A"], main);
+    git(["commit", "-q", "-m", "guard: older revision"], main);
+
+    // c2: the NEW guard, committed. This is where the fleet is parked.
+    writeFileSync(checkoutGuard, current);
+    git(["add", "-A"], main);
+    git(["commit", "-q", "-m", "guard: current revision"], main);
+    assert.equal(installHook(main, ["--install"]).status, 0);
+    const storedBefore = readFileSync(stored, "utf8");
+    assert.equal(storedBefore, current, "fixture is wrong: the stored guard is not the current one");
+
+    // c3: revert the guard to the OLD bytes. Same content as c1, but its newest
+    // carrier is now a DESCENDANT of c2's -- which is the whole point.
+    writeFileSync(checkoutGuard, older);
+    git(["add", "-A"], main);
+    git(["commit", "-q", "-m", "Revert the guard to the older revision"], main);
+
+    // Prove the fixture really is the shape it claims, so a green run cannot be
+    // a fixture that never built the revert.
+    const carriers = git(["log", "--all", "--format=%H", "--", "scripts/check-worktree-isolation.mjs"], main)
+      .split("\n")
+      .filter(Boolean);
+    const revert = git(["rev-parse", "HEAD"], main).trim();
+    assert.equal(carriers[0], revert, "fixture is wrong: the revert is not the newest carrier of the old content");
+    const newCarrier = carriers.find((r) => r !== revert);
+    assert.ok(newCarrier, "fixture is wrong: the current content has no carrier");
+    assert.equal(
+      isAncestorExit(newCarrier, revert, main),
+      0,
+      "fixture is wrong: the revert is not a descendant of the new-content commit",
+    );
+
+    // The stale shim, so --install takes the refusing branch.
+    const staleShim = makeShimStale(main);
+
+    const refused = installHook(main, ["--install"]);
+    assert.equal(refused.status, 1, "control: the shim should still be refused");
+    assert.equal(readFileSync(path.join(main, ".git", "hooks", "pre-commit"), "utf8"), staleShim);
+
+    // The assertion this test exists for: a revert lane must not outrank the
+    // stored guard just because the revert commit is the newer one.
+    assert.equal(
+      readFileSync(stored, "utf8"),
+      storedBefore,
+      "a refusing --install from a REVERTED guard lane DOWNGRADED the stored guard",
+    );
+
+    // And the message must not claim a refresh it did not perform.
+    assert.doesNotMatch(
+      refused.stderr,
+      /stored guard has been refreshed/,
+      "the refusal claims a refresh that did not happen",
+    );
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+// The `shim` succeeding path: an outdated shim that IS recognisably ours is
+// replaced, and the run exits 0.
+//
+// KEE-966 names this as unexercised on every branch to date, and it is the
+// branch where the fix in this commit is easiest to get wrong. The
+// guardRefreshOutcome() call sits AFTER the shim write, so a shim replacement
+// and a guard write happen in the same run on different code paths -- and the
+// guard half of that run is exactly the one that was unguarded. This test
+// covers the combination rather than either half.
+//
+// A correction to the shape this test was first written in, made because the
+// code said so: there is no unforced path to "outdated shim replaced". Any shim
+// carrying our marker whose body is not the revision we would write goes to the
+// REFUSING branch, and only --force reaches the replacement. That is the
+// deliberate KEE-954 design ("refuse, name both states, say the one command
+// that resolves it") and the existing suite already pins it. The card's note
+// that this path is unexercised is therefore about the forced form, which is
+// what is exercised here.
+//
+// The reason it is worth exercising at all: --force is also the escape hatch
+// for the guard rule added in this commit, so one --force run now reaches BOTH
+// overrides. The guard half must not be silently skipped because the shim half
+// succeeded, and the shim half must not be reported as a refusal because the
+// guard half withheld.
+test("--force replaces an outdated shim of ours, exit 0, and still applies the guard rule", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const hookPath = path.join(main, ".git", "hooks", "pre-commit");
+    const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
+    const guardInCheckout = path.join(main, "scripts", "check-worktree-isolation.mjs");
+    const fleet = readFileSync(stored, "utf8");
+    const currentShim = readFileSync(hookPath, "utf8");
+
+    // A recognisably ours, genuinely outdated shim: an older revision of the
+    // block, produced the way the existing suite produces one, by replacing the
+    // stored-guard branch with the toplevel-only branch an earlier revision
+    // emitted.
+    const elsewhere = path.join(root, "stored-elsewhere.mjs").split(path.sep).join("/");
+    const outdated = currentShim.replace(
+      storedGuardBranch(),
+      `  TOPLEVEL=$(git rev-parse --show-toplevel 2>/dev/null) || TOPLEVEL=""\n` +
+        `  if [ -n "$TOPLEVEL" ] && [ -f "$TOPLEVEL/scripts/check-worktree-isolation.mjs" ]; then\n` +
+        `    GUARD="$TOPLEVEL/scripts/check-worktree-isolation.mjs"\n` +
+        `  elif [ -f "${elsewhere}" ]; then\n` +
+        `    GUARD="${elsewhere}"\n` +
+        `  fi\n`,
+    );
+    assert.notEqual(outdated, currentShim, "fixture is wrong: could not make an older shim");
+    writeFileSync(hookPath, outdated, { mode: 0o755 });
+
+    // Control: --force replaces the shim, and the guard is untouched because
+    // this checkout's guard still matches what is in force.
+    const replaced = installHook(main, ["--install", "--force"]);
+    assert.equal(replaced.status, 0, replaced.stdout + replaced.stderr);
+    assert.match(replaced.stdout, /outdated shim replaced/, "the outdated shim was not replaced");
+    assert.equal(
+      readFileSync(hookPath, "utf8").trimEnd(),
+      currentShim.trimEnd(),
+      "--force did not install the current shim",
+    );
+    assert.equal(readFileSync(stored, "utf8"), fleet, "a clean shim replacement moved the guard");
+
+    // The half that was unguarded: the same --force run, with this checkout's
+    // guard unstamped. --force legitimately takes the unstamped copy, and it
+    // must SAY that it did -- this is the one path where the guard is replaced
+    // on a run that also replaced the shim.
+    writeFileSync(hookPath, outdated, { mode: 0o755 });
+    const unstamped = unstampGuard(fleet);
+    writeFileSync(guardInCheckout, unstamped);
+
+    const both = installHook(main, ["--install", "--force"]);
+    assert.equal(both.status, 0, both.stdout + both.stderr);
+    assert.match(both.stdout, /outdated shim replaced/, "the shim half stopped working");
+    assert.equal(readFileSync(stored, "utf8"), unstamped, "--force did not install the unstamped guard either");
+    assert.match(
+      both.stdout,
+      /--force: this checkout's guard carries no version stamp/,
+      "a forced guard replacement was not reported in the same run that forced the shim",
+    );
+  } finally {
+    rmSync(root, { force: true, recursive: true });
   }
 });
