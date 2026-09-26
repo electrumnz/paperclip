@@ -103,6 +103,7 @@ import {
 } from "../issues.js";
 import {
   applyIssueMonitorPolicyTransition,
+  hasClearedIssueMonitor,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "../issue-execution-policy.js";
@@ -241,6 +242,7 @@ export type StrandedRecoveryCause =
   | "provider_quota"
   | "codex_output_inactivity_monitor"
   | "workspace_validation_failed"
+  | "cleared_monitor_missing_wake_path"
   | "configuration_incomplete"
   | "native_session_interrupted"
   | "native_runner_process_exited"
@@ -299,6 +301,8 @@ function recoveryCauseTitle(cause: StrandedRecoveryCause) {
       return "output-inactivity retry exhausted";
     case "workspace_validation_failed":
       return "workspace validation failed";
+    case "cleared_monitor_missing_wake_path":
+      return "cleared monitor has no wake path";
     case "configuration_incomplete":
       return "configuration incomplete";
     case "execution_review_participant_recovery":
@@ -2445,6 +2449,10 @@ export function recoveryService(
       input.recoveryCause === "workspace_validation_failed"
         ? readWorkspaceValidationPayload(input.latestRun)
         : null;
+    const clearedMonitor =
+      input.recoveryCause === "cleared_monitor_missing_wake_path"
+        ? parseIssueExecutionState(input.issue.executionState)?.monitor ?? null
+        : null;
     return {
       sourceIssueId: input.issue.id,
       sourceIdentifier: input.issue.identifier,
@@ -2465,6 +2473,7 @@ export function recoveryService(
       maxHandoffAttempts:
         input.successfulRunHandoffEvidence?.maxHandoffAttempts ?? null,
       ...(workspaceValidation ? { workspaceValidation } : {}),
+      ...(clearedMonitor ? { clearedMonitor } : {}),
     };
   }
 
@@ -2533,12 +2542,13 @@ export function recoveryService(
                   ? readWorkspaceValidationPayload(input.latestRun)?.reason ===
                     "git_worktree_branch_incoherence"
                     ? "Board operator: repair the source task git worktree branch incoherence or choose a new execution workspace, then explicitly retry or reassign."
-                    : readWorkspaceValidationPayload(input.latestRun)
-                          ?.reason ===
+                    : readWorkspaceValidationPayload(input.latestRun)?.reason ===
                         "git_worktree_base_materialization_failed"
                       ? "Board operator: repair the project workspace repository URL or clone access, or configure a local checkout cwd, then explicitly retry or reassign."
                       : "Board operator: repair the source task workspace link, project workspace cwd, or git checkout, then explicitly retry or reassign."
-                  : recoveryCause === "configuration_incomplete"
+                  : recoveryCause === "cleared_monitor_missing_wake_path"
+                    ? "Board operator: schedule a new monitor, restore a durable work path, or explicitly retry the original owner."
+                    : recoveryCause === "configuration_incomplete"
                     ? readConfigurationIncompletePayload(input.latestRun)?.reason === "ai_connection_unavailable"
                       ? "Reconnect the selected AI account or choose an available connection, then continue the task."
                       : readConfigurationIncompletePayload(input.latestRun)
@@ -4446,19 +4456,43 @@ export function recoveryService(
         continue;
       }
 
+      // A cleared monitor is only a strand once every authority that could
+      // legitimately own the next action has declined it, so the strand verdict
+      // is needed by two lanes below: the legacy-continuation guard and the
+      // cleared-monitor escalation. Both read the same issue row and the same
+      // `latestRun` (this function never reassigns `latestRun` on a path that
+      // reaches the second lane), so resolve it once and reuse it rather than
+      // paying the durable-wait-path queries twice for one issue.
+      const isClearedMonitorStrand =
+        issue.status === "in_progress" && hasClearedIssueMonitor(issue);
+      let durableWaitPath: boolean | undefined;
+      const hasDurableWaitPath = async () => {
+        if (durableWaitPath === undefined) {
+          durableWaitPath = await hasPersistedDurableWaitPath(issue, latestRun);
+        }
+        return durableWaitPath;
+      };
+
       if (latestRun?.status === "succeeded" && issue.status !== "in_review") {
         const [source] = await db.select({ runtimeMode: heartbeatRuns.runtimeMode }).from(heartbeatRuns).where(eq(heartbeatRuns.id, latestRun.id)).limit(1);
         if (source?.runtimeMode !== "native") {
-          const outcome = await reconcileLegacyContinuation(latestRun.id);
-          if (outcome === "queued") {
-            result.continuationRequeued += 1;
-            result.dispositionRepairRequeued += 1;
-            result.issueIds.push(issue.id);
-          } else if (outcome === "escalated") {
-            result.escalated += 1;
-            result.issueIds.push(issue.id);
-          } else result.skipped += 1;
-          continue;
+          // An `in_progress` issue whose monitor was cleared and which owns no
+          // durable wait path is a strand, not a legacy continuation. Legacy
+          // disposition repair would manufacture an issue-bound continuation
+          // and re-arm the timer churn this strand is meant to surface, so let
+          // the issue fall through to the cleared-monitor escalation below.
+          if (!(isClearedMonitorStrand && !(await hasDurableWaitPath()))) {
+            const outcome = await reconcileLegacyContinuation(latestRun.id);
+            if (outcome === "queued") {
+              result.continuationRequeued += 1;
+              result.dispositionRepairRequeued += 1;
+              result.issueIds.push(issue.id);
+            } else if (outcome === "escalated") {
+              result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else result.skipped += 1;
+            continue;
+          }
         }
       }
 
@@ -4749,6 +4783,42 @@ export function recoveryService(
               latestRun,
               adapterFailureClassification,
             );
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+      }
+
+      // A cleared monitor is only a strand once every authority that could
+      // legitimately own the next action has declined it. An active subtree
+      // pause hold above means the board deliberately stopped the subtree, an
+      // operator-cancelled run means a human deliberately stopped the agent, and
+      // a failure-specific recovery path (provider quota monitor,
+      // configuration repair) owns the next step. Escalating `in_progress` to
+      // `blocked` before those lanes would fight a human decision and hide a
+      // monitor that is about to be scheduled.
+      if (isClearedMonitorStrand) {
+        // Same memoised read as the legacy-continuation guard above: this lane
+        // must not pay a second set of durable-wait-path queries for an issue
+        // the guard already resolved.
+        const hasExplicitBlockerPath = await hasDurableWaitPath();
+        if (!hasExplicitBlockerPath) {
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "in_progress",
+            latestRun,
+            recoveryCause: "cleared_monitor_missing_wake_path",
+            notice: {
+              body:
+                "Paperclip found that this issue's monitor was cleared while the issue remained `in_progress`, and no blocker or other durable wait path owns the next action. Moving it to `blocked` so the missing wake path is visible for intervention.",
+              title: "Cleared monitor has no wake path",
+              tone: "danger",
+            },
+          });
+          if (updated) {
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {
