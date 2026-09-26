@@ -102,10 +102,17 @@ fi
 if [ -z "$GUARD" ]; then
   # No guard to run. This is not allowed to be silent: a hook that exits 0
   # having decided nothing is exactly the defect this card is about. It warns
-  # loudly on every commit and still exits 0, because the alternative is
-  # refusing every commit in a checkout that has never had the guard, which
-  # would look like the tool is broken and would be worked around with
-  # --no-verify within a day.
+  # loudly on every commit.
+  #
+  # It still exits 0, deliberately, and the independent review on KEE-943
+  # agreed with that reasoning rather than the fail-closed alternative: refusing
+  # every commit in a checkout that has never had the guard would look like a
+  # broken tool and be worked around with --no-verify within a day. They did
+  # note the choice is internally inconsistent with the guard's own
+  # fail-closed-on-uncertainty rule, which is fair, and they were explicit that
+  # whichever way it goes the decision has to be under test. It is, below in
+  # the suite; before this it was not tested at all, and flipping the exit code
+  # changed no test result.
   echo "check-worktree-isolation: NO GUARD FOUND, seat isolation is NOT being enforced." >&2
   echo "  cwd:         $(pwd)" >&2
   echo "  expected at: ${storedGuardPath}" >&2
