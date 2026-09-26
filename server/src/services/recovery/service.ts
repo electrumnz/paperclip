@@ -4461,10 +4461,17 @@ export function recoveryService(
       // A cleared monitor is only a strand once every authority that could
       // legitimately own the next action has declined it, so the strand verdict
       // is needed by two lanes below: the legacy-continuation guard and the
-      // cleared-monitor escalation. Both read the same issue row and the same
-      // `latestRun` (this function never reassigns `latestRun` on a path that
-      // reaches the second lane), so resolve it once and reuse it rather than
-      // paying the durable-wait-path queries twice for one issue.
+      // cleared-monitor escalation. Both read the same issue row, so resolve the
+      // verdict once and reuse it rather than paying the durable-wait-path
+      // queries twice for one issue.
+      //
+      // `latestRun` *is* reassigned further down, at the adapter-failure lanes
+      // (provider-quota monitor scheduling and configuration-incomplete
+      // escalation), but every one of those sites is followed by a `continue`,
+      // so no path that reaches the strand lane below observes a reassigned
+      // value. The memoised durable-wait-path read is therefore still correct;
+      // the point of the old wording was to claim the absence of reassignment
+      // as the reason, which was not true.
       const isClearedMonitorStrand =
         issue.status === "in_progress" && hasClearedIssueMonitor(issue);
       let durableWaitPath: boolean | undefined;
