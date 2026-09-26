@@ -502,6 +502,62 @@ test("every write of the stored guard goes through one decision, on every path",
   }
 });
 
+test("the version stamp itself is the ordering mechanism, and is covered", (t) => {
+  // KEE-973 Finding B, confirmed here independently before acting on it: the
+  // project's own installer suite cannot tell version 2 from version 3. Flipping
+  // the guard's stamp line and nothing else gives, on bc1ade2,
+  //
+  //   stamp 3 (as shipped)  ->  31 pass  0 fail
+  //   stamp 2 (flipped)     ->  31 pass  0 fail
+  //
+  // and this file passed 7/7 with the stamp set to 99999. So the whole ruling --
+  // which is a statement about what the stamp claims -- rested on a number that
+  // nothing could see change.
+  //
+  // What is asserted here is not a literal. It is that the stamp is what decides
+  // the order: move it and the decision must move with it, in the direction the
+  // moved stamp says. A test that pinned the number would be the same defect in
+  // the other direction, which is why the numbers below are read, never written.
+  const { root, main } = makeFleet();
+  try {
+    if (skipWithoutStamp(t, main)) return;
+    const { inForceVersion, base } = seedInForce(main);
+    const guardFile = path.join(main, "scripts", "check-worktree-isolation.mjs");
+
+    // Ordering follows the stamp, not the bytes and not the numbers' size. Take a
+    // guard that is otherwise IDENTICAL to the one in force -- same content, so
+    // the only thing that can decide anything is the stamp -- and give it a
+    // higher stamp. It must win, and the stored copy must then carry that stamp.
+    writeFileSync(guardFile, atVersion(guardIn(main), inForceVersion + 1));
+    assertRelation(main, "newer");
+    const result = installHook(main, ["--install"]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(stampOf(storedGuard(main)), inForceVersion + 1,
+      "the guard now in force must carry the stamp that won the decision");
+    assert.equal(stampOf(guardIn(main)), inForceVersion + 1,
+      "fixture is wrong: the winning stamp did not land");
+
+    // And lower, from the same content, must lose to what is in force. If the
+    // stamp did not decide this, nothing in this file would catch the stamp
+    // being ignored -- which is exactly what Finding B describes.
+    const afterWrite = stampOf(storedGuard(main));
+    writeFileSync(guardFile, atVersion(guardIn(main), afterWrite - 1));
+    assertRelation(main, "older");
+    const before = storedGuard(main);
+    const second = installHook(main, ["--install"]);
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(storedGuard(main), before,
+      "a lower stamp must not displace a higher one, however the content compares");
+
+    // Sanity on the fixture's own reading of the stamp, so a change to the
+    // regex cannot silently make the two assertions above vacuous.
+    assert.ok(base > 0, "fixture is wrong: the shipped guard carries no version at all");
+    assert.equal(stampOf(guardIn(main)), afterWrite - 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("the stored guard is fleet-wide: in the common dir, not in a lane", (t) => {
   // A guard on the shape. If the stored guard were per-lane, none of the tests
   // above would mean anything, so assert the location here rather than leaving
