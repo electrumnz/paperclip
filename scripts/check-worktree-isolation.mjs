@@ -83,9 +83,25 @@ if (!agentId) {
 let topLevel;
 try {
   topLevel = git("rev-parse", "--show-toplevel");
-} catch {
-  // Not inside a git worktree at all.
-  process.exit(0);
+} catch (err) {
+  // "not a git repository" means there is no worktree to judge, so skipping is
+  // right. Any other failure is git refusing to answer for a reason we did not
+  // predict: dubious ownership, a corrupt repo, a permissions problem. Exiting
+  // 0 there is the worst outcome available, because it converts "I could not
+  // tell" into "allowed" without a word, and that is how a guard stops being a
+  // guard. Fail closed instead, and say why.
+  const stderr = (err && err.stderr) || "";
+  if (/not a git repository/i.test(stderr)) {
+    process.stdout.write("check-worktree-isolation: skipped, not a git repository\n");
+    process.exit(0);
+  }
+  process.stderr.write(
+    `check-worktree-isolation: could not determine the worktree root, refusing the commit.\n` +
+      `git said: ${stderr.trim() || (err && err.message) || "unknown error"}\n` +
+      `This is a git failure, not a clean run. Fix the repository, or commit with\n` +
+      `--no-verify if you are certain this worktree is yours.\n`,
+  );
+  process.exit(2);
 }
 
 const repoRoot = path.resolve(topLevel);
@@ -111,19 +127,25 @@ if (relative.startsWith("..") || path.isAbsolute(relative)) {
 const seat = agentId.trim().toLowerCase().split("-")[0].slice(0, 8);
 const dirName = path.basename(repoRoot);
 
-// The directory is <kind>-kee-<issue>[-<suffix>]. The issue token itself
-// contains a hyphen, so strip by prefix rather than by a fixed index: a
-// "slice(2)" here would read the "929" of "paperclip-kee-929-4a323d0d" as the
-// suffix and reject the seat's own lane.
-const withoutKind = dirName.replace(/^(app|paperclip)-/, "");
-const withoutIssue = withoutKind.replace(/^kee-\d+/, "");
-if (withoutIssue === withoutKind) {
-  // Not shaped like an issue worktree. Do not guess; do not fail a reviewer's
-  // checkout over it.
+// The directory is <kind>-kee-<issue>[-<suffix>], where <kind> is whatever the
+// minting tool used ("paperclip" or "app" today, but seats create lanes by
+// hand often enough that new prefixes do appear: "keece-kee-923" is a real
+// directory on this host). Match the issue token anywhere in the leading run
+// rather than stripping a fixed kind prefix, so an unfamiliar prefix is still
+// recognised as an issue lane instead of silently skipping.
+//
+// A hard-coded `^(app|paperclip)-` prefix caused two real false negatives
+// found in review: "paperclip-kee341-pr13498" and "keece-kee-923" both exited
+// 0 as "not an issue worktree", when both are exactly the shape this check
+// exists to catch.
+const issueMatch = dirName.match(/kee-?\d+/i);
+if (!issueMatch || issueMatch.index === undefined) {
+  // No issue token anywhere in the name. This is a reference checkout or an
+  // unrelated directory, so do not guess and do not fail a reviewer over it.
   process.stdout.write(`check-worktree-isolation: skipped, ${dirName} is not an issue worktree\n`);
   process.exit(0);
 }
-const tail = withoutIssue.replace(/^-+/, "");
+const tail = dirName.slice(issueMatch.index + issueMatch[0].length).replace(/^-+/, "");
 
 if (/^[0-9a-f]{8}$/.test(tail)) {
   if (tail === seat) {

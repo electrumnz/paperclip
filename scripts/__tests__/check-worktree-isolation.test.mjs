@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -137,6 +137,47 @@ test("a missing worktree root is skipped even for a real violation path", () => 
   const { code, stdout } = run(SEAT_B, dir, path.join(fixtureRoot, "no-such-root"));
   assert.equal(code, 0);
   assert.match(stdout, /does not exist/);
+});
+
+test("a lane whose issue number runs into the kind prefix is still a lane", () => {
+  // Regression, found in independent review: the kind prefix was hard-coded to
+  // ^(app|paperclip)-, so "paperclip-kee341-pr13498" matched neither prefix nor
+  // /^kee-\d+/ and was skipped as "not an issue worktree". It is a real lane on
+  // this host, and it is exactly the shape this check exists to catch.
+  const dir = makeWorktree("paperclip-kee341-pr13498");
+  const { code } = run(SEAT_A, dir);
+  assert.equal(code, 1);
+});
+
+test("an unfamiliar kind prefix is still a lane", () => {
+  // Same regression. "keece-kee-923" is not a prefix the minting tool emits, but
+  // a lane is a lane. Refusing to guess must not extend to guessing "safe".
+  const dir = makeWorktree("keece-kee-923");
+  const { code } = run(SEAT_A, dir);
+  assert.equal(code, 1);
+});
+
+test("a git failure is not a silent pass", () => {
+  // Regression, found in independent review. The guard caught every git error
+  // with a bare `catch { process.exit(0) }`, so "fatal: detected dubious
+  // ownership" became exit 0: the guard reported success while knowing nothing.
+  // A pre-commit hook that passes when it cannot tell is not a guard.
+  const stub = path.join(fixtureRoot, "git-stub");
+  mkdirSync(stub, { recursive: true });
+  const gitStub = path.join(stub, "git");
+  writeFileSync(gitStub, '#!/bin/sh\necho "fatal: detected dubious ownership" >&2\nexit 128\n', {
+    mode: 0o755,
+  });
+  const dir = makeWorktree("paperclip-kee-923");
+  const env = { ...process.env };
+  env.PATH = `${stub}:${env.PATH}`;
+  env.PAPERCLIP_AGENT_ID = SEAT_A;
+  env.KEE_WORKTREE_ROOT = fixtureRoot;
+  const result = spawnSync(process.execPath, [script], { cwd: dir, env, encoding: "utf8" });
+  // Exit 2 is the documented "could not decide" code, distinct from 1 (refused)
+  // and 0 (clean). Anything that reports success here is a false negative.
+  assert.equal(result.status, 2);
+  assert.match(result.stderr, /could not determine the worktree root/);
 });
 
 test("a directory that is not a git checkout is skipped", () => {
