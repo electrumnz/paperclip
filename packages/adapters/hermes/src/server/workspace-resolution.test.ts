@@ -172,4 +172,17 @@ describe("hermes-local adapter workspace resolution", () => {
 
     expect(spawnedEnv().PAPERCLIP_WORKSPACE_CWD).toBeUndefined();
   });
+
+  it("tolerates non-string env entries (secret_ref bindings) when exporting", async () => {
+    // Real adapterConfig.env in this fleet carries {type:"secret_ref",...}
+    // objects alongside strings; the workspace handoff must not throw on them.
+    const { ctx } = makeCtx(
+      { env: { TYPESAFE_API_KEY: { type: "secret_ref", secretId: "abc" } } },
+      { paperclipWorkspace: { cwd: realWorkspace, source: "project_primary" } },
+    );
+
+    await expect(execute(ctx as any)).resolves.toBeDefined();
+    expect(spawnedCwd()).toBe(realWorkspace);
+    expect(spawnedEnv().PAPERCLIP_WORKSPACE_CWD).toBe(realWorkspace);
+  });
 });
