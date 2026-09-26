@@ -26,14 +26,14 @@ const SEAT_B = "0f4136b3-8cc6-4dc1-a956-106ba76877e4";
 const SEAT_A_SHORT = "4a323d0d";
 const SEAT_B_SHORT = "0f4136b3";
 
-function run(agentId, workdir) {
+function run(agentId, workdir, rootOverride) {
   const env = { ...process.env };
   if (agentId === null) delete env.PAPERCLIP_AGENT_ID;
   else env.PAPERCLIP_AGENT_ID = agentId;
   // The guard decides "is this an issue worktree" from the absolute path, so
   // the fixtures have to sit under a root it recognises. Point it at the
   // fixture tree instead of minting real seat-named worktrees.
-  env.KEE_WORKTREE_ROOT = fixtureRoot;
+  env.KEE_WORKTREE_ROOT = rootOverride ?? fixtureRoot;
   const result = spawnSync(process.execPath, [script], { cwd: workdir, env, encoding: "utf8" });
   return { code: result.status, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
 }
@@ -115,6 +115,28 @@ test("a repository outside the worktree root is skipped", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("a missing worktree root is skipped, not thrown", () => {
+  // Regression: the first version called realpathSync on KEE_WORKTREE_ROOT at
+  // module load, so a root that does not exist raised ENOENT before any of the
+  // skip checks ran. As a pre-commit hook that blocks a commit on a machine
+  // that has no such layout at all. Found by Greptile on #14094.
+  const dir = path.join(fixtureRoot, "paperclip-kee-929-4a323d0d");
+  mkdirSync(dir, { recursive: true });
+  const { code, stdout, stderr } = run(SEAT_A, dir, path.join(fixtureRoot, "no-such-root"));
+  assert.equal(code, 0);
+  assert.doesNotMatch(stderr, /ENOENT/);
+  assert.match(stdout, /does not exist/);
+});
+
+test("a missing worktree root is skipped even for a real violation path", () => {
+  // The point of the fix: a seat that IS out of lane must not be blocked by a
+  // root that cannot be resolved, because "cannot tell" is not "guilty".
+  const dir = makeWorktree("paperclip-kee-929-4a323d0d");
+  const { code, stdout } = run(SEAT_B, dir, path.join(fixtureRoot, "no-such-root"));
+  assert.equal(code, 0);
+  assert.match(stdout, /does not exist/);
 });
 
 test("a directory that is not a git checkout is skipped", () => {
