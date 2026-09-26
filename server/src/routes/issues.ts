@@ -347,9 +347,19 @@ import {
 } from "../services/issue-queued-comment-queue.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
-const updateIssueRouteSchema = updateIssueSchema.extend({
-  interrupt: z.boolean().optional(),
-});
+// KEE-579: an issue PATCH used to strip an unrecognised body key and still
+// answer 200, so `{"assigneeId": ...}` reported success while assigning
+// nothing. `.strict()` turns that silent no-op into a 400 that names the
+// unknown field. Strictness is applied here, at the route, rather than on the
+// shared `updateIssueSchema`, so the create route and the other consumers of
+// that schema keep their existing lenient shape and this stays a scoped fix.
+// `.strict()` is deliberately the last call in the chain: it has to sit after
+// `.partial()` and `.extend()` or the added fields would not be recognised.
+const updateIssueRouteSchema = updateIssueSchema
+  .extend({
+    interrupt: z.boolean().optional(),
+  })
+  .strict();
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
   revision: z.string().min(1),
