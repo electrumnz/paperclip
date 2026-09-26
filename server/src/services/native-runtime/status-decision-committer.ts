@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import type { CreateIssueThreadInteraction } from "@paperclipai/shared";
+import type { CreateIssueThreadInteraction, IssueUnblockDescriptor } from "@paperclipai/shared";
 import {
   agentWakeupRequests,
   agents,
@@ -749,10 +749,18 @@ async function materializeDecisionEffect(input: {
   }
   if (effect.kind === "bind_blocker") {
     failAt("blocker_materialization", input.failpoint);
+    // Never displace an unblock path this commit did not create. The card may
+    // already be `blocked` with a valid agent- or user-owned descriptor, and
+    // `deliverAgentUnblockNotification` only wakes agent-owned descriptors, so
+    // overwriting one severs the wake route to whoever is already responsible.
+    const boundDescriptor = unblockDescriptorForStatusCommit({
+      existing: input.issue.unblockDescriptor,
+      proposed: { owner: effect.owner, action: effect.action },
+    });
     const [bound] = await input.tx
       .update(issues)
       .set({
-        unblockDescriptor: { owner: effect.owner, action: effect.action },
+        ...(boundDescriptor ? { unblockDescriptor: boundDescriptor } : {}),
         updatedAt: new Date(),
       })
       .where(
@@ -1521,6 +1529,44 @@ async function materializeDecisionEffect(input: {
   return assertNeverEffect(effect);
 }
 
+/**
+ * A status commit that moves a card to `blocked` must attach an unblock
+ * descriptor, but must never *displace* a block it did not create.
+ *
+ * `issueService.update` stamps `blockedTransitionAt` only on a real
+ * `not blocked -> blocked` transition, and `assertTransition` returns early
+ * when `from === to`, so a card that is already `blocked` accepts this write
+ * unconditionally. If the card already carries a valid descriptor, writing over
+ * it severs the wake route to whoever is already responsible:
+ * `deliverAgentUnblockNotification` only wakes agent-owned descriptors.
+ *
+ * The descriptor proposed by the decision keeps its own owner. An
+ * agent-owned `bind_blocker` must not be rewritten as board-owned, or the
+ * agent that is being given the block would stop being woken for it.
+ *
+ * Kept local to the committer on purpose: the equivalent
+ * `boardDescriptorForBlock` helper in `services/recovery/blocked-descriptor.ts`
+ * ships on the KEE-250 branch, which is not merged into `origin/master`. This
+ * mirrors its contract for the board-owned case and additionally preserves a
+ * proposed agent owner; when KEE-250 lands this function should be deleted and
+ * `boardDescriptorForBlock` used at the board-owned call site.
+ *
+ * Returns the descriptor to write, or `null` to leave the existing value
+ * untouched.
+ */
+export function unblockDescriptorForStatusCommit(input: {
+  existing: IssueUnblockDescriptor | null | undefined;
+  proposed: { owner: { agentId: string } | "board"; action: string } | null | undefined;
+}): IssueUnblockDescriptor | null {
+  if (input.existing && input.existing.action.trim()) {
+    // A real unblock path already exists. Keep its owner and its action.
+    return null;
+  }
+  const action = input.proposed?.action?.trim();
+  if (!action) return null;
+  return { owner: input.proposed!.owner, action } satisfies IssueUnblockDescriptor;
+}
+
 export async function commitNativeStatusDecision(input: {
   db: Db;
   companyId: string;
@@ -1873,13 +1919,29 @@ export async function commitNativeStatusDecision(input: {
       if (!updated) throw new NativeStatusRaceError();
     } else {
       failAt("status_projection", input.failpoint);
+      // A status commit must never *displace* a block it did not create. This
+      // projection runs even when the card is already `blocked`
+      // (`assertTransition` returns early when `from === to`), so an existing
+      // valid descriptor keeps its owner. `deliverAgentUnblockNotification`
+      // only wakes agent-owned descriptors, so overwriting one with a
+      // board-owned descriptor severs the wake route to whoever is already
+      // responsible. Same rule as the KEE-250 recovery paths.
+      const projectedUnblockDescriptor =
+        input.decision.statusAction === "blocked"
+          ? unblockDescriptorForStatusCommit({
+              existing: issue.unblockDescriptor,
+              proposed: input.decision.unblockDescriptor,
+            })
+          : null;
       const projected = await issueService(tx as unknown as Db).update(
         input.issueId,
         {
           status: input.decision.toStatus,
           statusVersion: input.priorStatusVersion + 1,
           lastStatusDecisionId: decisionRow.id,
-          unblockDescriptor: input.decision.unblockDescriptor,
+          ...(projectedUnblockDescriptor
+            ? { unblockDescriptor: projectedUnblockDescriptor }
+            : {}),
           actorAgentId: null,
           actorUserId: null,
         },
