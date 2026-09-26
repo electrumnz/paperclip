@@ -45,9 +45,19 @@ import process from "node:process";
 // literal root yields a bogus "../../../.." path.relative result and the guard
 // silently exits 0 on every path. That bug shipped in the first version of
 // this script and was caught only by testing the hook against a real worktree.
-const WORKTREE_ROOT = realpathSync(
-  process.env.KEE_WORKTREE_ROOT || "/home/love4vengeance/Work/keece-issue-worktrees",
-);
+//
+// A root that does not exist is a misconfiguration, not a violation. It must
+// not throw: this script runs as a pre-commit hook, so an uncaught error here
+// turns "I could not find the worktree root" into "your commit is blocked",
+// on a machine that has no such layout at all. Fail open with a message, the
+// same way every other non-hazard case in this file exits 0.
+const configuredRoot = process.env.KEE_WORKTREE_ROOT || "/home/love4vengeance/Work/keece-issue-worktrees";
+let WORKTREE_ROOT = null;
+try {
+  WORKTREE_ROOT = realpathSync(configuredRoot);
+} catch {
+  WORKTREE_ROOT = null;
+}
 
 function git(...args) {
   return execFileSync("git", args, { encoding: "utf8" }).trim();
@@ -79,6 +89,14 @@ try {
 }
 
 const repoRoot = path.resolve(topLevel);
+if (WORKTREE_ROOT === null) {
+  // The configured root does not exist, so no worktree under it can be in play.
+  // Nothing to judge, and in particular nothing to block.
+  process.stdout.write(
+    `check-worktree-isolation: skipped, worktree root ${configuredRoot} does not exist\n`,
+  );
+  process.exit(0);
+}
 const relative = path.relative(WORKTREE_ROOT, repoRoot);
 
 if (relative.startsWith("..") || path.isAbsolute(relative)) {
