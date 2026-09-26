@@ -21,7 +21,14 @@
  * checkout would therefore fail open on exactly the worktrees that need the
  * guard most, which is the same "check that always passes" outcome as the
  * version-1 bug. So the installer also stores a copy in the common git dir, and
- * the shim prefers the checkout's copy and falls back to the stored one.
+ * the shim prefers the STORED copy over the checkout's, falling back to the
+ * checkout only when the stored copy is absent.
+ *
+ * That order is the one that matters, and it was the other way round for a
+ * while. Preferring the checkout let a worktree whose own guard is an older
+ * revision decide its own commits, so a fixed or tightened guard sitting in the
+ * common dir was never consulted -- a stale, permissive guard won. The stored
+ * copy is refreshed on every run, so it is the copy that is current.
  *
  * Usage:
  *   node scripts/install-worktree-isolation-hook.mjs            # install
