@@ -323,7 +323,7 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       entityId: context.agentId,
       agentId: context.agentId,
       runId: context.heartbeatRunId,
-      details: { count: secrets.length },
+      details: { count: secrets.length, keys: secrets.map((s) => s.key) },
     });
     res.json({
       secrets: secrets.map(({ secretId, bindingId: _bindingId, configPath: _configPath, ...secret }) => ({

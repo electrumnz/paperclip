@@ -5,6 +5,8 @@ import { and, desc, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentRuntimeState,
+  agentWakeupRequests,
   agents,
   authUsers,
   companies,
@@ -65,7 +67,9 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
   afterEach(async () => {
     await db.delete(activityLog);
     await db.delete(issueComments);
+    await db.delete(agentRuntimeState);
     await db.delete(heartbeatRuns);
+    await db.delete(agentWakeupRequests);
     await db.delete(issues);
     await db.delete(companyMemberships);
     await db.delete(agents);
@@ -143,7 +147,16 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
       contextSnapshot: { issueId: sourceIssue.id },
     }).returning().then((rows) => rows[0]!);
 
-    return { company, actorAgent, responsibleUserId, boardUserId, run, issue };
+    return {
+      company,
+      actorAgent,
+      targetAgent,
+      responsibleUserId,
+      boardUserId,
+      run,
+      sourceIssue,
+      issue,
+    };
   }
 
   function agentActor(input: Awaited<ReturnType<typeof seed>>): Express.Request["actor"] {
@@ -243,6 +256,62 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
         action: "issue.updated",
         responsibleUserId: fixture.responsibleUserId,
         details: expect.objectContaining({ authorizationReason: "allow_visible_issue_write" }),
+      }),
+    ]));
+  }, 30_000);
+
+  it("lets an unscoped heartbeat timer assign unowned work and comment on assigned work", async () => {
+    const fixture = await seed();
+    await db
+      .update(heartbeatRuns)
+      .set({
+        invocationSource: "timer",
+        contextSnapshot: {
+          wakeReason: "heartbeat_timer",
+          wakeSource: "timer",
+        },
+      })
+      .where(eq(heartbeatRuns.id, fixture.run.id));
+    await db
+      .update(issues)
+      .set({ assigneeAgentId: null, status: "backlog" })
+      .where(eq(issues.id, fixture.issue.id));
+
+    const timerApp = await createApp(db, agentActor(fixture));
+    const assignmentResponse = await request(timerApp)
+      .patch(`/api/issues/${fixture.issue.id}`)
+      .send({ assigneeAgentId: fixture.targetAgent.id });
+    expect(assignmentResponse.status, JSON.stringify(assignmentResponse.body)).toBe(200);
+
+    const commentResponse = await request(timerApp)
+      .post(`/api/issues/${fixture.sourceIssue.id}/comments`)
+      .send({ body: "Coordinator heartbeat update" });
+    expect(commentResponse.status, JSON.stringify(commentResponse.body)).toBe(201);
+
+    const influenceEvents = await db
+      .select({ details: activityLog.details })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.runId, fixture.run.id),
+        eq(activityLog.action, "issue.cross_issue_influence_observed"),
+      ));
+    expect(influenceEvents).toHaveLength(2);
+    expect(influenceEvents).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        details: expect.objectContaining({
+          kind: "update",
+          sourceKind: "heartbeat_timer",
+          sourceIssueId: null,
+          targetIssueId: fixture.issue.id,
+        }),
+      }),
+      expect.objectContaining({
+        details: expect.objectContaining({
+          kind: "comment",
+          sourceKind: "heartbeat_timer",
+          sourceIssueId: null,
+          targetIssueId: fixture.sourceIssue.id,
+        }),
       }),
     ]));
   }, 30_000);
