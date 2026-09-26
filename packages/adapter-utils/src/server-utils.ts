@@ -4823,10 +4823,19 @@ export async function runChildProcess(
           // let the child close the promise.
           stdin.on("error", (err: Error) => {
             stdinWriteError = err;
-            void opts.onLog(
-              "stderr",
-              `[runChildProcess] stdin write failed after the child closed its input: ${err.message}\n`,
-            );
+            // Chain the same guard the stdout/stderr handlers above use. A bare
+            // `void opts.onLog(...)` leaves the returned promise unhandled, so a
+            // failing log store turns an EPIPE into an unhandled rejection that
+            // can take down the server — the precise failure this handler
+            // exists to prevent.
+            void opts
+              .onLog(
+                "stderr",
+                `[runChildProcess] stdin write failed after the child closed its input: ${err.message}\n`,
+              )
+              .catch((logErr) =>
+                onLogError(logErr, runId, "failed to append stdin write failure log"),
+              );
           });
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
@@ -4835,10 +4844,14 @@ export async function runChildProcess(
               stdin.end();
             } catch (err) {
               stdinWriteError = err instanceof Error ? err : new Error(String(err));
-              void opts.onLog(
-                "stderr",
-                `[runChildProcess] stdin write failed synchronously: ${stdinWriteError.message}\n`,
-              );
+              void opts
+                .onLog(
+                  "stderr",
+                  `[runChildProcess] stdin write failed synchronously: ${stdinWriteError.message}\n`,
+                )
+                .catch((logErr) =>
+                  onLogError(logErr, runId, "failed to append stdin write failure log"),
+                );
             }
           });
         }

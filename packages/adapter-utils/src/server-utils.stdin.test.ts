@@ -74,4 +74,52 @@ describe("runChildProcess stdin write failures", () => {
     expect(result.exitCode).toBe(0);
     expect(result.stdinWriteError ?? null).toBeNull();
   });
+
+  it("routes a failing log store to onLogError instead of rejecting unhandled", async () => {
+    // The stdin EPIPE handler logs its failure. If that log call rejects and
+    // the promise is left unhandled, an EPIPE on the stdin path becomes an
+    // unhandled rejection — the same class of failure as the uncaught
+    // exception the handler above exists to prevent, just one level up. The
+    // stdout/stderr handlers already chain .catch(onLogError); these two sites
+    // must do the same.
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+
+    const onLogErrors: Array<{ runId: string; message: string }> = [];
+
+    try {
+      const result = await runChildProcess(
+        "run-kee-923-logfail",
+        "/bin/sh",
+        ["-c", "exit 3"],
+        {
+          cwd: ".",
+          env: baseEnv,
+          timeoutSec: 20,
+          graceSec: 2,
+          stdin: "x".repeat(1_000_000),
+          // Every log call rejects, including the stdin write-failure line.
+          onLog: async () => {
+            throw new Error("log store unavailable");
+          },
+          onLogError: (err, runId, message) => {
+            onLogErrors.push({ runId, message });
+          },
+        },
+      );
+
+      // The run still terminates on the child's own status, not on log failure.
+      expect(result.exitCode).toBe(3);
+      expect(result.stdinWriteError).toBeTruthy();
+    } finally {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      process.off("unhandledRejection", onUnhandled);
+    }
+
+    expect(unhandled).toEqual([]);
+    // The rejection was handled and attributed, not swallowed silently.
+    expect(onLogErrors.length).toBeGreaterThan(0);
+    expect(onLogErrors.some((entry) => entry.runId === "run-kee-923-logfail")).toBe(true);
+  });
 });
