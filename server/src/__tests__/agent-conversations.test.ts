@@ -874,13 +874,21 @@ const support = await getEmbeddedPostgresTestSupport();
           evidence: { runId: run.id }, nextAction: "Reconcile stopped work",
         }).returning();
       }
+      const expectedUnblockAction = actions[0]!.nextAction;
       await settleUnrecoverableExecutions(db);
-      const [after] = await db.select().from(issues).where(eq(issues.id, task.id));
-      const [action] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, actions[0]!.id));
-      expect(after.status).toBe(scenario.superseded ? status : "blocked");
-      expect(action).toMatchObject({ status: "resolved", outcome: scenario.superseded ? "cancelled" : "blocked" });
+      const [settledTask] = await db.select().from(issues).where(eq(issues.id, task.id));
+      const [settledAction] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, task.id));
+      expect(settledTask.status).toBe(scenario.superseded ? status : "blocked");
+      expect(settledAction).toMatchObject({ status: "resolved", outcome: scenario.superseded ? "cancelled" : "blocked" });
+      if (!scenario.superseded) {
+        expect(settledTask.unblockDescriptor).toEqual({
+          owner: "board",
+          action: expectedUnblockAction,
+        });
+        expect(settledTask.blockedTransitionAt).toBeInstanceOf(Date);
+      }
       expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0].status).toBe("cancelled");
-      if (!scenario.ordinary) expect(after.conversationSessionGeneration).toBe(scenario.generation);
+      if (!scenario.ordinary) expect(settledTask.conversationSessionGeneration).toBe(scenario.generation);
     });
 
     it("only parks answered turns and preserves idle across recovery classification", async () => {
