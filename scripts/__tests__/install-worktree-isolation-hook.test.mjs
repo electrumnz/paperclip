@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -320,6 +320,153 @@ test("uninstall removes the stored guard as well as the hook", () => {
     assert.ok(existsSync(stored), "stored guard missing after install");
     assert.equal(installHook(main, ["--uninstall"]).status, 0);
     assert.ok(!existsSync(stored), "stored guard survived uninstall");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The four tests below are the automated review's findings on 1023ffe31, each
+// reproduced by me before fixing. The premise is the same as above: a fix that
+// is not asserted cannot be shown to have fixed anything.
+
+// Greptile P1 "stale guard takes precedence". A worktree whose own guard is an
+// older revision used to decide its own commits, so a fixed or tightened guard
+// was not in force there -- the original defect of this card, one level up.
+test("an older guard in the committing worktree does not outrank the stored guard", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0);
+    const worktrees = path.join(root, "keece-issue-worktrees");
+    mkdirSync(worktrees, { recursive: true });
+    const shared = path.join(worktrees, "paperclip-kee-923");
+    git(["worktree", "add", "-q", shared, "-b", "keece/kee-923"], main);
+
+    // A permissive, older guard sitting in the committing worktree.
+    const stale = path.join(shared, "scripts", "check-worktree-isolation.mjs");
+    writeFileSync(stale, 'process.stdout.write("PERMISSIVE-STALE\\n");\nprocess.exit(0);\n');
+    writeFileSync(path.join(shared, "f.txt"), "f\n");
+    git(["add", "f.txt"], shared);
+
+    const commit = spawnSync("git", ["commit", "-m", "stale-guard"], {
+      cwd: shared,
+      encoding: "utf8",
+      env: { ...gitEnv, PAPERCLIP_AGENT_ID: SEAT_A, KEE_WORKTREE_ROOT: worktrees },
+    });
+    const output = `${commit.stdout}${commit.stderr}`;
+    assert.doesNotMatch(output, /PERMISSIVE-STALE/, "the stale worktree guard was in force");
+    assert.notEqual(commit.status, 0, "a permissive guard allowed the commit");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Greptile P1 "hook installation can falsely succeed", both halves. Reproduced
+// by me: with core.hooksPath pointing elsewhere a cross-seat commit landed
+// while --check reported the hook installed.
+test("--check fails when the hook is not executable, and install refuses a foreign core.hooksPath", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0);
+    const hookPath = path.join(main, ".git", "hooks", "pre-commit");
+
+    chmodSync(hookPath, 0o644);
+    const notExecutable = installHook(main, ["--check"]);
+    assert.equal(notExecutable.status, 1, "a non-executable hook was reported installed");
+    assert.match(notExecutable.stderr, /not executable/);
+    chmodSync(hookPath, 0o755);
+    assert.equal(installHook(main, ["--check"]).status, 0);
+
+    const elsewhere = path.join(root, "elsewhere-hooks");
+    mkdirSync(elsewhere, { recursive: true });
+    git(["config", "core.hooksPath", elsewhere], main);
+    const refused = installHook(main, ["--install"]);
+    assert.equal(refused.status, 1, "install succeeded although git would never run the hook");
+    assert.match(refused.stderr, /core\.hooksPath/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Greptile P1 "commits never run the guard" in the core.hooksPath form: the
+// installer refusing is not enough, the commit has to be shown landing.
+test("a cross-seat commit lands when core.hooksPath hides the hook, and the installer says why", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0);
+    const elsewhere = path.join(root, "hidden-hooks");
+    mkdirSync(elsewhere, { recursive: true });
+    git(["config", "core.hooksPath", elsewhere], main);
+
+    const worktrees = path.join(root, "keece-issue-worktrees");
+    mkdirSync(worktrees, { recursive: true });
+    const foreign = path.join(worktrees, `paperclip-kee-923-${SEAT_B_SHORT}`);
+    git(["worktree", "add", "-q", foreign, "-b", "keece/kee-923-x"], main);
+    writeFileSync(path.join(foreign, "g.txt"), "g\n");
+    git(["add", "g.txt"], foreign);
+
+    const commit = spawnSync("git", ["commit", "-m", "unhooked"], {
+      cwd: foreign,
+      encoding: "utf8",
+      env: { ...gitEnv, PAPERCLIP_AGENT_ID: SEAT_A, KEE_WORKTREE_ROOT: worktrees },
+    });
+    assert.equal(commit.status, 0, "control failed: the commit should land when the hook is hidden");
+    const log = spawnSync("git", ["log", "--oneline"], { cwd: foreign, encoding: "utf8" }).stdout;
+    assert.match(log, /unhooked/);
+
+    // And the installer must not claim success while that is the situation.
+    const check = installHook(main, ["--check"]);
+    assert.notEqual(check.status, 0, "--check claimed installed while core.hooksPath hides the hook");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Greptile P2 "uninstall deletes other checks". Somebody else's check appended
+// to the same hook must survive, for every worktree sharing it.
+test("uninstall keeps a check that somebody else added to the same hook", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0);
+    const hookPath = path.join(main, ".git", "hooks", "pre-commit");
+    writeFileSync(hookPath, `${readFileSync(hookPath, "utf8")}# somebody else's important check\nexit 0\n`);
+
+    assert.equal(installHook(main, ["--uninstall"]).status, 0);
+    assert.ok(existsSync(hookPath), "uninstall deleted a hook that also contained someone else's check");
+    const after = readFileSync(hookPath, "utf8");
+    assert.match(after, /somebody else's important check/, "someone else's check was deleted");
+    assert.doesNotMatch(after, /installed by scripts\/install-worktree-isolation-hook/, "our block survived");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Greptile P2 "interrupted install leaves unguarded hook". The stored guard is
+// now written first, through a temp file and a rename, so there is never a
+// live hook with no guard and never a half-written guard for node to choke on.
+//
+// The ordering half of this is asserted on the source rather than by racing an
+// interruption, which is not something a test can do reliably. The previous
+// version wrote the hook first and the guard second, so an install interrupted
+// between the two left a live hook with no guard: it warns and allows every
+// commit. Reading the write order is honest about what it checks.
+test("the stored guard is written before the hook, and no staging file is left behind", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0);
+    const hooksDir = path.join(main, ".git", "hooks");
+    const leftovers = readdirSync(hooksDir).filter((f) => f.includes("worktree-isolation-guard.mjs.tmp"));
+    assert.deepEqual(leftovers, [], "a staging file was left behind");
+    assert.ok(existsSync(path.join(hooksDir, "worktree-isolation-guard.mjs")), "no stored guard");
+    assert.ok(existsSync(path.join(hooksDir, "pre-commit")), "no hook");
+
+    const source = readFileSync(installer, "utf8");
+    const storeAt = source.indexOf("renameSync(staging, storedGuardPath)");
+    const hookAt = source.indexOf("writeFileSync(hookPath, shim");
+    assert.ok(storeAt > -1 && hookAt > -1, "fixture is wrong: both writes should be present");
+    assert.ok(
+      storeAt < hookAt,
+      "the hook is written before the stored guard, so an interrupted install leaves a live hook with no guard",
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
