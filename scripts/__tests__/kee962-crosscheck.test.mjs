@@ -47,9 +47,11 @@
  *
  * FIXTURE RULES, learned the hard way. Every fixture asserts its precondition
  * before measuring, so a fixture that stops being the shape it claims fails
- * loudly instead of quietly measuring nothing. Nine such defects were found
- * across the probes behind this card, three of which produced clean-looking
- * wrong answers:
+ * loudly instead of quietly measuring nothing. Eleven such defects were found
+ * across the probes behind this card, four of which produced clean-looking
+ * wrong answers, and one of which -- defect 11, found in run 27d85309 -- cried
+ * wolf: it reported a hazard on a revision that did not have one. See saidFlat()
+ * below, and treat that as the reason to check the failures and not count them.
  *
  *   1. `sed > same-file` truncates its input first; the guard came out empty and
  *      the "downgrade" was really a missing file.
@@ -76,6 +78,17 @@
  *      under the ruling it failed on its own setup precondition and read as a
  *      broken product. Every fixture below now writes the stored guard DIRECTLY
  *      rather than asking the installer to perform the state under test.
+ *  10. `return` inside a `for` loop over relations aborted every relation after
+ *      the first, so a table test could report one passing arm and mean it as a
+ *      pass for all of them. Now `continue`; the loop runs every arm.
+ *  11. The one that cried wolf. Reason-assertions matched against the raw
+ *      output, but the installer hard-wraps its prose and where the wrap falls
+ *      is an accident of the message. On 6f99a78f0 "not being moved\nbackwards"
+ *      is split across a line, so the assertion failed on a message that is
+ *      correct -- reporting a hazard where the operator WAS told. It is the same
+ *      error this card is about, made by the test. saidFlat() now backs every
+ *      reason-assertion, and the failures on 6f99a78f0 went 5 -> 4 with the four
+ *      that remain all on genuine HAZARD assertions.
  */
 
 import assert from "node:assert/strict";
@@ -308,6 +321,29 @@ function said(result) {
   return `${result.stdout || ""}\n${result.stderr || ""}`;
 }
 
+/**
+ * The same thing, with runs of whitespace collapsed to single spaces.
+ *
+ * FIXTURE DEFECT 11, and the worst one in this file, because it is the only one
+ * that made this suite CRY WOLF: it reported a hazard that was not there.
+ *
+ * The installer hard-wraps its own prose, and where the wrap falls is an
+ * accident of the message text. On bc1ade2 this phrase is on one line; on
+ * 6f99a78f0 it is split:
+ *
+ *     so the fleet is not being moved\nbackwards. The copy the shim runs is
+ *
+ * So an assertion of /not being moved backwards/ PASSES on the ruling and FAILS
+ * on the older revision, for a message that is correct on both -- and the
+ * operator was told, out loud, exactly what happened. Attributing that to the
+ * product is the precise error this whole card is about: a measurement that
+ * reports a downgrade where there was none, with a confident clean failure
+ * message. Every reason-assertion must match against this, not against said().
+ */
+function saidFlat(result) {
+  return said(result).replace(/\s+/g, " ");
+}
+
 test("a lane behind the fleet cannot roll the stored guard back on a succeeding --install", (t) => {
   // The KEE-962 hazard, on the ordinary path. No --force, no refusing shim: the
   // checkout holds an OLDER guard, the fleet's newer one is in force, and the
@@ -328,7 +364,7 @@ test("a lane behind the fleet cannot roll the stored guard back on a succeeding 
       "HAZARD: the succeeding --install replaced the fleet-wide stored guard with an older copy");
     assert.match(said(result), /NOT replaced/,
       "the operator must be told the stored guard was left alone; silent success IS the hazard");
-    assert.match(said(result), /not being moved backwards/,
+    assert.match(saidFlat(result), /not being moved backwards/,
       "the message must say WHY it was left alone, not merely that it was");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -437,8 +473,8 @@ test("--force is the deliberate override, and it says what it replaced", (t) => 
   ]) {
     const { root, main } = makeFleet();
     try {
-      if (skipWithoutStamp(t, main)) return;
-    const { inForceVersion } = seedInForce(main);
+      if (skipWithoutStamp(t, main)) continue;
+      const { inForceVersion } = seedInForce(main);
       const guardFile = path.join(main, "scripts", "check-worktree-isolation.mjs");
       writeFileSync(guardFile, shape(guardIn(main), inForceVersion));
       assertRelation(main, name);
@@ -448,9 +484,9 @@ test("--force is the deliberate override, and it says what it replaced", (t) => 
 
       assert.equal(result.status, 0, result.stderr);
       assert.notEqual(storedGuard(main), before, `--force must be able to install a ${name} guard`);
-      assert.match(said(result), /--force/,
+      assert.match(saidFlat(result), /--force/,
         "--force must say it was a force; a quiet override is the hazard wearing a different hat");
-      assert.match(said(result), new RegExp(`version ${inForceVersion}`),
+      assert.match(saidFlat(result), new RegExp(`version ${inForceVersion}`),
         "--force must name the version that was in force, so the operator can read both");
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -472,8 +508,8 @@ test("every write of the stored guard goes through one decision, on every path",
   for (const [relation, shouldWrite] of Object.entries(writable)) {
     const { root, main } = makeFleet();
     try {
-      if (skipWithoutStamp(t, main)) return;
-    const { inForceVersion } = seedInForce(main);
+      if (skipWithoutStamp(t, main)) continue;
+      const { inForceVersion } = seedInForce(main);
       const guardFile = path.join(main, "scripts", "check-worktree-isolation.mjs");
       const shapes = {
         older: atVersion(guardIn(main), inForceVersion - 1),
