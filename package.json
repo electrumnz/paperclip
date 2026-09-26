@@ -49,6 +49,7 @@
     "install:worktree-isolation-hook": "node scripts/install-worktree-isolation-hook.mjs",
     "test:check-no-git-push": "node --test scripts/check-no-git-push.test.mjs",
     "test:check-worktree-isolation": "node --test scripts/__tests__/check-worktree-isolation.test.mjs",
+    "test:install-worktree-isolation-hook": "node --test scripts/__tests__/install-worktree-isolation-hook.test.mjs",
     "test:install-sh-docker": "./scripts/test-install-sh-docker.sh",
     "test:hermes-gateway-smoke": "node --test scripts/smoke/hermes-gateway-smoke.test.mjs",
     "docs:dev": "cd docs && npx mintlify dev",
