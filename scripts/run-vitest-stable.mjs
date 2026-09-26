@@ -26,15 +26,22 @@ const nonServerProjects = [
   "@paperclipai/adapter-utils",
   "@paperclipai/adapter-claude-local",
   "@paperclipai/adapter-codex-local",
+  "@paperclipai/adapter-cursor-cloud",
+  "@paperclipai/adapter-cursor-local",
+  "@paperclipai/adapter-gemini-local",
   "@paperclipai/adapter-grok-local",
+  "@paperclipai/adapter-kimi-local",
   "@paperclipai/adapter-openclaw-gateway",
   "@paperclipai/adapter-opencode-local",
+  "@paperclipai/adapter-pi-local",
   // Regression tests for the large-prompt transport (KEE-923) live here. This
   // array, not the root vitest.config.ts projects list, is what every CI lane
   // runs, so a project missing from here has its tests silently skipped in CI
   // while `pnpm exec vitest` still collects them locally. cursor-cloud,
-  // cursor-local, gemini-local, kimi-local and pi-local have the same gap;
-  // tracked separately, see the hermes entry in KEE-927.
+  // cursor-local, gemini-local, kimi-local and pi-local had the same gap;
+  // KEE-930 closed it, and the guard test in
+  // scripts/__tests__/run-vitest-stable-shard.test.mjs now fails on the next
+  // divergence between this array and the root projects list.
   "@paperclipai/hermes-paperclip-adapter",
   "@paperclipai/plugin-daytona",
   "@paperclipai/plugin-sdk",

@@ -55,6 +55,23 @@ vi.mock("./remote-command.js", async () => {
   };
 });
 
+// The sandbox client creates the workspace archive through the mocked `sh`
+// runner but extracts it with real `tar` (via runChildProcess), so the archive
+// must be genuine. Build it with the same real `tar` rather than a hand-rolled
+// ustar writer: this test already depends on the real binary for extraction, so
+// invoking it here adds no new dependency and keeps the fixture correct for any
+// archive shape a future change needs.
+async function buildWorkspaceTar(targetPath: string, sourceDir: string): Promise<void> {
+  await runChildProcess("cursor-build-workspace-tar", "tar", ["-cf", targetPath, "-C", sourceDir, "."], {
+    cwd: sourceDir,
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+    timeoutSec: 30,
+    graceSec: 5,
+    onLog: async () => {},
+    onSpawn: async () => {},
+  });
+}
+
 function buildFakeAgentScript(captureDir: string): string {
   return `#!/bin/sh
 cat > ${JSON.stringify(path.join(captureDir, "prompt.txt"))}
@@ -272,15 +289,56 @@ printf '%s\\n' '{"type":"result","subtype":"success","session_id":"cursor-sessio
       execute: async (input: { command: string; args?: string[]; env?: Record<string, string> }) => {
         runnerState.commands.push(input.command);
         if (input.command === "sh") {
+          // The sandbox client tars the remote workspace and then probes the
+          // resulting file's size with `wc -c` before reading it
+          // (command-managed-runtime.ts). This runner must actually create that
+          // tarball, otherwise the size probe has nothing to report and
+          // readFile throws "Could not determine remote file size". A blanket
+          // empty stdout here is what let that go unnoticed while this suite ran
+          // in no CI lane. Nested `sh -c` layers escape inner single quotes as
+          // '"'"', so unescape before matching the quoted paths.
+          const script = (input.args ?? []).join(" ").replaceAll("'\"'\"'", "'");
+          // Materialize the archive the script asks for, so the size probe below
+          // has a real file to report. The client tars the remote workspace
+          // directory, so archive that directory with the real tar binary.
+          const tarMatch = /tar -cf '([^']+)'/.exec(script);
+          if (tarMatch) {
+            const archivePath = tarMatch[1];
+            const workspaceRoot = archivePath.slice(0, archivePath.indexOf("/.paperclip-runtime"));
+            await fs.mkdir(path.dirname(archivePath), { recursive: true });
+            await buildWorkspaceTar(archivePath, workspaceRoot);
+          }
+          // Answer the `wc -c` size probe with the real byte count.
+          const sizeMatch = /wc -c < '([^']+)'/.exec(script);
+          let stdout = "";
+          if (sizeMatch) {
+            try {
+              stdout = `${(await fs.stat(sizeMatch[1])).size}\n`;
+            } catch {
+              stdout = "";
+            }
+          }
+          // Serve the chunked read that follows the size probe:
+          // `dd if='<path>' bs=<n> skip=0 count=1 | base64`.
+          const readMatch = /dd if='([^']+)' bs=(\d+) skip=(\d+)/.exec(script);
+          if (readMatch) {
+            try {
+              const contents = await fs.readFile(readMatch[1]);
+              const offset = Number(readMatch[3]) * Number(readMatch[2]);
+              stdout = `${contents.subarray(offset, offset + Number(readMatch[2])).toString("base64")}\n`;
+            } catch {
+              stdout = "";
+            }
+          }
           return {
             exitCode: 0,
-          signal: null,
-          timedOut: false,
-          stdout: "",
-          stderr: "",
-          pid: 555,
-          startedAt: new Date().toISOString(),
-        };
+            signal: null,
+            timedOut: false,
+            stdout,
+            stderr: "",
+            pid: 555,
+            startedAt: new Date().toISOString(),
+          };
         }
 
         return runChildProcess(`cursor-fresh-lease-${runnerState.commands.length}`, input.command, input.args ?? [], {
