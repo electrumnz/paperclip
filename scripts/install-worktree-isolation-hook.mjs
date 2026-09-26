@@ -1,0 +1,1063 @@
+#!/usr/bin/env node
+/**
+ * install-worktree-isolation-hook.mjs
+ *
+ * Installs check-worktree-isolation.mjs as a pre-commit hook.
+ *
+ * Why this exists (KEE-929): the guard is useless unless a commit actually runs
+ * it. A package.json script and a CI lane are both opt-in, so a contributor who
+ * never reads the README can still `git commit --amend` inside a worktree that
+ * another person owns, and the collision the guard exists to prevent happens
+ * anyway.
+ *
+ * Git cannot commit a hook from a repository, so this installs one into
+ * .git/hooks. It writes a small shim rather than copying the guard, so an
+ * update to the guard takes effect on the next commit with no re-install.
+ *
+ * The shim does NOT simply point at this worktree's copy of the guard. The
+ * guard only exists on branches that carry it, and on this host 118 of 119
+ * worktree HEADs do not have it -- including paperclip-kee-923, the worktree the
+ * whole card is about. A shim that resolved the guard from the committing
+ * checkout would therefore fail open on exactly the worktrees that need the
+ * guard most, which is the same "check that always passes" outcome as the
+ * version-1 bug. So the installer also stores a copy in the common git dir, and
+ * the shim prefers the STORED copy over the checkout's, falling back to the
+ * checkout only when the stored copy is absent.
+ *
+ * That order is the one that matters, and it was the other way round for a
+ * while. Preferring the checkout let a worktree whose own guard is an older
+ * revision decide its own commits, so a fixed or tightened guard sitting in the
+ * common dir was never consulted -- a stale, permissive guard won. The stored
+ * copy is refreshed on every run, so it is the copy that is current.
+ *
+ * Usage:
+ *   node scripts/install-worktree-isolation-hook.mjs            # install
+ *   node scripts/install-worktree-isolation-hook.mjs --check    # report only
+ *   node scripts/install-worktree-isolation-hook.mjs --uninstall
+ *   node scripts/install-worktree-isolation-hook.mjs --install --force
+ *                                                               # replace a shim that
+ *                                                               # is ours-shaped but not
+ *                                                               # this revision
+ *
+ * The hook is deliberately not unbypassable: `git commit --no-verify` still
+ * skips it. A hook that appears unbypassable teaches --no-verify as a habit,
+ * which is worse than an honest opt-out.
+ *
+ * The one thing the shim does insist on: if a seat identity is set and no guard
+ * can be found, the commit is REFUSED. A hook that can enforce nothing is
+ * indistinguishable from no hook, and reporting success while enforcing nothing
+ * is the failure this whole change exists to end. A human with no seat identity
+ * is not governed by the seat rule and is warned rather than blocked.
+ */
+
+import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { constants as fsConstants, accessSync as fsAccessSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import path from "node:path";
+import process from "node:process";
+import { fileURLToPath } from "node:url";
+
+const repoRoot = execFileSync("git", ["rev-parse", "--show-toplevel"], { encoding: "utf8" }).trim();
+const commonDir = execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], {
+  encoding: "utf8",
+}).trim();
+
+const hookPath = path.join(commonDir, "hooks", "pre-commit");
+
+// The copy the shim falls back to. It lives beside the hook, in the common git
+// dir, so every linked worktree of this repository reaches the same file and it
+// survives the removal of whichever worktree happened to run the installer.
+const storedGuardPath = path.join(commonDir, "hooks", "worktree-isolation-guard.mjs");
+
+// Path to the guard in this checkout, absolute and forward-slashed so the shim
+// works on every platform and does not depend on the hook's own cwd.
+const guardPath = path.join(repoRoot, "scripts", "check-worktree-isolation.mjs").split(path.sep).join("/");
+
+// The lane this shim was installed from. Recorded so the NO GUARD FOUND
+// message can name a checkout an operator can actually cd into: 56 of the 58
+// worktree HEADs on this host have no scripts/install-worktree-isolation-hook.mjs
+// at all, so "run scripts/install-worktree-isolation-hook.mjs" is advice the
+// blocked seat cannot follow. See the shim's refusal message.
+const installedFrom = repoRoot;
+
+const MARKER = "# installed by scripts/install-worktree-isolation-hook.mjs";
+
+/**
+ * Write a file atomically, or not at all.
+ *
+ * writeFileSync opens the target with O_TRUNC and then writes. If it is
+ * interrupted -- a full disk, a file-size limit, a kill -- the target is left
+ * truncated, and for the hook that means a shim ending mid-string. git runs it,
+ * the shell fails to parse it, prints "unexpected EOF", and then ALLOWS the
+ * commit: an interrupted reinstall does not just skip the guard, it installs a
+ * broken one that fails open.
+ *
+ * Reproduced with `ulimit -f 1`, which lets the truncate land and then fails
+ * the write: a 2751-byte live hook became 1024 bytes ending in
+ * `GUARD="${KEE_WORKTREE_ISOLATION_GUA`.
+ *
+ * So the content goes to a temporary file in the same directory, is chmodded
+ * there, and only then renamed over the target. rename(2) within a directory is
+ * atomic, so a reader sees either the old file or the new one, never a partial.
+ */
+function writeFileAtomic(target, content, mode) {
+  const staging = `${target}.tmp-${process.pid}`;
+  try {
+    writeFileSync(staging, content, { mode });
+    renameSync(staging, target);
+  } catch (error) {
+    rmSync(staging, { force: true });
+    throw error;
+  }
+}
+
+// The shim's first line and its last two lines. Both are identical in every
+// revision of this script, so they are what identifies a hook as ours: the
+// header says who wrote it, the terminator says where our block ends and
+// anything after it belongs to somebody else.
+//
+// The terminator deliberately has no trailing newline. Everything here is
+// compared against trimmed content, because the file on disk is written from
+// `shim` and a raw byte comparison would never match its own output.
+const HEADER = "#!/bin/sh\n# One seat owns one worktree.";
+const TERMINATOR = 'node "$GUARD" "$@"\nexit $?';
+const shim = `#!/bin/sh
+# One seat owns one worktree. See scripts/check-worktree-isolation.mjs.
+# Runs on every commit in every linked worktree of this repository.
+#
+${MARKER}
+#
+# Resolution order, in order of freshness:
+#   1. KEE_WORKTREE_ISOLATION_GUARD, for an explicit override
+#   2. the stored copy, which the installer keeps in step with the checkout it
+#      was installed from
+#   3. the copy in the checkout being committed to
+#
+# The stored copy is preferred over the checkout's on purpose. The other order
+# lets a worktree whose guard is an older revision decide the commit on its
+# own, so a fixed or tightened guard is not in force in that worktree, which is
+# the original failure of this card one level up. The installer refreshes the
+# stored copy on every run, so it is the one that is current.
+#
+# A checkout with no guard at all still works: 118 of 119 worktree HEADs here
+# do not carry the guard, and step 2 is what covers them.
+GUARD="\${KEE_WORKTREE_ISOLATION_GUARD:-}"
+if [ -z "$GUARD" ]; then
+  if [ -f "${storedGuardPath}" ]; then
+    GUARD="${storedGuardPath}"
+  else
+    TOPLEVEL=$(git rev-parse --show-toplevel 2>/dev/null) || TOPLEVEL=""
+    if [ -n "$TOPLEVEL" ] && [ -f "$TOPLEVEL/scripts/check-worktree-isolation.mjs" ]; then
+      GUARD="$TOPLEVEL/scripts/check-worktree-isolation.mjs"
+    fi
+  fi
+fi
+
+if [ -z "$GUARD" ]; then
+  # No guard to run. This is not allowed to be silent: a hook that exits 0
+  # having decided nothing is exactly the defect this card is about.
+  #
+  # Whether it exits 0 or not used to be a judgement call, and it was the wrong
+  # one. I chose exit 0 -- refusing every commit in a checkout that has never
+  # had the guard would look like a broken tool and be worked around with
+  # --no-verify within a day -- and put the decision to the KEE-943 review to be
+  # made by someone other than me. Two independent sources have now landed on
+  # the other side: the security review flagged the same thing as a P2, and the
+  # rationale is the stronger argument. A hook that cannot enforce anything is
+  # indistinguishable from no hook, and "it would be annoying" is a smaller
+  # concern than a guard that reports success while enforcing nothing -- which
+  # is the failure this whole card exists to end. The honest repair for an
+  # absent guard is to install it, and the message says exactly that.
+  #
+  # Failing closed, though, has to mean "closed against a real hazard", not
+  # "closed against everything". The guard itself allows a clean primary
+  # checkout and anything outside the issue-worktree root: there is no
+  # worktree-ownership violation possible from either, so there is nothing for
+  # the guard to catch. An earlier revision refused those anyway (review finding,
+  # 11:36), which blocked a seat from committing in the reference checkout
+  # while telling it to install a guard that has no bearing on that directory.
+  # A check that blocks where it cannot be violated is a broken check.
+  #
+  # So the question the missing guard would have answered -- "is this a worktree
+  # this control governs?" -- is asked here instead, using the same two facts the
+  # guard uses. It is asked before refusing, and only for the case it is for.
+  # This has to agree with the guard's own resolution of the root, or the shim
+  # decides the guard would not have cared while the guard would have. The guard
+  # reads KEE_WORKTREE_ROOT with a fallback to a default literal, so an EMPTY
+  # variable means "use the default", not "there is no root" -- and this branch
+  # is only reached when there is no guard, so the guard's own source is not
+  # available to ask. Measured: with the variable set to the empty string, a
+  # first version of this block skipped every commit as "no root", which is the
+  # opposite of what the guard does with the same value.
+  KEE_ROOT="\${KEE_WORKTREE_ROOT:-/home/love4vengeance/Work/keece-issue-worktrees}"
+  NEEDS_CHECK=0
+  if [ -n "\${PAPERCLIP_AGENT_ID:-}" ] && [ -d "$KEE_ROOT" ]; then
+    TOPLEVEL_NG=$(git rev-parse --show-toplevel 2>/dev/null) || TOPLEVEL_NG=""
+    if [ -n "$TOPLEVEL_NG" ]; then
+      TOPLEVEL_NG=$(CDPATH= cd -- "$TOPLEVEL_NG" 2>/dev/null && pwd -P) || TOPLEVEL_NG=""
+      ROOT_NG=$(CDPATH= cd -- "$KEE_ROOT" 2>/dev/null && pwd -P) || ROOT_NG=""
+      if [ -n "$TOPLEVEL_NG" ] && [ -n "$ROOT_NG" ]; then
+        case "$TOPLEVEL_NG/" in
+          "$ROOT_NG"/*) NEEDS_CHECK=1 ;;
+        esac
+      fi
+    fi
+  fi
+
+  if [ "$NEEDS_CHECK" -eq 0 ]; then
+    echo "check-worktree-isolation: NO GUARD FOUND, but nothing here is governed by it." >&2
+    echo "  cwd:        $(pwd)"
+    echo "  expected at: ${storedGuardPath}"
+    if [ -n "\${PAPERCLIP_AGENT_ID:-}" ]; then
+      echo "  A seat identity is set, but this directory is not an issue worktree, so there is no" >&2
+      echo "  cross-seat commit to catch here. The commit is allowed. Seat isolation is NOT" >&2
+      echo "  being enforced in this repository; a seat committing into an issue worktree will" >&2
+      echo "  be refused until the guard is installed. From a checkout that carries the installer:" >&2
+      echo "    cd \${installedFrom} && node scripts/install-worktree-isolation-hook.mjs" >&2
+    else
+      echo "  No seat identity is set either, so this is not a seat commit. The commit is" >&2
+      echo "  allowed. Every seat commit in an issue worktree will be refused until the guard" >&2
+      echo "  is installed. From a checkout that carries the installer:" >&2
+      echo "    cd \${installedFrom} && node scripts/install-worktree-isolation-hook.mjs" >&2
+    fi
+    exit 0
+  fi
+
+  if [ -n "\${PAPERCLIP_AGENT_ID:-}" ]; then
+    echo "check-worktree-isolation: NO GUARD FOUND, refusing the commit." >&2
+    echo "  A seat identity is set (\${PAPERCLIP_AGENT_ID%%-*}) and this IS an issue worktree, so" >&2
+    echo "  this commit must be checked, and there is no guard to check it with. Refusing rather" >&2
+    echo "  than allowing it unchecked." >&2
+    echo "  expected at: ${storedGuardPath}" >&2
+    echo "" >&2
+    echo "  This checkout has no installer, so the fix cannot be run from here. An operator has to" >&2
+    echo "  install the guard into this repository's shared hooks directory, from a checkout that" >&2
+    echo "  carries it:" >&2
+    echo "" >&2
+    echo "    cd ${installedFrom}" >&2
+    echo "    node scripts/install-worktree-isolation-hook.mjs" >&2
+    echo "" >&2
+    echo "  That writes the shared guard once and every worktree of this repository is covered," >&2
+    echo "  including this one. If ${installedFrom} is gone, install from whichever lane currently" >&2
+    echo "  has scripts/install-worktree-isolation-hook.mjs." >&2
+    exit 2
+  fi
+  echo "check-worktree-isolation: NO GUARD FOUND, seat isolation is NOT being enforced." >&2
+  echo "  cwd:         $(pwd)" >&2
+  echo "  expected at: ${storedGuardPath}" >&2
+  echo "  No seat identity is set, so this is not a seat commit and is allowed. Every seat" >&2
+  echo "  commit in an issue worktree will be refused until the guard is installed." >&2
+  echo "  From a checkout that carries the installer:" >&2
+  echo "    cd ${installedFrom} && node scripts/install-worktree-isolation-hook.mjs" >&2
+  exit 0
+fi
+
+node "$GUARD" "\$@"
+exit \$?
+`;
+
+const mode = process.argv[2] || "--install";
+const force = process.argv.includes("--force");
+const current = existsSync(hookPath) ? readFileSync(hookPath, "utf8") : null;
+const installed = current !== null && current.includes(MARKER);
+
+// Where git will actually look for hooks. If core.hooksPath is set, the
+// common .git/hooks directory is not consulted at all, so writing a hook there
+// looks like success and enforces nothing. That is a false "installed", and it
+// was found in review: with core.hooksPath pointing elsewhere, a cross-seat
+// commit landed while the installer reported the hook installed.
+let hooksPath = null;
+try {
+  hooksPath = execFileSync("git", ["config", "--get", "core.hooksPath"], { encoding: "utf8" }).trim() || null;
+} catch {
+  hooksPath = null;
+}
+if (hooksPath) {
+  const expected = path.join(commonDir, "hooks");
+  // A RELATIVE core.hooksPath is resolved by git against the directory of the
+  // repository the commit is happening in, not against the installing checkout.
+  // A linked worktree's .git is a file rather than a directory, so a relative
+  // path that is correct from the primary checkout resolves somewhere else --
+  // usually nowhere -- from a linked worktree. Accepting it here reported
+  // success while the guard ran in no worktree at all.
+  //
+  // So the value is resolved the way git will resolve it, in the worst case
+  // there is, and refused if it is not the common hooks dir from there too.
+  if (!path.isAbsolute(hooksPath)) {
+    process.stderr.write(
+      `install-worktree-isolation-hook: core.hooksPath is set to the relative path\n` +
+        `${hooksPath}. Git resolves a relative core.hooksPath against each committing\n` +
+        `repository, and in a linked worktree .git is a file, not a directory, so the\n` +
+        `path does not resolve to the same place. Git would not run a hook written to\n` +
+        `the common .git/hooks, so installing there would report success and enforce\n` +
+        `nothing in the very worktrees the guard exists for.\n` +
+        `Unset core.hooksPath, or set it to the absolute path ${expected}, and run this again.\n`,
+    );
+    process.exit(1);
+  }
+  const resolved = path.resolve(hooksPath);
+  if (path.resolve(resolved) !== expected) {
+    process.stderr.write(
+      `install-worktree-isolation-hook: core.hooksPath is set to ${hooksPath}, which is not\n` +
+        `the repository's hooks directory (${expected}). Git will not run a hook written to\n` +
+        `the common .git/hooks, so installing there would report success and enforce nothing.\n` +
+        `Point core.hooksPath at ${expected}, or unset it, and run this again.\n`,
+    );
+    process.exit(1);
+  }
+}
+
+// git runs a hook only if it is executable. A hook that lost its bit is
+// reported installed by a marker check alone, and is silently inert.
+function hookIsRunnable(file) {
+  if (!existsSync(file)) return false;
+  try {
+    fsAccessSync(file, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sha1(text) {
+  return createHash("sha1").update(text).digest("hex").slice(0, 8);
+}
+
+/**
+ * The part of an on-disk hook that is ours, normalised the same way `shim` is
+ * compared.
+ *
+ * One definition, used by --check, --uninstall and --install, because those
+ * three have to agree about what "our block" is. They did not before: --check
+ * tested marker provenance and the other two sliced at the terminator, which
+ * is how --check could say "installed" about a file the installer would refuse
+ * to touch. Splitting on the terminator rather than on a line count matters
+ * for the same reason it matters in the install path: an older revision may be
+ * longer or shorter than the new one.
+ */
+function shimBlock(onDisk) {
+  const trimmed = onDisk.trimEnd();
+  const at = trimmed.indexOf(TERMINATOR);
+  return at === -1 ? trimmed : trimmed.slice(0, at + TERMINATOR.length).trim();
+}
+
+/**
+ * Copy this checkout's guard over the stored one, through a staging file.
+ *
+ * One definition for both the install and the re-install path, because the two
+ * were doing the same two lines by hand and the refusal path needs the same
+ * guarantee: a copy that is interrupted must not leave a truncated guard that
+ * node fails to parse, which is a guard that errors rather than one that runs.
+ */
+function refreshStoredGuard() {
+  const staging = `${storedGuardPath}.tmp-${process.pid}`;
+  try {
+    copyFileSync(guardPath, staging);
+    renameSync(staging, storedGuardPath);
+  } catch (error) {
+    rmSync(staging, { force: true });
+    throw error;
+  }
+}
+
+/**
+ * The guard's version, read from a single line the guard itself carries.
+ *
+ * This exists because of a measurement, not a hunch. The installer could only
+ * ever prove "same" or "differs" between two guards, never which was newer, so
+ * every decision about replacing a fleet-wide guard had to be made by refusing
+ * (KEE-958) and the refusal left a stale guard enforcing (the security review's
+ * P1 on edff2335d). Both directions of that switch were wrong, because the
+ * thing being decided -- "is this guard newer?" -- was not decidable at all.
+ *
+ * A single monotonic integer on its own line makes it decidable: the guard with
+ * the higher number is the newer one, whoever is standing where. It is
+ * deliberately the only ordering signal, and it is deliberately simple, because
+ * a cleverer scheme would be another thing that can be wrong in a new way.
+ *
+ * A guard with no version, or an unparseable one, reads as 0. That is the
+ * honest answer: an unversioned guard predates versioning, so it cannot be
+ * newer than anything, and treating it as newest would be how an old guard
+ * takes a fleet over.
+ */
+// The guard's own file header, where the version lives inside the block comment.
+// It is matched inside a JSDoc block rather than as a bare `#` line because a
+// bare `#` between the shebang and the block is a syntax error under node's
+// module rules: stamping the guard for orderability would have made it
+// unrunnable. The bare form is accepted too so an operator can move the stamp
+// to a line comment without silently dropping the fleet to version 0.
+const GUARD_VERSION_RE = /^[ \t]*(?:\*[ \t]*)?#?[ \t]*worktree-isolation-guard-version:[ \t]*(\d+)[ \t]*$/m;
+
+function guardVersionOf(text) {
+  const match = GUARD_VERSION_RE.exec(text);
+  return match ? Number.parseInt(match[1], 10) : 0;
+}
+
+/**
+ * THE RULE, in one place, for every write of the stored guard.
+ *
+ * The question, stated once so it is answered once: on a succeeding --install,
+ * which relations may replace a guard that is already in force?
+ *
+ *   absent          -> write.  Nothing to lose.
+ *   same            -> write.  Byte-identical; the claim is trivially true.
+ *   no-checkout-copy-> write.  There is no other guard to compare against.
+ *   newer           -> write.  A guard that positively declares a higher
+ *                      version is the one to publish, whoever is standing
+ *                      where.
+ *   older           -> WITHHELD.  A positive downgrade claim, refused.
+ *   differs         -> WITHHELD.  Two guards, same version, different bytes:
+ *                      somebody hand-edited one and the installer cannot tell
+ *                      which was intended.
+ *   UNSTAMPED (this
+ *   checkout's guard
+ *   declares nothing) -> WITHHELD, unless --force.
+ *
+ * The last row is the ruling (KEE-966), and it is the one this card is about.
+ * Measured on 6f99a78f0: a fleet guard at version 2 in force, a lane whose
+ * guard carried no version stamp at all, an ordinary succeeding --install:
+ *
+ *   6f99a78f0 UNSTAMPED lane vs stamped v2 fleet : stored 4c5ec6c1 -> b9a83f1b exit=0
+ *     *** FLEET GUARD ROLLED BACK -- the unstamped lane copy took over ***
+ *
+ * The prior code treated "no version" as "unmeasured, therefore not older" and
+ * installed it, loudly, on the strength of --install. That honours the
+ * operator's intent and is exactly the hole: an unstamped copy carries no
+ * ordering information at all, so a lane holding a stale hand-written or
+ * vendored guard can replace a newer stamped one across every worktree in the
+ * repository, and the only warning is a line in the output of the one run that
+ * did it.
+ *
+ * The rule is about CLAIMS, not measurements. A guard that declares a lower
+ * version is a downgrade and is refused. A guard that declares nothing has made
+ * no claim, and no claim is not authority to move the fleet backwards: a
+ * measured guard in force is a stronger position than an unmeasured one
+ * offered in its place, and an unmeasured copy cannot earn the fleet on the
+ * strength of the run asking for it.
+ *
+ * The cost is real and is the reason this needs saying out loud. A legitimate
+ * hand-written or vendored guard can no longer take over on an ordinary run.
+ * That is the intended behaviour change, and the escape hatch is the same one
+ * the rest of this installer uses for a state it cannot read: --force, which
+ * the operator reaches for deliberately, having been told what is in force and
+ * what would replace it.
+ *
+ * --force overrides the withholding in all three of them -- `older`, `differs`
+ * and `unstamped` -- and that is not a special case bolted on for one relation.
+ * The refusal message for `older` ends by naming --force, and the one for
+ * `unstamped` ends by printing the exact --install --force command. Scoping the
+ * override to a subset would leave those messages promising a command that does
+ * nothing, which is the false-success shape this file exists to end. The
+ * `differs` message names no override: it says to read both files and either
+ * delete the stored copy or leave it, which is still true advice, and --force
+ * resolves that state too for an operator who has read both.
+ *
+ * That is a promise about every call site, not about this function, and it was
+ * false for one of them for as long as the override was documented: the
+ * fresh-install call site did not forward `force`, so a refusal naming
+ * --install --force could name a command that did nothing on its first run
+ * (KEE-993). All three call sites now pass the flag through, and the
+ * fresh-install one prints what it actually did, so the messages and the
+ * behaviour are the same thing.
+ */
+function decideStoredGuardWrite(relation, options = {}) {
+  const { force = false } = options;
+  if (relation === "absent" || relation === "same" || relation === "no-checkout-copy") {
+    return { write: true, reason: relation };
+  }
+  if (relation === "newer") return { write: true, reason: "newer" };
+  // Everything else is a state the installer cannot order, or has ordered and
+  // found wanting: `older` is a measured downgrade, `differs` and `unstamped`
+  // are undecidable. An ordinary --install does not write in any of them.
+  //
+  // What --force does NOT do is write quietly. Every override says what it
+  // replaced and what it replaced it with, because the hazard was never the
+  // deliberate run -- it was the ordinary one, exit 0, no warning.
+  if (force) return { write: true, reason: `${relation}-forced` };
+  return { write: false, reason: relation };
+}
+
+/**
+ * Put this checkout's guard in force, unless doing so would move the fleet
+ * backwards -- and say plainly which of those two happened.
+ *
+ * Every write goes through here. There used to be two write paths: this
+ * function, and an inline re-implementation of the same rule on the refusing
+ * path. They disagreed -- on the same state, the succeeding path let a
+ * hand-edited guard take over while the refusing path withheld it -- and a rule
+ * that exists in two places is a rule that will be changed in one of them.
+ *
+ * It also REPORTS whether it wrote, and why, so a caller that prints its own
+ * success lines afterwards cannot claim something this call declined to do.
+ * That return value is what stops a run which withheld here from also printing
+ * "guard: stored at" three lines below a refusal that says "NOT replaced" --
+ * two contradictory claims about one state, on one run, exit 0 (KEE-993).
+ * `write` is the same decision decideStoredGuardWrite() made, not a second
+ * opinion about it, and `reason` is that decision's reason, so a caller can
+ * report a refusal or an override without re-deriving either.
+ */
+function guardRefreshOutcome(options = {}) {
+  const relation = storedGuardRelation();
+  const decision = decideStoredGuardWrite(relation, options);
+  if (!decision.write) {
+    reportGuardWithheld(relation, decision);
+    return { write: false, reason: decision.reason, relation };
+  }
+  // Read the version that is in force BEFORE the write, because after the write
+  // this path reports the guard that is now in place and the message would name
+  // the unstamped copy's own zero as the version it replaced. Read it only when
+  // there is a stored guard to read: on a fresh install there is none, and
+  // readFileSync on a missing path throws.
+  const guardVersionInForce = existsSync(storedGuardPath)
+    ? guardVersionOf(readFileSync(storedGuardPath, "utf8"))
+    : 0;
+  refreshStoredGuard();
+  if (decision.reason.endsWith("-forced")) {
+    process.stdout.write(
+      `worktree isolation guard: refreshed at ${storedGuardPath}\n` +
+        `  --force: this checkout's guard ${describeRelation(relation)} the one that was in force\n` +
+        `  (version ${guardVersionInForce}), so this run is publishing it anyway. Every commit in this\n` +
+        `  repository now runs this checkout's copy, not the one it replaced. --force is the\n` +
+        `  deliberate override; what it must never be is the way a downgrade happens quietly.\n`,
+    );
+    return { write: true, reason: decision.reason, relation };
+  }
+  process.stdout.write(`worktree isolation guard: refreshed at ${storedGuardPath}\n`);
+  return { write: true, reason: decision.reason, relation };
+}
+
+/**
+ * How a relation reads inside a sentence meant for a person.
+ *
+ * These strings are operator-facing, so "differs" does not appear in one. A
+ * guard that declares no version and a guard that was hand-edited are both
+ * things an operator needs named plainly, because the action each one calls
+ * for is different.
+ */
+function describeRelation(relation) {
+  if (relation === "older") return "is an OLDER revision of";
+  if (relation === "differs") return "carries different content from";
+  if (relation === "unstamped") return "carries no version stamp, so cannot be ordered against";
+  return `is in the ${relation} state relative to`;
+}
+
+/**
+ * Explain a write that was not performed.
+ *
+ * Silence is the defect this whole card is against, so every withheld case
+ * names both files and says which one the shim runs. The operator can only
+ * act on a state they were told about.
+ */
+function reportGuardWithheld(relation, decision) {
+  const storedText = readFileSync(storedGuardPath, "utf8");
+  const checkoutText = readFileSync(guardPath, "utf8");
+  const storedVersion = guardVersionOf(storedText);
+  const checkoutVersion = guardVersionOf(checkoutText);
+
+  if (decision.reason === "unstamped") {
+    process.stdout.write(
+      `worktree isolation guard: NOT replaced. This checkout's guard carries no version stamp,\n` +
+        `so it cannot be ordered against the copy in force (version ${storedVersion}). A guard that\n` +
+        `makes no claim is not a claim that the fleet should move onto it, and an unmeasured copy\n` +
+        `in one lane is not authority for every lane, so the stored copy is left alone:\n` +
+        `  ${storedGuardPath}\n` +
+        `That is the one the shim runs. If this checkout's guard is the one you want in force --\n` +
+        `because it is newer and simply was never stamped, or because you wrote it yourself --\n` +
+        `then stamp it and re-run, or install it deliberately:\n` +
+        `  node scripts/install-worktree-isolation-hook.mjs --install --force\n`,
+    );
+    return;
+  }
+
+  if (decision.reason === "differs") {
+    process.stdout.write(
+      `worktree isolation guard: NOT replaced. This checkout's guard and the one in force are both\n` +
+        `at version ${storedVersion} but differ in content, so one of them was hand-edited and the\n` +
+        `installer cannot tell which was intended. Refusing to guess between them. The stored copy\n` +
+        `is the one in force:\n` +
+        `  ${storedGuardPath}\n` +
+        `Read both, then either delete the stored copy to take this checkout's, or leave it.\n`,
+    );
+    return;
+  }
+
+  process.stdout.write(
+    `worktree isolation guard: NOT replaced. This checkout's guard is version ${checkoutVersion} and\n` +
+      `version ${storedVersion} is already in force, so the fleet is not being moved backwards. The\n` +
+      `copy the shim runs is unchanged: ${storedGuardPath}\n` +
+      `To install this checkout's guard anyway, having read both, use --force.\n`,
+  );
+}
+
+/**
+ * Order this checkout's guard against the stored one.
+ *
+ * "newer" and "older" are the whole point: the two states that make a decision
+ * safe. "same" and "differs" are what the installer could see before, and acting
+ * on "differs" without being able to order it is exactly what turned a refresh
+ * into a downgrade on the refusal path.
+ *
+ * "unstamped" is separate from "older" on purpose, and this is the only place
+ * that can tell them apart. guardVersionOf() reads a guard with no version
+ * stamp as 0, so a checkout guard that declares nothing and a checkout guard
+ * that positively declares a lower version both come out of a bare comparison
+ * as "older". They are the same NUMBER and they are not the same STATE: one
+ * made a claim the fleet can read, the other made no claim at all, and they
+ * have different correct answers. Collapsing them here is what let an
+ * unmeasured copy displace a measured one while the code believed it was
+ * refusing a downgrade (KEE-966).
+ */
+function storedGuardRelation() {
+  if (!existsSync(storedGuardPath)) return "absent";
+  if (!existsSync(guardPath)) return "no-checkout-copy";
+  const stored = readFileSync(storedGuardPath, "utf8");
+  const checkout = readFileSync(guardPath, "utf8");
+  if (stored === checkout) return "same";
+  const storedVersion = guardVersionOf(stored);
+  const checkoutVersion = guardVersionOf(checkout);
+  if (checkoutVersion > storedVersion) return "newer";
+  // Checked BEFORE the numeric comparison, and not folded into it. A stored
+  // guard with no stamp is never "older" than anything either -- it is in
+  // force, unmeasured, and nothing is being asked about it, because a
+  // comparison that cannot be decided leaves the status quo alone.
+  if (checkoutVersion === 0) return "unstamped";
+  if (checkoutVersion < storedVersion) return "older";
+  return "differs";
+}
+
+/**
+ * Copy the hook that is about to be replaced to a timestamped sibling, so
+ * replacing it is reversible.
+ *
+ * --force overwrites a hook this script did not write in a state it cannot
+ * verify, and it used to do that with no record of the previous content. The
+ * operator is told "anything hand-edited into that file is being discarded",
+ * which is accurate and useless: the edit is gone, it was never shown, and
+ * there is no way to get it back. Measured: an operator's check inserted
+ * inside our block, one --force run, zero copies of it left anywhere.
+ *
+ * The backup is a plain file next to the hook, in the same directory, named for
+ * the revision being replaced -- which is the installing lane's HEAD, the lane the
+ * operator is standing in, and not necessarily the revision that produced the
+ * outgoing hook. The timestamp makes each name unique regardless, and what the
+ * name is for is to be recognisable to an operator, not to identify a
+ * provenance the script cannot actually establish. This host already carries
+ * one from a hand repair -- pre-commit.pre-1023ffe31.20260926T064339Z.bak --
+ * so the convention is the one an operator here will already recognise.
+ *
+ * It is a copy, not a rename: the rename onto the live hook is the atomic step
+ * that makes the replacement safe, and a failed copy must not take the working
+ * hook with it. A missing hook means there is nothing to preserve, so there is
+ * nothing to back up.
+ */
+function backupHook() {
+  if (!existsSync(hookPath)) return null;
+  let stamp;
+  let rev;
+  try {
+    stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "Z");
+  } catch {
+    stamp = "unknown-time";
+  }
+  try {
+    rev = execFileSync("git", ["rev-parse", "--short=9", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).trim();
+  } catch {
+    rev = "unknown-rev";
+  }
+  const target = `${hookPath}.pre-${rev}.${stamp}.bak`;
+  try {
+    copyFileSync(hookPath, target);
+    return target;
+  } catch (error) {
+    // A backup that cannot be written is not a reason to refuse an install the
+    // operator asked for, but it is a reason to say so loudly: the replacement
+    // is about to become irreversible, and silence about that is the defect
+    // this function exists to remove.
+    process.stderr.write(
+      `install-worktree-isolation-hook: WARNING: could not back up ${hookPath} to ${target}\n` +
+        `  (${error.message})\n` +
+        `  The replacement below is still going ahead, and will not be reversible.\n`,
+    );
+    return null;
+  }
+}
+
+if (mode === "--check") {
+  const problems = [];
+  if (!installed) {
+    process.stdout.write(`worktree isolation hook: NOT installed (${hookPath})\n`);
+    process.exit(1);
+  }
+  if (!existsSync(storedGuardPath)) {
+    problems.push(`no stored guard at ${storedGuardPath}; commits fall back to the checkout's copy`);
+  }
+  if (!hookIsRunnable(hookPath)) {
+    problems.push(`${hookPath} is not executable, so git will skip it`);
+  }
+
+  // Is the shim the revision this script would write? --check is the supported
+  // health command, and the whole point of it is to say what will actually run.
+  //
+  // It used to answer "is a file carrying our marker here", which is provenance:
+  // it is true of the copy a previous revision wrote, and of a hand-edited one.
+  // The re-install refusal guarantees the condition -- it refuses precisely
+  // when the body is not this revision's -- so a host can be permanently
+  // stranded on a shim this guard has fixed, and --check said "installed" and
+  // exited 0 about it. Measured before this fix: --check exit 0 against a shim
+  // from before the stored-guard fallback existed, while --install on the same
+  // host exited 1. The health command and the installer disagreed about the
+  // same file, and only the installer was right.
+  //
+  // So --check runs the same comparison the installer runs (shimBody below) and
+  // reports it. Compared on the block up to the terminator, so a check somebody
+  // appended after our block is not reported as a revision problem: that is a
+  // foreign addition this script is supposed to keep, and the installer keeps
+  // it too.
+  const block = shimBlock(current);
+  if (block !== shim.trimEnd()) {
+    problems.push(
+      `${hookPath} is not the revision this script would write, so a fixed shim would not reach\n` +
+        `  this host and --install will refuse to guess. Read the file, then either remove it\n` +
+        `  (rm ${hookPath}) if it is unmodified and simply old, or install over it deliberately:\n` +
+        `  node scripts/install-worktree-isolation-hook.mjs --install --force`,
+    );
+  }
+
+  // Which guard is actually in force, and is it the one this checkout has? The
+  // shim prefers the STORED copy, because the checkout's copy only exists in
+  // the lanes that carry it. But the two have different freshness: the
+  // checkout's is refreshed by git pull on every merge, the stored one only
+  // when an operator re-runs the installer. So the preference is systematically
+  // for the staler of the two, silently.
+  //
+  // Measured before this fix: appending a revision to the checkout's guard
+  // without re-running the installer left stored sha1 9a015171 against checkout
+  // f742cfbb, and --check exited 0 without mentioning either. Nothing in the
+  // command's output distinguished a fleet running the guard in force from one
+  // running a different guard than its own checkout says it should.
+  //
+  // This is a warning, not a refusal to run: the shim's resolution order is
+  // deliberate, and an operator may be running a newer guard from a lane than
+  // the one they happen to be standing in. So it names both, says which one
+  // wins, and names the command that makes them agree. It deliberately does NOT
+  // resolve the difference for you, because it cannot tell which of two
+  // differing guards is the newer one, and a guard is fleet-wide when it is
+  // stored: the refusing install path refreshes that copy only when it already
+  // matches this checkout, for the same reason.
+  if (existsSync(storedGuardPath) && existsSync(guardPath)) {
+    const stored = readFileSync(storedGuardPath, "utf8");
+    const checkoutCopy = readFileSync(guardPath, "utf8");
+    if (stored !== checkoutCopy) {
+      problems.push(
+        `the stored guard ${storedGuardPath} is not the same content as this checkout's\n` +
+          `  ${guardPath}, and the shim runs the STORED one on every commit. The stored copy is\n` +
+          `  only refreshed when the installer is re-run, so it is the staler of the two by\n` +
+          `  default. stored sha1 ${sha1(stored)} vs checkout sha1 ${sha1(checkoutCopy)}.\n` +
+          `  Re-run node scripts/install-worktree-isolation-hook.mjs from whichever lane's guard\n` +
+          `  you want in force, or point KEE_WORKTREE_ISOLATION_GUARD at a specific file.`,
+      );
+    }
+  }
+
+  if (problems.length > 0) {
+    for (const problem of problems) process.stderr.write(`install-worktree-isolation-hook: ${problem}\n`);
+    process.exit(1);
+  }
+  process.stdout.write(`worktree isolation hook: installed at ${hookPath} (guard ${storedGuardPath})\n`);
+  process.exit(0);
+}
+
+if (mode === "--uninstall") {
+  if (!installed) {
+    process.stdout.write("worktree isolation hook: nothing to remove\n");
+    process.exit(0);
+  }
+  // Only remove what this script wrote. If somebody appended another check to
+  // the same file, deleting it would silently drop their check from every
+  // worktree in this repository. Remove this script's block, identified by the
+  // header it starts with and the terminator it ends with, and leave the rest.
+  const ours = shim.trimEnd();
+  const onDisk = current.trimEnd();
+  if (onDisk.startsWith(HEADER) && onDisk.includes(TERMINATOR)) {
+    const remainder = onDisk.slice(onDisk.indexOf(TERMINATOR) + TERMINATOR.length).trim();
+    if (remainder.length === 0) {
+      rmSync(hookPath);
+    } else {
+      process.stderr.write(
+        `install-worktree-isolation-hook: ${hookPath} also contains content this script did not\n` +
+          `write. Removing only the worktree isolation block and leaving the rest in place.\n`,
+      );
+      writeFileAtomic(hookPath, `${remainder}\n`, 0o755);
+    }
+  } else {
+    process.stderr.write(
+      `install-worktree-isolation-hook: ${hookPath} carries the marker but is not the block this\n` +
+        `script writes. Refusing to remove it, so an edited hook is not deleted.\n`,
+    );
+    process.exit(1);
+  }
+  rmSync(storedGuardPath, { force: true });
+  process.stdout.write(`worktree isolation hook: removed from ${hookPath}\n`);
+  process.exit(0);
+}
+
+if (mode !== "--install") {
+  process.stderr.write("Usage: install-worktree-isolation-hook.mjs [--install|--check|--uninstall]\n");
+  process.exit(2);
+}
+
+// Do not clobber a hook somebody else wrote. A pre-commit hook that already
+// exists and is not ours may be doing something important, and overwriting it
+// would be a worse failure than a missing guard.
+if (current !== null && !installed) {
+  process.stderr.write(
+    `install-worktree-isolation-hook: ${hookPath} already exists and was not installed by this script.\n` +
+      `Refusing to overwrite it. Merge the two hooks by hand, or move it aside first.\n`,
+  );
+  process.exit(1);
+}
+
+if (!existsSync(guardPath)) {
+  process.stderr.write(
+    `install-worktree-isolation-hook: no guard at ${guardPath}.\n` +
+      `Nothing to store. Run this from a checkout that has scripts/check-worktree-isolation.mjs.\n`,
+  );
+  process.exit(1);
+}
+
+if (installed) {
+  // Re-install rather than skip. Both halves are refreshed: the stored guard,
+  // and the shim itself. Refreshing only the guard meant that after the shim
+  // was fixed, every host that had an older shim installed kept running it --
+  // the fixed installer never reached the live hook. That is the same
+  // "the code that runs is not the code I fixed" defect as the guard itself.
+  //
+  // Normalise trailing whitespace: the file on disk was written from `shim`,
+  // which ends in a newline, so comparing raw would never match its own output
+  // and an up-to-date hook would be rewritten on every run.
+  const ours = shim.trimEnd();
+  const onDisk = current.trimEnd();
+  if (onDisk === ours) {
+    process.stdout.write(
+      `worktree isolation hook: already installed at ${hookPath} and already current\n`,
+    );
+  } else if (onDisk.startsWith(HEADER)) {
+    // Ours, but an older revision of ours. Replace it wholesale. The boundary
+    // is the shim's own last two lines, which are the same in every revision
+    // and are the only thing this script emits. Anything after them is somebody
+    // else's and is kept. Splitting on that terminator rather than on a line
+    // count matters: the old revision may be longer or shorter than the new
+    // one, and a count taken from the new shim would slice into a foreign check
+    // or keep a tail of the stale shim.
+    const at = onDisk.indexOf(TERMINATOR);
+    const remainder = (at === -1 ? onDisk : onDisk.slice(at + TERMINATOR.length)).trim();
+
+    // "Ours, but not the revision we would write" is also what an operator's
+    // hand-edit looks like. They add a check to the shim and leave the header
+    // and terminator in place, so the boundary test above cannot tell the two
+    // apart: an edit AFTER the terminator looks like ours-with-a-remainder, and
+    // an edit INSIDE our block looks like a plain stale shim. Replacing the
+    // body then discards their work silently, in a branch whose stated intent
+    // is to leave an edited hook alone -- and reinstall printed "outdated shim
+    // replaced" and exited 0 while it did it. Both shapes were reproduced.
+    //
+    // The two cases pull in opposite directions and neither is safe to
+    // automate:
+    //
+    //   - Replacing is right when the file is an unmodified older revision. It
+    //     is what makes a fixed shim actually reach a host, which is the whole
+    //     point of re-installing, and the earlier revision of this branch did
+    //     exactly that with no complaints.
+    //   - Refusing is right when the file is somebody's edited copy. The edit
+    //     is unrecoverable, and the previous behaviour destroyed it silently.
+    //
+    // They are the same observation, so the installer cannot tell them apart,
+    // and guessing either way produces a false success: guessing "replace"
+    // destroys a local check, guessing "refuse" strands a fleet on a known-bad
+    // shim and calls it current.
+    //
+    // The resolution is a VERSION the shim carries, so a stale file can be
+    // recognised as stale without trusting its body. Anything that identifies
+    // as an older revision of this script AND whose body still matches what
+    // that revision wrote can be replaced automatically, because nothing was
+    // edited. Without a version marker that is unknowable, so the safe
+    // default stands: refuse, name both states, and say the one command that
+    // resolves it. `--force` is the deliberate override for an operator who
+    // has looked at the file and wants the new shim.
+    const body = shimBlock(onDisk);
+    if (body !== ours) {
+      if (force) {
+        // Back the outgoing hook up FIRST. The replacement is the one
+        // irreversible step in this script, and it is the step where the file's
+        // previous contents are least likely to be understood by the operator
+        // running it. --force is the override for a file this script cannot
+        // read the state of, so the state is preserved before it is overwritten.
+        const kept = backupHook();
+        if (kept) {
+          process.stderr.write(
+            `install-worktree-isolation-hook: --force: replacing ${hookPath} even though it is not the\n` +
+              `revision this script would write. The outgoing hook has been kept at:\n` +
+              `  ${kept}\n` +
+              `Anything hand-edited into that file is being discarded, and it is in that copy.\n`,
+          );
+        } else {
+          process.stderr.write(
+            `install-worktree-isolation-hook: --force: replacing ${hookPath} even though it is not the\n` +
+              `revision this script would write. Anything hand-edited into that file is being\n` +
+              `discarded.\n`,
+          );
+        }
+      } else {
+        // The shim is ambiguous and is being left alone. The guard is not the
+        // ambiguous object, but "not ambiguous" is not the same as "safe to
+        // overwrite": it is only safe when this checkout's copy can be shown not
+        // to be older than the one in force.
+        //
+        // The installer CAN order the two guards now, because the guard carries a
+        // version, so "differs" is not a dead end any more. That is what turns
+        // this branch from a decision made by refusing into one made by evidence.
+        //
+        // Measured on this host before the version stamp: stored guard 9d35139e
+        // (current), an operator standing in a lane whose guard was 9a015171
+        // (older), a shim this script refuses. The run exited 1, refused the
+        // shim, and left the fleet-wide stored guard downgraded to 9a015171 --
+        // every commit in every worktree then ran the older guard, on a run
+        // whose output said "Refusing to guess" and claimed the guard "has been
+        // refreshed". Withholding the refresh instead of guessing the other way
+        // fixed the downgrade and introduced the opposite hazard: a stale guard
+        // stayed in force, silently allowing a cross-seat commit the newer guard
+        // would have refused, until an operator noticed and reached for --force.
+        //
+        // Both of those were symptoms of one unanswerable question. With a
+        // version on the guard the question has an answer, so the only
+        // withholding left is the genuinely unorderable case -- two guards at the
+        // same version with different content, which means someone hand-edited
+        // one and the installer cannot pretend to know which is intended.
+        // The guard is not the ambiguous object, but "not ambiguous" is not the
+        // same as "safe to overwrite". The decision is NOT re-made here: it is
+        // asked of decideStoredGuardWrite(), the same function the succeeding
+        // path uses, so there is one answer per state instead of two.
+        //
+        // This branch used to carry its own copy of the rule --
+        // `refreshed = relation === "absent" || "same" || "newer"` -- with no
+        // unstamped case at all, so the same repository state produced a
+        // different answer depending on whether the shim happened to be
+        // recognisable. Measured on 6f99a78f0, with the rule as it stood:
+        //
+        //   state (stored / checkout)  succeeding path   refusing path
+        //   v2 / v1                   withheld          withheld
+        //   v2 / v3                   takes over        takes over
+        //   v2 / v2 edited            CHECKOUT WINS     stored kept
+        //   v2 / unstamped            LANE COPY WINS    withheld
+        //
+        // The bottom two rows are the two states where the paths disagreed,
+        // and both are now the answer the refusing path already gave.
+        const relation = storedGuardRelation();
+        const decision = decideStoredGuardWrite(relation, { force });
+        if (decision.write) refreshStoredGuard();
+        const guardNote = decision.write
+          ? decision.reason.endsWith("-forced")
+            ? `The stored guard has been refreshed from this checkout, which ${describeRelation(relation)}\n` +
+              `the one that was in force. --force asked for it and every commit in this repository\n` +
+              `now runs this checkout's copy. Only the shim above is unresolved.\n`
+            : `The stored guard has been refreshed, so commits in this repository are running the\n` +
+              `guard from this checkout. Only the shim above is unresolved.\n`
+          : relation === "older"
+            ? `The stored guard has NOT been changed. This checkout's guard is OLDER than the one in\n` +
+              `force (version ${guardVersionOf(readFileSync(storedGuardPath, "utf8"))} in force, ` +
+              `version ${guardVersionOf(readFileSync(guardPath, "utf8"))} here), so replacing the\n` +
+              `fleet's guard with it from a run that refused would be the downgrade this message\n` +
+              `exists to prevent. Do nothing: the stored copy\n` +
+              `  ${storedGuardPath}\n` +
+              `is the newer one and is the one the shim runs. To replace it with this checkout's\n` +
+              `anyway, run this again with --force, after reading the shim above.\n`
+            : relation === "unstamped"
+              ? `The stored guard has NOT been changed. This checkout's guard carries no version stamp,\n` +
+                `so it cannot be ordered against the one in force (version ` +
+                `${guardVersionOf(readFileSync(storedGuardPath, "utf8"))}). An unmeasured copy is not a\n` +
+                `reason to move the whole fleet onto it, and the succeeding path now withholds here too.\n` +
+                `The stored copy is the one in force:\n` +
+                `  ${storedGuardPath}\n` +
+                `If this checkout's guard is the one you want, stamp it, or install it deliberately\n` +
+                `with --force.\n`
+              : `The stored guard has NOT been changed. This checkout's guard and the one in force are both\n` +
+                `at version ${guardVersionOf(readFileSync(storedGuardPath, "utf8"))} but differ in content, so\n` +
+                `one of them was hand-edited and the installer cannot tell which is intended. Refusing to\n` +
+                `guess between them. The stored copy is the one in force:\n` +
+                `  ${storedGuardPath}\n` +
+                `Read both, then either delete the stored copy to take this checkout's, or leave it.\n`;
+        process.stderr.write(
+          `install-worktree-isolation-hook: ${hookPath} carries this script's marker and looks like\n` +
+            `one of ours, but it is not the revision this script would write, and it cannot be told\n` +
+            `apart from a hand-edited hook. An older revision of ours and somebody's edited copy\n` +
+            `look identical to this script, and the difference matters: replacing the body of an\n` +
+            `edited hook silently discards their check, and leaving an old one in place means a\n` +
+            `fixed shim never reaches this host.\n` +
+            `Refusing to guess. Read the file. If it is unmodified and simply old, remove it and run\n` +
+            `this again:\n` +
+            `  rm ${hookPath}\n` +
+            `If you have looked at it and want the new shim regardless:\n` +
+            `  node scripts/install-worktree-isolation-hook.mjs --install --force\n` +
+            guardNote,
+        );
+        process.exit(1);
+      }
+    }
+
+    // Atomic: a truncated shim fails open, so the live hook is replaced by a
+    // rename, never truncated in place. See writeFileAtomic.
+    writeFileAtomic(hookPath, remainder.length > 0 ? `${ours}\n${remainder}\n` : `${ours}\n`, 0o755);
+    process.stdout.write(`worktree isolation hook: outdated shim replaced at ${hookPath}\n`);
+  } else {
+    process.stderr.write(
+      `install-worktree-isolation-hook: ${hookPath} carries the marker but is not a revision of this\n` +
+        `script's shim, so it was left alone. It may be an older hook with a manual edit in it.\n` +
+        `Review it, then replace it deliberately.\n`,
+    );
+    process.exit(1);
+  }
+  guardRefreshOutcome({ force });
+  process.exit(0);
+}
+
+mkdirSync(path.dirname(hookPath), { recursive: true });
+
+// The stored guard is written FIRST, and through a temporary file so a failed
+// copy cannot leave a truncated guard that node would fail to parse. Writing
+// the hook first meant an interrupted install could leave a live hook with no
+// guard, which then warns on every commit and allows all of them -- a partial
+// install that looks like a working one.
+//
+// force is passed through, and this call site used to drop it. There are three
+// calls to guardRefreshOutcome() and this was the only one that did not forward
+// the flag, so on a fresh install --force never reached decideStoredGuardWrite()
+// and the withholding applied in `older`, `differs` and `unstamped` regardless
+// of what the operator asked for. The two calls that DID forward it meant the
+// same command worked on a re-install and did nothing on a fresh install, which
+// is the worst possible pair: the refusal above names --install --force, the
+// operator runs it, and it exits 0 having changed nothing.
+//
+// This path is not a corner case. An install interrupted between the guard
+// write below and the hook write after it leaves exactly the state this call
+// sees -- a stored guard in force and no hook -- and so does an operator who
+// removed the hook, or a repository that never had one.
+//
+// The returned outcome is used for the reporting line below, because printing
+// "stored at" after this call withheld would tell the operator the opposite of
+// what the refusal three lines above just told them, on one run, exit 0.
+const guardOutcome = guardRefreshOutcome({ force });
+writeFileAtomic(hookPath, shim, 0o755);
+process.stdout.write(`worktree isolation hook: installed at ${hookPath}\n`);
+if (guardOutcome.write) {
+  process.stdout.write(`worktree isolation guard: stored at ${storedGuardPath}\n`);
+} else {
+  // Say it once, and point at the refusal above rather than restate it. If
+  // --force was passed it cannot get here at all: the flag reaches
+  // decideStoredGuardWrite() now, and it resolves all three withheld relations.
+  // So this line only ever appears on an ordinary --install, and the refusal
+  // above it is the one that names --force.
+  process.stdout.write(
+    `worktree isolation guard: the copy in force was left alone; see the refusal above.\n` +
+      `  ${storedGuardPath}\n`,
+  );
+}
