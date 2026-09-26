@@ -156,7 +156,7 @@ function jsonEqual(left: unknown, right: unknown): boolean {
 }
 
 function buildConfigSnapshot(
-  row: Pick<typeof agents.$inferSelect, ConfigRevisionField>,
+  row: Pick<typeof agents.$inferSelect, ConfigRevisionField> & { id: string },
 ): AgentConfigSnapshot {
   const adapterConfig =
     typeof row.adapterConfig === "object" && row.adapterConfig !== null && !Array.isArray(row.adapterConfig)
@@ -175,7 +175,12 @@ function buildConfigSnapshot(
     role: row.role,
     title: row.title,
     icon: row.icon,
-    appearance: row.appearance,
+    // Resolve stored appearance the same way the public hydrated read does, so
+    // the before- and after-snapshots of one revision agree on the
+    // representation. Without this, a null or invalid stored appearance makes an
+    // unrelated edit record a phantom `appearance` change, and rolling that
+    // revision back would rewrite appearance to a value the agent never had.
+    appearance: resolveAgentAppearance(row.appearance, row.id),
     reportsTo: row.reportsTo,
     capabilities: row.capabilities,
     adapterType: row.adapterType,
