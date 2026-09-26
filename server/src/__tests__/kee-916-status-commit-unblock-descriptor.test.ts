@@ -11,6 +11,7 @@ import {
   issues,
   nativeRunFinalizations,
   nativeRunResults,
+  statusDecisionEffects,
   workAssessments,
 } from "@paperclipai/db";
 import { NATIVE_STATUS_ARBITER_POLICY_VERSION } from "../services/native-runtime/status-arbiter.js";
@@ -18,7 +19,7 @@ import { commitNativeStatusDecision } from "../services/native-runtime/status-de
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 /**
- * KEE-916 integration coverage.
+ * KEE-916 / KEE-925 integration coverage.
  *
  * The report traced this path but explicitly did not reproduce it, so this
  * test exists to settle reachability rather than to re-assert the trace. The
@@ -30,6 +31,14 @@ import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.j
  *
  * `assertTransition` returns early when `from === to`, which is what lets the
  * displacing write through on an already-`blocked` card.
+ *
+ * KEE-925 extends this to the second half of the same defect. Once the write
+ * stopped displacing a descriptor, the `bind_blocker` effect still woke
+ * `effect.owner` and reported `effect.owner` in its payload. So the card stored
+ * one owner while the wake named another: the agent was asked to handle a block
+ * it did not own, and later unblock notifications followed the stored owner.
+ * The defect class this PR exists to close is the card, the wake and the
+ * recorded effect disagreeing about who owns the block.
  */
 describe("status commit does not displace an existing unblock descriptor", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
@@ -180,7 +189,21 @@ describe("status commit does not displace an existing unblock descriptor", () =>
       )
       .then((rows) => rows.map((row) => row.agentId));
 
-    return { committed, persisted, wakeAgentIds };
+    // The recorded `bind_blocker` effect. The card, this payload and the wake
+    // must all name the same owner, so the test has to read all three.
+    const bindBlockerEffects = await db
+      .select({ payload: statusDecisionEffects.payload })
+      .from(statusDecisionEffects)
+      .where(
+        and(
+          eq(statusDecisionEffects.companyId, companyId),
+          eq(statusDecisionEffects.issueId, issueId),
+          eq(statusDecisionEffects.effectKind, "bind_blocker"),
+        ),
+      )
+      .then((rows) => rows.map((row) => row.payload));
+
+    return { committed, persisted, wakeAgentIds, bindBlockerEffects };
   }
 
   it("keeps an existing agent-owned descriptor on an already-blocked card", async () => {
@@ -224,5 +247,114 @@ describe("status commit does not displace an existing unblock descriptor", () =>
     });
     // The owner must actually be woken, not just labelled.
     expect(wakeAgentIds).toContain(agentId);
+  });
+
+  // KEE-925: the guard above already refuses to displace a valid descriptor, so
+  // the wake and the recorded effect have to follow the descriptor that *remains*
+  // rather than the one this effect proposed.
+  it("does not wake or report the proposed agent when a user-owned descriptor is kept", async () => {
+    // The exact divergence case: an already-blocked card owned by a user, and a
+    // `bind_blocker` naming an agent. Before the fix the card kept the user
+    // descriptor while the effect woke `agentId` and recorded it as the owner.
+    const existing = { owner: { userId: "user-1" }, action: "Decide on the schema change." };
+    const { persisted, wakeAgentIds, bindBlockerEffects } =
+      await commitBlockedDecisionOverExistingDescriptor(existing, { agentId });
+
+    expect(persisted?.unblockDescriptor).toEqual(existing);
+    // The user owns the block, so no agent may be woken for it.
+    expect(wakeAgentIds).not.toContain(agentId);
+    expect(wakeAgentIds).toEqual([]);
+
+    expect(bindBlockerEffects).toHaveLength(1);
+    const [effect] = bindBlockerEffects;
+    // The recorded effect must name the stored owner, not the proposed agent.
+    expect(effect.owner).toEqual({ userId: "user-1" });
+    expect(effect.action).toBe(existing.action);
+    // And no wake was recorded, because no agent owns the block.
+    expect(effect.wakeId).toBeNull();
+    // Provenance is explicit so the log does not imply this effect bound it.
+    expect(effect.descriptorSource).toBe("existing");
+  });
+
+  it("does not wake or report the proposed agent when a board-owned descriptor is kept", async () => {
+    const existing = { owner: "board" as const, action: "Existing board action." };
+    const { persisted, wakeAgentIds, bindBlockerEffects } =
+      await commitBlockedDecisionOverExistingDescriptor(existing, { agentId });
+
+    expect(persisted?.unblockDescriptor).toEqual(existing);
+    expect(wakeAgentIds).not.toContain(agentId);
+    expect(wakeAgentIds).toEqual([]);
+
+    expect(bindBlockerEffects).toHaveLength(1);
+    expect(bindBlockerEffects[0].owner).toBe("board");
+    expect(bindBlockerEffects[0].action).toBe(existing.action);
+    expect(bindBlockerEffects[0].wakeId).toBeNull();
+    expect(bindBlockerEffects[0].descriptorSource).toBe("existing");
+  });
+
+  it("wakes the descriptor's own agent instead of the proposed agent when an agent-owned descriptor is kept", async () => {
+    // The card blames a different agent than the one this `bind_blocker` names.
+    // Waking the proposer is the defect; waking the stored owner is the fix.
+    const responsibleAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: responsibleAgentId,
+      companyId,
+      name: "Already responsible agent",
+      adapterType: "codex_local",
+      status: "running",
+    });
+    const existing = {
+      owner: { agentId: responsibleAgentId },
+      action: "Re-run the failed migration.",
+    };
+    const { persisted, wakeAgentIds, bindBlockerEffects } =
+      await commitBlockedDecisionOverExistingDescriptor(existing, { agentId });
+
+    expect(persisted?.unblockDescriptor).toEqual(existing);
+    // The woken agent and the stored owner are the same party.
+    expect(wakeAgentIds).toContain(responsibleAgentId);
+    expect(wakeAgentIds).not.toContain(agentId);
+    expect(wakeAgentIds).toEqual([responsibleAgentId]);
+
+    expect(bindBlockerEffects).toHaveLength(1);
+    expect(bindBlockerEffects[0].owner).toEqual({ agentId: responsibleAgentId });
+    expect(bindBlockerEffects[0].action).toBe(existing.action);
+    expect(bindBlockerEffects[0].wakeId).not.toBeNull();
+    expect(bindBlockerEffects[0].descriptorSource).toBe("existing");
+  });
+
+  it("still wakes and reports the proposed agent when the descriptor is attached", async () => {
+    // No existing descriptor: the proposed one is written, so the existing
+    // behaviour is correct and must not change.
+    const { persisted, wakeAgentIds, bindBlockerEffects } =
+      await commitBlockedDecisionOverExistingDescriptor(null, { agentId });
+
+    expect(persisted?.unblockDescriptor).toEqual({
+      owner: { agentId },
+      action: "Agent-owned action.",
+    });
+    expect(wakeAgentIds).toContain(agentId);
+
+    expect(bindBlockerEffects).toHaveLength(1);
+    expect(bindBlockerEffects[0].owner).toEqual({ agentId });
+    expect(bindBlockerEffects[0].action).toBe("Agent-owned action.");
+    expect(bindBlockerEffects[0].wakeId).not.toBeNull();
+    expect(bindBlockerEffects[0].descriptorSource).toBe("proposed");
+  });
+
+  it("records the board owner and no wake for a board-owned bind_blocker", async () => {
+    const { persisted, wakeAgentIds, bindBlockerEffects } =
+      await commitBlockedDecisionOverExistingDescriptor(null, "board");
+
+    expect(persisted?.unblockDescriptor).toEqual({
+      owner: "board",
+      action: "Board-owned action that must not land.",
+    });
+    expect(wakeAgentIds).toEqual([]);
+
+    expect(bindBlockerEffects).toHaveLength(1);
+    expect(bindBlockerEffects[0].owner).toBe("board");
+    expect(bindBlockerEffects[0].wakeId).toBeNull();
+    expect(bindBlockerEffects[0].descriptorSource).toBe("proposed");
   });
 });

@@ -757,6 +757,16 @@ async function materializeDecisionEffect(input: {
       existing: input.issue.unblockDescriptor,
       proposed: { owner: effect.owner, action: effect.action },
     });
+    // The wake and the recorded effect must name the owner the card *ends up*
+    // with, not the owner this effect proposed. When the guard above kept a
+    // board- or user-owned descriptor, waking `effect.owner.agentId` would ask
+    // an agent to handle a block the card assigns to somebody else, while
+    // later unblock notifications keep following the stored descriptor. Card,
+    // wake and payload then disagree about who owns the block.
+    const retained = retainedUnblockDescriptorForBindBlocker({
+      existing: input.issue.unblockDescriptor,
+      proposed: { owner: effect.owner, action: effect.action },
+    });
     const [bound] = await input.tx
       .update(issues)
       .set({
@@ -771,18 +781,22 @@ async function materializeDecisionEffect(input: {
       )
       .returning({ id: issues.id });
     if (!bound) throw new Error("native_blocker_binding_not_persisted");
+    // `retained.descriptor.owner` is the whole point: it is agent-owned only
+    // when the agent is genuinely the recorded blocker owner, whether that came
+    // from this effect or from a descriptor this commit declined to displace.
+    const blockerOwner = retained.descriptor.owner;
     let wakeId: string | null = null;
-    if (effect.owner !== "board") {
+    if (blockerOwner !== "board" && "agentId" in blockerOwner) {
       wakeId = await enqueueWake({
         tx: input.tx,
         companyId: input.companyId,
         issueId: input.issue.id,
-        agentId: effect.owner.agentId,
+        agentId: blockerOwner.agentId,
         reason: "issue_status_changed",
         idempotencyKey: `native-status:${input.decisionId}:blocker-owner`,
         payload: {
           nativeDecisionId: input.decisionId,
-          unblockAction: effect.action,
+          unblockAction: retained.descriptor.action,
         },
       });
     }
@@ -790,7 +804,16 @@ async function materializeDecisionEffect(input: {
       effectKind: effect.kind,
       targetType: "issue_unblock_descriptor",
       targetId: bound.id,
-      payload: { owner: effect.owner, action: effect.action, wakeId },
+      payload: {
+        owner: blockerOwner,
+        action: retained.descriptor.action,
+        wakeId,
+        // Whether the stored descriptor is the one this effect proposed or a
+        // pre-existing one that was kept. Recorded so the effect log shows
+        // which of the two happened instead of hiding it behind an identical
+        // owner/action pair.
+        descriptorSource: retained.source,
+      },
     };
   }
   if (effect.kind === "schedule_retry") {
@@ -1565,6 +1588,39 @@ export function unblockDescriptorForStatusCommit(input: {
   const action = input.proposed?.action?.trim();
   if (!action) return null;
   return { owner: input.proposed!.owner, action } satisfies IssueUnblockDescriptor;
+}
+
+/**
+ * Which unblock descriptor a `bind_blocker` actually leaves on the card, and
+ * where it came from.
+ *
+ * `unblockDescriptorForStatusCommit` deliberately returns only the descriptor to
+ * *write*, so `null` means two different things: "an existing descriptor was
+ * kept" and "nothing could be attached at all". A caller that treats `null` as
+ * "use the proposed owner" will wake and report an agent the card does not
+ * actually blame. Resolving the retained descriptor here keeps the write, the
+ * wake target and the recorded effect payload describing the same party.
+ */
+export function retainedUnblockDescriptorForBindBlocker(input: {
+  existing: IssueUnblockDescriptor | null | undefined;
+  proposed: { owner: { agentId: string } | "board"; action: string };
+}): { descriptor: IssueUnblockDescriptor; source: "proposed" | "existing" } {
+  const attached = unblockDescriptorForStatusCommit({
+    existing: input.existing,
+    proposed: input.proposed,
+  });
+  if (attached) return { descriptor: attached, source: "proposed" };
+  // `null` here means a valid existing descriptor was preserved. Its owner is
+  // the party responsible for the block, and the only one a wake may name.
+  if (input.existing && input.existing.action.trim())
+    return { descriptor: input.existing, source: "existing" };
+  // Neither side carries a usable action, so the card ends up with no
+  // descriptor to disagree with. Report the proposal rather than inventing an
+  // owner that is not recorded anywhere.
+  return {
+    descriptor: { owner: input.proposed.owner, action: input.proposed.action.trim() },
+    source: "proposed",
+  };
 }
 
 export async function commitNativeStatusDecision(input: {

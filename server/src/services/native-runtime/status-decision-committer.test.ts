@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import type { IssueUnblockDescriptor } from "@paperclipai/shared";
-import { unblockDescriptorForStatusCommit } from "./status-decision-committer.js";
+import {
+  retainedUnblockDescriptorForBindBlocker,
+  unblockDescriptorForStatusCommit,
+} from "./status-decision-committer.js";
 
 /**
  * The defect this guards (KEE-916): the status-commit projection wrote
@@ -104,5 +107,111 @@ describe("unblockDescriptorForStatusCommit", () => {
         proposed: { owner: "board", action: "  Padded action.  " },
       }),
     ).toEqual({ owner: "board", action: "Padded action." });
+  });
+});
+
+/**
+ * The defect this guards (KEE-925): `unblockDescriptorForStatusCommit` returns
+ * `null` both for "kept the existing descriptor" and for "nothing attachable".
+ * The `bind_blocker` effect read that `null` and fell back to the owner the
+ * effect itself proposed, so it woke and recorded an agent the card did not
+ * name. The helper resolves which descriptor actually remains so the write, the
+ * wake and the recorded effect cannot disagree.
+ */
+describe("retainedUnblockDescriptorForBindBlocker", () => {
+  it("returns the attached proposal when the card has no usable descriptor", () => {
+    expect(
+      retainedUnblockDescriptorForBindBlocker({
+        existing: null,
+        proposed: { owner: { agentId: "agent-1" }, action: "Re-run the migration." },
+      }),
+    ).toEqual({
+      descriptor: { owner: { agentId: "agent-1" }, action: "Re-run the migration." },
+      source: "proposed",
+    });
+  });
+
+  it("returns the kept descriptor when an existing one is valid", () => {
+    // The divergence case: the proposal names an agent, the card keeps a
+    // user-owned descriptor. The retained descriptor is the user's, so no agent
+    // may be woken or named as the owner.
+    const existing: IssueUnblockDescriptor = {
+      owner: { userId: "user-1" },
+      action: "Decide whether to accept the schema change.",
+    };
+    expect(
+      retainedUnblockDescriptorForBindBlocker({
+        existing,
+        proposed: { owner: { agentId: "agent-1" }, action: "Agent action that must not land." },
+      }),
+    ).toEqual({ descriptor: existing, source: "existing" });
+  });
+
+  it("keeps an existing agent-owned descriptor that names a different agent", () => {
+    const existing: IssueUnblockDescriptor = {
+      owner: { agentId: "agent-2" },
+      action: "Re-run the failed migration.",
+    };
+    expect(
+      retainedUnblockDescriptorForBindBlocker({
+        existing,
+        proposed: { owner: { agentId: "agent-1" }, action: "Agent action that must not land." },
+      }),
+    ).toEqual({ descriptor: existing, source: "existing" });
+  });
+
+  it("replaces a degenerate existing descriptor and reports the proposal", () => {
+    expect(
+      retainedUnblockDescriptorForBindBlocker({
+        existing: { owner: "board", action: "   " },
+        proposed: { owner: { agentId: "agent-1" }, action: "Real next step." },
+      }),
+    ).toEqual({
+      descriptor: { owner: { agentId: "agent-1" }, action: "Real next step." },
+      source: "proposed",
+    });
+  });
+
+  it("falls back to the proposal when neither side has a usable action", () => {
+    // Nothing is written, so there is no retained owner to disagree with. The
+    // proposal is reported rather than an owner invented from nothing.
+    expect(
+      retainedUnblockDescriptorForBindBlocker({
+        existing: { owner: "board", action: "  " },
+        proposed: { owner: { agentId: "agent-1" }, action: "  " },
+      }),
+    ).toEqual({
+      descriptor: { owner: { agentId: "agent-1" }, action: "" },
+      source: "proposed",
+    });
+  });
+
+  it("agrees with unblockDescriptorForStatusCommit about what is written", () => {
+    // The whole point: the descriptor this helper reports as retained is the
+    // descriptor the card ends up carrying.
+    const cases: Array<{
+      existing: IssueUnblockDescriptor | null;
+      proposed: { owner: { agentId: string } | "board"; action: string };
+    }> = [
+      { existing: null, proposed: { owner: { agentId: "a1" }, action: "Do the thing." } },
+      {
+        existing: { owner: { userId: "u1" }, action: "User decides." },
+        proposed: { owner: { agentId: "a1" }, action: "Agent acts." },
+      },
+      {
+        existing: { owner: { agentId: "a2" }, action: "Other agent acts." },
+        proposed: { owner: { agentId: "a1" }, action: "Agent acts." },
+      },
+      {
+        existing: { owner: "board", action: "Board acts." },
+        proposed: { owner: { agentId: "a1" }, action: "Agent acts." },
+      },
+    ];
+    for (const { existing, proposed } of cases) {
+      const written = unblockDescriptorForStatusCommit({ existing, proposed });
+      const retained = retainedUnblockDescriptorForBindBlocker({ existing, proposed });
+      // Whatever is written, the reported descriptor is what the card carries.
+      expect(retained.descriptor).toEqual(written ?? existing);
+    }
   });
 });
