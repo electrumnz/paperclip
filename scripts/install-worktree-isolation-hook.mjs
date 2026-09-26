@@ -27,10 +27,20 @@
  *   node scripts/install-worktree-isolation-hook.mjs            # install
  *   node scripts/install-worktree-isolation-hook.mjs --check    # report only
  *   node scripts/install-worktree-isolation-hook.mjs --uninstall
+ *   node scripts/install-worktree-isolation-hook.mjs --install --force
+ *                                                               # replace a shim that
+ *                                                               # is ours-shaped but not
+ *                                                               # this revision
  *
  * The hook is deliberately not unbypassable: `git commit --no-verify` still
  * skips it. A hook that appears unbypassable teaches --no-verify as a habit,
  * which is worse than an honest opt-out.
+ *
+ * The one thing the shim does insist on: if a seat identity is set and no guard
+ * can be found, the commit is REFUSED. A hook that can enforce nothing is
+ * indistinguishable from no hook, and reporting success while enforcing nothing
+ * is the failure this whole change exists to end. A human with no seat identity
+ * is not governed by the seat rule and is warned rather than blocked.
  */
 
 import { execFileSync } from "node:child_process";
@@ -56,6 +66,35 @@ const storedGuardPath = path.join(commonDir, "hooks", "worktree-isolation-guard.
 const guardPath = path.join(repoRoot, "scripts", "check-worktree-isolation.mjs").split(path.sep).join("/");
 
 const MARKER = "# installed by scripts/install-worktree-isolation-hook.mjs";
+
+/**
+ * Write a file atomically, or not at all.
+ *
+ * writeFileSync opens the target with O_TRUNC and then writes. If it is
+ * interrupted -- a full disk, a file-size limit, a kill -- the target is left
+ * truncated, and for the hook that means a shim ending mid-string. git runs it,
+ * the shell fails to parse it, prints "unexpected EOF", and then ALLOWS the
+ * commit: an interrupted reinstall does not just skip the guard, it installs a
+ * broken one that fails open.
+ *
+ * Reproduced with `ulimit -f 1`, which lets the truncate land and then fails
+ * the write: a 2751-byte live hook became 1024 bytes ending in
+ * `GUARD="${KEE_WORKTREE_ISOLATION_GUA`.
+ *
+ * So the content goes to a temporary file in the same directory, is chmodded
+ * there, and only then renamed over the target. rename(2) within a directory is
+ * atomic, so a reader sees either the old file or the new one, never a partial.
+ */
+function writeFileAtomic(target, content, mode) {
+  const staging = `${target}.tmp-${process.pid}`;
+  try {
+    writeFileSync(staging, content, { mode });
+    renameSync(staging, target);
+  } catch (error) {
+    rmSync(staging, { force: true });
+    throw error;
+  }
+}
 
 // The shim's first line and its last two lines. Both are identical in every
 // revision of this script, so they are what identifies a hook as ours: the
@@ -101,21 +140,39 @@ fi
 
 if [ -z "$GUARD" ]; then
   # No guard to run. This is not allowed to be silent: a hook that exits 0
-  # having decided nothing is exactly the defect this card is about. It warns
-  # loudly on every commit.
+  # having decided nothing is exactly the defect this card is about.
   #
-  # It still exits 0, deliberately, and the independent review on KEE-943
-  # agreed with that reasoning rather than the fail-closed alternative: refusing
-  # every commit in a checkout that has never had the guard would look like a
-  # broken tool and be worked around with --no-verify within a day. They did
-  # note the choice is internally inconsistent with the guard's own
-  # fail-closed-on-uncertainty rule, which is fair, and they were explicit that
-  # whichever way it goes the decision has to be under test. It is, below in
-  # the suite; before this it was not tested at all, and flipping the exit code
-  # changed no test result.
+  # Whether it exits 0 or not used to be a judgement call, and it was the wrong
+  # one. I chose exit 0 -- refusing every commit in a checkout that has never
+  # had the guard would look like a broken tool and be worked around with
+  # --no-verify within a day -- and put the decision to the KEE-943 review to be
+  # made by someone other than me. Two independent sources have now landed on the
+  # other side: the security review flagged the same thing as a P2, and the
+  # rationale is the stronger argument. A hook that cannot enforce anything is
+  # indistinguishable from no hook, and "it would be annoying" is a smaller
+  # concern than a guard that reports success while enforcing nothing -- which
+  # is the failure this whole card exists to end. The honest repair for an
+  # absent guard is to install it, and the message says exactly that.
+  #
+  # So: fail CLOSED when there is a seat identity, because that is the case the
+  # control exists for, and a seat with no guard is a seat that is unprotected.
+  # A human with no seat identity is not a seat and is not governed by the seat
+  # rule, so it keeps the loud warning and is not blocked. This is also the
+  # only branch where the shim itself has to decide, because the guard -- which
+  # is what would normally do the deciding -- is the thing that is missing.
+  if [ -n "\${PAPERCLIP_AGENT_ID:-}" ]; then
+    echo "check-worktree-isolation: NO GUARD FOUND, refusing the commit." >&2
+    echo "  A seat identity is set (\${PAPERCLIP_AGENT_ID%%-*}), so this commit must be checked," >&2
+    echo "  and there is no guard to check it with. Refusing rather than allowing it unchecked." >&2
+    echo "  expected at: ${storedGuardPath}" >&2
+    echo "  Run: node scripts/install-worktree-isolation-hook.mjs" >&2
+    exit 2
+  fi
   echo "check-worktree-isolation: NO GUARD FOUND, seat isolation is NOT being enforced." >&2
   echo "  cwd:         $(pwd)" >&2
   echo "  expected at: ${storedGuardPath}" >&2
+  echo "  No seat identity is set, so this is not a seat commit and is allowed. Every seat" >&2
+  echo "  commit in this repository will be refused until the guard is installed." >&2
   echo "  Run: node scripts/install-worktree-isolation-hook.mjs" >&2
   exit 0
 fi
@@ -125,6 +182,7 @@ exit \$?
 `;
 
 const mode = process.argv[2] || "--install";
+const force = process.argv.includes("--force");
 const current = existsSync(hookPath) ? readFileSync(hookPath, "utf8") : null;
 const installed = current !== null && current.includes(MARKER);
 
@@ -140,8 +198,29 @@ try {
   hooksPath = null;
 }
 if (hooksPath) {
-  const resolved = path.isAbsolute(hooksPath) ? hooksPath : path.resolve(repoRoot, hooksPath);
   const expected = path.join(commonDir, "hooks");
+  // A RELATIVE core.hooksPath is resolved by git against the directory of the
+  // repository the commit is happening in, not against the installing checkout.
+  // A linked worktree's .git is a file rather than a directory, so a relative
+  // path that is correct from the primary checkout resolves somewhere else --
+  // usually nowhere -- from a linked worktree. Accepting it here reported
+  // success while the guard ran in no worktree at all.
+  //
+  // So the value is resolved the way git will resolve it, in the worst case
+  // there is, and refused if it is not the common hooks dir from there too.
+  if (!path.isAbsolute(hooksPath)) {
+    process.stderr.write(
+      `install-worktree-isolation-hook: core.hooksPath is set to the relative path\n` +
+        `${hooksPath}. Git resolves a relative core.hooksPath against each committing\n` +
+        `repository, and in a linked worktree .git is a file, not a directory, so the\n` +
+        `path does not resolve to the same place. Git would not run a hook written to\n` +
+        `the common .git/hooks, so installing there would report success and enforce\n` +
+        `nothing in the very worktrees the guard exists for.\n` +
+        `Unset core.hooksPath, or set it to the absolute path ${expected}, and run this again.\n`,
+    );
+    process.exit(1);
+  }
+  const resolved = path.resolve(hooksPath);
   if (path.resolve(resolved) !== expected) {
     process.stderr.write(
       `install-worktree-isolation-hook: core.hooksPath is set to ${hooksPath}, which is not\n` +
@@ -205,7 +284,7 @@ if (mode === "--uninstall") {
         `install-worktree-isolation-hook: ${hookPath} also contains content this script did not\n` +
           `write. Removing only the worktree isolation block and leaving the rest in place.\n`,
       );
-      writeFileSync(hookPath, `${remainder}\n`, { mode: 0o755 });
+      writeFileAtomic(hookPath, `${remainder}\n`, 0o755);
     }
   } else {
     process.stderr.write(
@@ -269,7 +348,69 @@ if (installed) {
     // or keep a tail of the stale shim.
     const at = onDisk.indexOf(TERMINATOR);
     const remainder = (at === -1 ? onDisk : onDisk.slice(at + TERMINATOR.length)).trim();
-    writeFileSync(hookPath, remainder.length > 0 ? `${ours}\n${remainder}\n` : `${ours}\n`, { mode: 0o755 });
+
+    // "Ours, but not the revision we would write" is also what an operator's
+    // hand-edit looks like. They add a check to the shim and leave the header
+    // and terminator in place, so the boundary test above cannot tell the two
+    // apart: an edit AFTER the terminator looks like ours-with-a-remainder, and
+    // an edit INSIDE our block looks like a plain stale shim. Replacing the
+    // body then discards their work silently, in a branch whose stated intent
+    // is to leave an edited hook alone -- and reinstall printed "outdated shim
+    // replaced" and exited 0 while it did it. Both shapes were reproduced.
+    //
+    // The two cases pull in opposite directions and neither is safe to
+    // automate:
+    //
+    //   - Replacing is right when the file is an unmodified older revision. It
+    //     is what makes a fixed shim actually reach a host, which is the whole
+    //     point of re-installing, and the earlier revision of this branch did
+    //     exactly that with no complaints.
+    //   - Refusing is right when the file is somebody's edited copy. The edit
+    //     is unrecoverable, and the previous behaviour destroyed it silently.
+    //
+    // They are the same observation, so the installer cannot tell them apart,
+    // and guessing either way produces a false success: guessing "replace"
+    // destroys a local check, guessing "refuse" strands a fleet on a known-bad
+    // shim and calls it current.
+    //
+    // The resolution is a VERSION the shim carries, so a stale file can be
+    // recognised as stale without trusting its body. Anything that identifies
+    // as an older revision of this script AND whose body still matches what
+    // that revision wrote can be replaced automatically, because nothing was
+    // edited. Without a version marker that is unknowable, so the safe
+    // default stands: refuse, name both states, and say the one command that
+    // resolves it. `--force` is the deliberate override for an operator who
+    // has looked at the file and wants the new shim.
+    const at2 = onDisk.indexOf(TERMINATOR);
+    const body = at2 === -1 ? onDisk : onDisk.slice(0, at2 + TERMINATOR.length).trim();
+    if (body !== ours) {
+      if (force) {
+        process.stderr.write(
+          `install-worktree-isolation-hook: --force: replacing ${hookPath} even though it is not the\n` +
+            `revision this script would write. Anything hand-edited into that file is being\n` +
+            `discarded.\n`,
+        );
+      } else {
+        process.stderr.write(
+          `install-worktree-isolation-hook: ${hookPath} carries this script's marker and looks like\n` +
+            `one of ours, but it is not the revision this script would write, and it cannot be told\n` +
+            `apart from a hand-edited hook. An older revision of ours and somebody's edited copy\n` +
+            `look identical to this script, and the difference matters: replacing the body of an\n` +
+            `edited hook silently discards their check, and leaving an old one in place means a\n` +
+            `fixed shim never reaches this host.\n` +
+            `Refusing to guess. Read the file. If it is unmodified and simply old, remove it and run\n` +
+            `this again:\n` +
+            `  rm ${hookPath}\n` +
+            `If you have looked at it and want the new shim regardless:\n` +
+            `  node scripts/install-worktree-isolation-hook.mjs --install --force\n`,
+        );
+        process.exit(1);
+      }
+    }
+
+    // Atomic: a truncated shim fails open, so the live hook is replaced by a
+    // rename, never truncated in place. See writeFileAtomic.
+    writeFileAtomic(hookPath, remainder.length > 0 ? `${ours}\n${remainder}\n` : `${ours}\n`, 0o755);
     process.stdout.write(`worktree isolation hook: outdated shim replaced at ${hookPath}\n`);
   } else {
     process.stderr.write(
@@ -296,7 +437,7 @@ mkdirSync(path.dirname(hookPath), { recursive: true });
 const staging = `${storedGuardPath}.tmp-${process.pid}`;
 copyFileSync(guardPath, staging);
 renameSync(staging, storedGuardPath);
-writeFileSync(hookPath, shim, { mode: 0o755 });
+writeFileAtomic(hookPath, shim, 0o755);
 process.stdout.write(
   `worktree isolation hook: installed at ${hookPath}\n` +
     `worktree isolation guard: stored at ${storedGuardPath}\n`,
