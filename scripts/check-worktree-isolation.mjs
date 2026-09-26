@@ -2,7 +2,7 @@
 /**
  * check-worktree-isolation.mjs
  *
- * worktree-isolation-guard-version: 2
+ * worktree-isolation-guard-version: 3
  *
  * The version line above is read by scripts/install-worktree-isolation-hook.mjs
  * to decide whether this guard is newer than the one already stored in a
@@ -16,6 +16,43 @@
  * integer, not a date and not a hash, because the only question asked of it is
  * "which of these two is newer", and a number answers that without a rule for
  * comparing the rest.
+ *
+ * WHAT YOUR STAMP MEANS, and what happens if you do not carry one (KEE-966).
+ *
+ * Carrying the stamp is not optional bookkeeping. It is the only thing that
+ * decides whether your copy of this file can take over a repository that
+ * already has one in force. The installer's rule, in one line: a guard is
+ * written over what is in force when it is newer, and withheld when it is
+ * older, when it is the same version with different content, and when it
+ * carries no stamp at all.
+ *
+ * That last clause is the ruling, and it is the one an operator is most likely
+ * to hit, because a hand-written, vendored or pre-stamp copy of this guard is
+ * exactly a copy with no stamp. Measured on 6f99a78f0, with a version 2 guard
+ * in force fleet-wide and an unstamped copy in one lane, an ordinary
+ * succeeding --install took the unstamped copy over every worktree:
+ *
+ *   6f99a78f0 UNSTAMPED lane vs stamped v2 fleet : stored 4c5ec6c1 -> b9a83f1b exit=0
+ *     *** FLEET GUARD ROLLED BACK -- the unstamped lane copy took over ***
+ *
+ * An earlier revision of the installer deliberately allowed this, on the
+ * reasoning that a guard with no version has made no claim and an operator who
+ * asked to install it should be obeyed. The objection is that "no claim" is not
+ * the same as "newer", and obedience to a request is not evidence. A copy that
+ * cannot be ordered cannot establish that it is safe, and "the operator asked"
+ * is the reason the downgrade was quiet.
+ *
+ * So the rule is about what is CLAIMED, not what is measured. Declaring a lower
+ * version is a downgrade and is refused. Declaring nothing is not a claim at
+ * all, and one lane holding an unorderable copy is not authority for every
+ * lane. The measured guard already in force keeps running, and the installer
+ * says so and names --force as the deliberate way through.
+ *
+ * The cost, stated plainly because it is a behaviour change: a legitimate
+ * hand-written guard cannot take over on an ordinary run any more. If you wrote
+ * this file yourself, add a stamp line and it becomes orderable. If you meant
+ * to replace what is in force, run with --force, and the run will tell you what
+ * it replaced.
  *
  * Fails when the current working tree is an issue worktree that does not
  * belong to the seat running the check.
