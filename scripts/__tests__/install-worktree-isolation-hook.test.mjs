@@ -1702,3 +1702,172 @@ test("--force replaces an outdated shim of ours, exit 0, and still applies the g
     rmSync(root, { force: true, recursive: true });
   }
 });
+
+/**
+ * The state a FRESH install sees, and the one the two paths above never test.
+ *
+ * Every --force test before this one installed a hook first, so every one of
+ * them reached the re-install call site at 1011, which did forward the flag.
+ * The fresh-install call site -- the one that runs when there is no hook to
+ * replace -- called guardRefreshOutcome() with no arguments, so --force never
+ * reached decideStoredGuardWrite() there and the withholding applied in
+ * `older`, `differs` and `unstamped` whatever the operator asked for.
+ *
+ * The observable consequence is the run-1/run-2 asymmetry, which is why this is
+ * a first-run test and not a table: the state is reachable in ordinary
+ * operation, because this call site writes the stored guard and THEN the hook,
+ * so an install interrupted between the two leaves exactly this state, and so
+ * does an operator who removed the hook.
+ *
+ * Both halves are asserted, because the first run is where the operator forms
+ * their belief about what the second run will do:
+ *
+ *   run 1: --install --force, no hook  -> exit 0, stored guard NOT moved,
+ *                                         last line "guard: stored at"
+ *   run 2: the same command again     -> exit 0, stored guard moved
+ *
+ * A named command that does nothing on its first run and works on its second is
+ * the false-success shape the refusal messages exist to avoid, so the flag has
+ * to work on the first one.
+ */
+test("on a fresh install, --install --force works on the FIRST run, not the second", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
+    const guardInCheckout = path.join(main, "scripts", "check-worktree-isolation.mjs");
+    const hookPath = path.join(main, ".git", "hooks", "pre-commit");
+    const fleet = readFileSync(stored, "utf8");
+    const fleetVersion = versionIn(fleet);
+
+    const states = {
+      older: stampGuardVersion(fleet, fleetVersion - 1),
+      differs: `${fleet}\n// somebody hand-edited this copy\n`,
+      unstamped: unstampGuard(fleet),
+    };
+
+    for (const [relation, guardText] of Object.entries(states)) {
+      // Reset the fleet state DIRECTLY rather than by running the installer, for
+      // the reason "the two write paths agree" gives: --install can only move
+      // the guard forward, so a reset by installation would corrupt the
+      // bookkeeping of a fixture whose subject is which copy wins.
+      rmSync(hookPath, { force: true });
+      writeFileSync(guardInCheckout, guardText);
+      writeFileSync(stored, fleet, { mode: 0o755 });
+      const before = readFileSync(stored, "utf8");
+      assert.equal(before, fleet, `fixture is wrong for ${relation}: the fleet guard moved`);
+
+      // FIRST run. No hook is installed, so this is the fresh-install path.
+      const first = installHook(main, ["--install", "--force"]);
+      assert.equal(first.status, 0, `${relation}: ${first.stdout}${first.stderr}`);
+      assert.equal(
+        readFileSync(stored, "utf8"),
+        guardText,
+        `${relation}: --install --force did not publish this checkout's guard on the first run`,
+      );
+      assert.match(
+        first.stdout,
+        /--force: this checkout's guard/,
+        `${relation}: a forced override was not reported as one on the first run`,
+      );
+      assert.match(
+        first.stdout,
+        new RegExp(`version ${fleetVersion}`),
+        `${relation}: the forced run does not say what it displaced`,
+      );
+      assert.ok(existsSync(hookPath), `${relation}: the hook was not installed`);
+
+      // SECOND run, unchanged state and unchanged command. This is the one that
+      // already worked, and it is the one that hid the defect: an operator who
+      // ran the command twice saw run 2 succeed and concluded the command was
+      // fine. It has to be the first run that works too, and the difference
+      // between the two runs is the flag, not the state -- which is what makes
+      // the second run a control rather than a repeat.
+      rmSync(hookPath, { force: true });
+      writeFileSync(stored, fleet, { mode: 0o755 });
+      const second = installHook(main, ["--install", "--force"]);
+      assert.equal(second.status, 0, `${relation}: ${second.stdout}${second.stderr}`);
+      assert.equal(
+        readFileSync(stored, "utf8"),
+        guardText,
+        `${relation}: the second run took the deliberate override the first one refused`,
+      );
+    }
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("a withheld fresh install does not also claim the guard was stored", () => {
+  // The same call site, the same run, two claims about one state.
+  //
+  // guardRefreshOutcome() reported "NOT replaced" and returned, and the
+  // fresh-install path then printed "worktree isolation guard: stored at" as an
+  // unconditional tail line. An ordinary --install therefore printed both: a
+  // refusal naming --force, and a line saying the guard had been stored, exit
+  // 0. Fixing the dropped flag alone would not have fixed this -- the ordinary
+  // run still withholds, by design.
+  //
+  // The two lines cannot both be true, so the run has to be able to say which
+  // one happened without the operator reading two paragraphs to work it out.
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
+    const guardInCheckout = path.join(main, "scripts", "check-worktree-isolation.mjs");
+    const hookPath = path.join(main, ".git", "hooks", "pre-commit");
+    const fleet = readFileSync(stored, "utf8");
+
+    const older = stampGuardVersion(fleet, versionIn(fleet) - 1);
+    writeFileSync(guardInCheckout, older);
+    rmSync(hookPath, { force: true });
+    writeFileSync(stored, fleet, { mode: 0o755 });
+
+    const withheld = installHook(main, ["--install"]);
+    assert.equal(withheld.status, 0, withheld.stdout + withheld.stderr);
+    assert.equal(
+      readFileSync(stored, "utf8"),
+      fleet,
+      "an ordinary --install moved the stored guard on a fresh install",
+    );
+    assert.match(withheld.stdout, /NOT replaced/, "the run did not report the withholding");
+    assert.match(
+      withheld.stdout,
+      /--force/,
+      "the refusal does not name the override, so the operator cannot act on it",
+    );
+    // The contradiction, asserted directly: the run must not also say it stored
+    // the guard.
+    assert.doesNotMatch(
+      withheld.stdout,
+      /guard: stored at/,
+      "the run said the guard was stored AND that it was NOT replaced, on one run, exit 0",
+    );
+    assert.match(
+      withheld.stdout,
+      /the copy in force was left alone/,
+      "the withheld run does not say what it left in place",
+    );
+    // The hook still installed: that part of the run did succeed, and the point
+    // is that the operator can see exactly which half did.
+    assert.ok(existsSync(hookPath), "the hook was not installed on a withheld fresh install");
+
+    // And the positive control: when the guard really is stored, the line is
+    // there. A fix that simply removed the line would pass the assertion above.
+    // The checkout's guard has to go back to matching the stored copy for this,
+    // or the run correctly withholds again and the control proves nothing.
+    writeFileSync(guardInCheckout, fleet);
+    writeFileSync(stored, fleet, { mode: 0o755 });
+    rmSync(hookPath, { force: true });
+    const storedRun = installHook(main, ["--install"]);
+    assert.equal(storedRun.status, 0, storedRun.stdout + storedRun.stderr);
+    assert.match(
+      storedRun.stdout,
+      /guard: stored at/,
+      "a fresh install that really did store the guard no longer says so",
+    );
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
