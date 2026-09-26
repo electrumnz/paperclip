@@ -305,8 +305,66 @@ test("the stored guard is refreshed when the installer runs again", () => {
     writeFileSync(path.join(main, "scripts", "check-worktree-isolation.mjs"), updated);
     const again = installHook(main, ["--install"]);
     assert.equal(again.status, 0, again.stdout);
-    assert.match(again.stdout, /guard refreshed/);
+    assert.match(again.stdout, /worktree isolation guard: refreshed/);
     assert.equal(readFileSync(stored, "utf8"), updated, "stored guard went stale");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Greptile found five defects; this is the sixth, and I found it myself while
+// installing the fix. The re-install path refreshed the stored guard but
+// returned before rewriting the shim, so after the shim was corrected every
+// host that already had the older shim kept running it. The fixed installer
+// never reached the live hook -- the same "the code that runs is not the code I
+// fixed" shape as the guard itself.
+test("re-install replaces an outdated shim, and refuses a hook it cannot recognise", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0);
+    const hookPath = path.join(main, ".git", "hooks", "pre-commit");
+    const currentShim = readFileSync(hookPath, "utf8");
+
+    // An older revision of our shim: the same header, but the checkout-first
+    // resolution order that 1023ffe31 shipped. The first three lines of the
+    // header are what identify the shim as ours, so those are kept.
+    const currentBlock = /  if \[ -f "\/tmp\/[^"]+" \]; then\n[\s\S]*?\n  fi\n/;
+    assert.ok(currentBlock.test(currentShim), "fixture is wrong: no stored-guard branch found");
+    const staleBlock =
+      '  TOPLEVEL=$(git rev-parse --show-toplevel 2>/dev/null) || TOPLEVEL=""\n' +
+      '  if [ -n "$TOPLEVEL" ] && [ -f "$TOPLEVEL/scripts/check-worktree-isolation.mjs" ]; then\n' +
+      '    GUARD="$TOPLEVEL/scripts/check-worktree-isolation.mjs"\n' +
+      '  elif [ -f "/tmp/stored-elsewhere.mjs" ]; then\n' +
+      '    GUARD="/tmp/stored-elsewhere.mjs"\n' +
+      '  fi\n';
+    const staleShim = currentShim.replace(currentBlock, staleBlock);
+    assert.notEqual(staleShim, currentShim, "fixture is wrong: could not make an older shim");
+    writeFileSync(hookPath, staleShim, { mode: 0o755 });
+
+    const reinstall = installHook(main, ["--install"]);
+    assert.equal(reinstall.status, 0, reinstall.stdout + reinstall.stderr);
+    assert.match(reinstall.stdout, /outdated shim replaced/);
+    // Compared on trimmed content: the installer writes `shim` with its
+    // trailing newline and compares normalised, so the raw file is not
+    // byte-identical to the in-memory template.
+    assert.equal(
+      readFileSync(hookPath, "utf8").trimEnd(),
+      currentShim.trimEnd(),
+      "the outdated shim was not replaced",
+    );
+
+    // Idempotence: a second run must report the shim is current, not rewrite it.
+    const third = installHook(main, ["--install"]);
+    assert.equal(third.status, 0, third.stdout + third.stderr);
+    assert.match(third.stdout, /already current/);
+    assert.doesNotMatch(third.stdout, /outdated shim replaced/, "an up-to-date shim is reported outdated");
+
+    // And an unrecognised hook carrying our marker must be refused, not
+    // silently rewritten or silently left as a false success.
+    writeFileSync(hookPath, `#!/bin/sh\n# installed by scripts/install-worktree-isolation-hook.mjs\n# hand-edited beyond recognition\nexit 0\n`, { mode: 0o755 });
+    const refused = installHook(main, ["--install"]);
+    assert.equal(refused.status, 1, "an unrecognisable hook was overwritten or accepted");
+    assert.match(refused.stderr, /not a revision of this/);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
