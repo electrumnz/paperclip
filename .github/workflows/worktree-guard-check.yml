@@ -1,0 +1,100 @@
+name: Worktree guard check
+
+# KEE-999. The fork's guard suites (landed by PR #15) are never run by the
+# upstream-pinned pr-trusted.yml, because the pin resolves to an upstream
+# commit whose copy of that workflow has no guard step. GitHub resolves
+# `uses: owner/repo/path@ref` inside the *named* repository, so the pin cannot
+# be repointed at a fork ref that carries the steps. This workflow is the
+# fork-local lane that gives those suites real CI coverage.
+#
+# It deliberately does NOT replace the upstream pin: fork/master's own
+# pr-trusted.yml is stale relative to upstream master, and the pin is what
+# keeps the fork on upstream's definition.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/worktree-guard-check.yml
+      - scripts/check-worktree-isolation.mjs
+      - scripts/install-worktree-isolation-hook.mjs
+      - scripts/__tests__/check-worktree-isolation.test.mjs
+      - scripts/__tests__/install-worktree-isolation-hook.test.mjs
+      - scripts/__tests__/kee962-crosscheck.test.mjs
+      - scripts/__tests__/worktree-guard-ci-wiring.test.mjs
+
+permissions: {}
+
+concurrency:
+  group: worktree-guard-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: Worktree guard suites
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # No pnpm bootstrap. The guard, the installer and these suites import
+      # node builtins only and read no workspace package, so an install would
+      # cost minutes to run three node:test files. A missing node_modules here
+      # is not an error condition; the suites would fail loudly if it were.
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+
+      # Detect by content, not by branch. The guard lands in a pull request, and
+      # a guard suite that reports success without running is the exact failure
+      # mode this workflow exists to remove, so absence must never read as green.
+      - name: Detect guard suite presence
+        id: guard
+        env:
+          GUARD: scripts/check-worktree-isolation.mjs
+          INSTALLER: scripts/install-worktree-isolation-hook.mjs
+          GUARD_TEST: scripts/__tests__/check-worktree-isolation.test.mjs
+          INSTALLER_TEST: scripts/__tests__/install-worktree-isolation-hook.test.mjs
+        run: |
+          present=all
+          for f in "$GUARD" "$INSTALLER" "$GUARD_TEST" "$INSTALLER_TEST"; do
+            if [ ! -f "$f" ]; then
+              echo "::notice title=Worktree guard suite not present::$f is missing on $(git rev-parse --short HEAD); the suite did not run on this pull request"
+              present=none
+            fi
+          done
+          echo "present=$present" >> "$GITHUB_OUTPUT"
+
+      - name: Report guard suite not landed
+        if: steps.guard.outputs.present == 'none'
+        run: |
+          {
+            echo "### Worktree guard suite: not run"
+            echo
+            echo "The worktree isolation guard is not on this pull request's head, so its"
+            echo "suite did not run. This check is **not** evidence that the guard suite"
+            echo "passed. Re-run it once the guard (PR #15) is on the head."
+            echo
+            echo "See KEE-999."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Test worktree isolation guard
+        if: steps.guard.outputs.present != 'none'
+        run: node --test ./scripts/__tests__/check-worktree-isolation.test.mjs
+
+      - name: Test worktree isolation hook installer
+        if: steps.guard.outputs.present != 'none'
+        run: node --test ./scripts/__tests__/install-worktree-isolation-hook.test.mjs
+
+      - name: Test fleet-guard downgrade cross-check
+        if: steps.guard.outputs.present != 'none'
+        run: node --test ./scripts/__tests__/kee962-crosscheck.test.mjs
+
+      # Runs on every trigger, guard present or not: it is what stops this
+      # lane from being deleted or silently narrowed back into a fake green.
+      - name: Test guard CI wiring
+        run: node --test ./scripts/__tests__/worktree-guard-ci-wiring.test.mjs
