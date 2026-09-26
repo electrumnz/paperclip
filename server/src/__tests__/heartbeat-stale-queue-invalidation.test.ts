@@ -662,6 +662,84 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     });
   });
 
+  it("skips the timer when every in-progress candidate past the first page has a cleared monitor", async () => {
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    const clearedExecutionState = {
+      status: "idle",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      monitor: {
+        status: "cleared",
+        nextCheckAt: null,
+        lastTriggeredAt: "2026-09-24T00:00:00.000Z",
+        attemptCount: 1,
+        notes: null,
+        scheduledBy: "assignee",
+        kind: null,
+        serviceName: null,
+        externalRef: null,
+        timeoutAt: null,
+        maxAttempts: null,
+        recoveryPolicy: null,
+        clearedAt: "2026-09-24T00:00:00.000Z",
+        clearReason: "invalid_status",
+      },
+    };
+    await db.insert(issues).values(
+      Array.from({ length: 101 }, (_, index) => ({
+        id: randomUUID(),
+        companyId,
+        title: `Cleared monitor only ${index}`,
+        status: "in_progress" as const,
+        priority: "medium" as const,
+        assigneeAgentId: agentId,
+        executionState: clearedExecutionState,
+        monitorNextCheckAt: null,
+      })),
+    );
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).toBeNull();
+    expect(mockAdapterExecute).not.toHaveBeenCalled();
+
+    const [wakeup] = await db
+      .select({
+        status: agentWakeupRequests.status,
+        reason: agentWakeupRequests.reason,
+        payload: agentWakeupRequests.payload,
+      })
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, agentId));
+    const runRows = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns);
+
+    expect(wakeup).toMatchObject({
+      status: "skipped",
+      reason: "heartbeat.timer.no_actionable_work",
+    });
+    expect(wakeup?.payload).toMatchObject({
+      heartbeatSkip: {
+        reason: expect.stringContaining("No assigned todo or in_progress issue"),
+      },
+    });
+    expect(runRows).toHaveLength(0);
+  });
+
   it("checks guarded issue status and assignee under the enqueue lock", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const parkedIssueId = randomUUID();
