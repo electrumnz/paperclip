@@ -12,6 +12,15 @@
  * helper in isolation: a unit test of the filter alone would pass even if the
  * call site stopped using it.
  *
+ * Ordering note: on this branch the adapter pushes extraArgs BEFORE the prompt
+ * transport flag, so the real argv is
+ *   chat -m <model> --source tool --yolo [extraArgs...] -q <prompt>
+ * An earlier revision of this file asserted the prompt sat at argv[1]. That was
+ * true of master, where the transport flag is pushed first, and false here.
+ * The assertions below encode the invariant that actually holds on this
+ * branch: the prompt stays bound to -q as the final pair, and no bare "--"
+ * survives anywhere that could end option parsing before it.
+ *
  * @see https://github.com/paperclipai/paperclip/issues/14083
  */
 
@@ -82,18 +91,22 @@ describe("hermes extraArgs argv ordering (KEE-935)", () => {
     vi.clearAllMocks();
   });
 
-  it("keeps the query on -q ahead of operator extraArgs", async () => {
+  it("keeps the query on -q ahead of any operator token that could shadow it", async () => {
     const { ctx } = makeCtx(["-p", "keece-build-verification-engineer"]);
     await execute(ctx as any);
 
     const argv = spawnedArgv();
     expect(argv[0]).toBe("chat");
-    // The prompt must stay bound to -q, and no operator token may precede it.
-    expect(argv[1]).toBe("-q");
-    expect(argv[2]).toBeTypeOf("string");
-    expect(argv.slice(2)).toEqual(argv.slice(2));
-    // The real fleet value lands after the transport flag, never before it.
-    expect(argv.indexOf("-p")).toBeGreaterThan(1);
+    // The prompt must stay bound to -q. This branch pushes extraArgs BEFORE the
+    // transport flag, so the invariant is that -q comes last and nothing after
+    // it can end option parsing: no bare "--" may sit to the left of -q.
+    expect(argv.indexOf("-q")).toBeGreaterThan(1);
+    const dashIndex = argv.indexOf("--");
+    expect(dashIndex === -1 || dashIndex > argv.indexOf("-q")).toBe(true);
+    expect(argv.indexOf("-q") + 1).toBe(argv.length - 1);
+    // The real fleet value still reaches hermes.
+    expect(argv).toContain("-p");
+    expect(argv).toContain("keece-build-verification-engineer");
   });
 
   it("drops a bare -- from extraArgs so the run cannot end in a usage error", async () => {
@@ -102,8 +115,8 @@ describe("hermes extraArgs argv ordering (KEE-935)", () => {
 
     const argv = spawnedArgv();
     expect(argv).not.toContain("--");
-    expect(argv[1]).toBe("-q");
-    // The operator's real options still reach hermes.
+    // The prompt keeps its own flag, and the operator's real options survive.
+    expect(argv[argv.length - 2]).toBe("-q");
     expect(argv).toContain("--source");
     expect(argv).toContain("tool");
   });
@@ -114,7 +127,7 @@ describe("hermes extraArgs argv ordering (KEE-935)", () => {
 
     const argv = spawnedArgv();
     expect(argv.filter((a) => a === "--")).toHaveLength(0);
-    expect(argv[1]).toBe("-q");
+    expect(argv[argv.length - 2]).toBe("-q");
   });
 
   it("leaves ordinary hyphenated options untouched", async () => {

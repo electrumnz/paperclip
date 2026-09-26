@@ -512,11 +512,13 @@ export async function execute(
   }
 
   if (extraArgs?.length) {
-    // Argparse ordering: the adapter's own transport flag (`-q <prompt>`) is
-    // already on argv at index 1, and every adapter flag is pushed before this
-    // block, so an operator's extraArgs cannot displace the prompt. A bare
-    // `--` in extraArgs is the one thing that can still break the run, because
-    // it ends option parsing for everything after it, so remove it here.
+    // Argparse ordering: this block runs before the prompt transport flag is
+    // chosen below, so an operator's extraArgs land on argv AHEAD of `-q
+    // <prompt>` / `--query-file -`. A bare `--` among them ends option parsing
+    // for everything after, which includes the transport flag itself, so
+    // hermes would take the query option as positional text and reject the
+    // run. Removing the bare marker is what keeps the prompt bound to its flag;
+    // the order of the remaining tokens is irrelevant to argparse.
     const stripped = stripBareDoubleDash(extraArgs);
     if (stripped.removed > 0) {
       await ctx.onLog(
