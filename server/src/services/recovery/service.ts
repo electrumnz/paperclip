@@ -4459,16 +4459,27 @@ export function recoveryService(
       if (latestRun?.status === "succeeded" && issue.status !== "in_review") {
         const [source] = await db.select({ runtimeMode: heartbeatRuns.runtimeMode }).from(heartbeatRuns).where(eq(heartbeatRuns.id, latestRun.id)).limit(1);
         if (source?.runtimeMode !== "native") {
-          const outcome = await reconcileLegacyContinuation(latestRun.id);
-          if (outcome === "queued") {
-            result.continuationRequeued += 1;
-            result.dispositionRepairRequeued += 1;
-            result.issueIds.push(issue.id);
-          } else if (outcome === "escalated") {
-            result.escalated += 1;
-            result.issueIds.push(issue.id);
-          } else result.skipped += 1;
-          continue;
+          // An `in_progress` issue whose monitor was cleared and which owns no
+          // durable wait path is a strand, not a legacy continuation. Legacy
+          // disposition repair would manufacture an issue-bound continuation
+          // and re-arm the timer churn this strand is meant to surface, so let
+          // the issue fall through to the cleared-monitor escalation below.
+          const isClearedMonitorStrand =
+            issue.status === "in_progress" &&
+            hasClearedIssueMonitor(issue) &&
+            !(await hasPersistedDurableWaitPath(issue, latestRun));
+          if (!isClearedMonitorStrand) {
+            const outcome = await reconcileLegacyContinuation(latestRun.id);
+            if (outcome === "queued") {
+              result.continuationRequeued += 1;
+              result.dispositionRepairRequeued += 1;
+              result.issueIds.push(issue.id);
+            } else if (outcome === "escalated") {
+              result.escalated += 1;
+              result.issueIds.push(issue.id);
+            } else result.skipped += 1;
+            continue;
+          }
         }
       }
 
