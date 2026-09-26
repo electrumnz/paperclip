@@ -66,6 +66,10 @@ const storedGuardPath = path.join(commonDir, "hooks", "worktree-isolation-guard.
 // works on every platform and does not depend on the hook's own cwd.
 const guardPath = path.join(repoRoot, "scripts", "check-worktree-isolation.mjs").split(path.sep).join("/");
 
+// The same file, repo-relative, because it is the path git knows it by: the
+// ordering of two revisions of it is what tells an update from a downgrade.
+const GUARD_RELATIVE_PATH = "scripts/check-worktree-isolation.mjs";
+
 // The lane this shim was installed from. Recorded so the NO GUARD FOUND
 // message can name a checkout an operator can actually cd into: 56 of the 58
 // worktree HEADs on this host have no scripts/install-worktree-isolation-hook.mjs
@@ -305,6 +309,168 @@ function refreshStoredGuard() {
 }
 
 /**
+ * The newest commit whose guard is exactly this content, or null when the
+ * repository has no such commit.
+ *
+ * Ordering is taken from the guard's own path-scoped history, not from a version
+ * number inside it, because the guard has no version marker and adding one would
+ * have to be carried into every revision that predates it.
+ *
+ * Two details of that history are load-bearing, and both were wrong in the first
+ * version of this:
+ *
+ *   - `--all` is required. Without it git lists only the commits reachable from
+ *     THIS lane, and the lane that needs the comparison most is the one behind
+ *     the fleet: it cannot see the newer guard's commit at all, so the two
+ *     contents are ranked against different lists. Measured: from a behind lane,
+ *     `git log -- <guard>` returned 2 revisions and `git log --all -- <guard>`
+ *     returned 3.
+ *
+ *   - the NEWEST commit carrying the content wins, which is what `git log`
+ *     already does by listing newest first. The same content is commonly carried
+ *     by several commits -- a guard that is added, edited and then reverted -- so
+ *     taking the last match would rank it by its oldest appearance instead.
+ *
+ * Content is matched by git's own blob id rather than by re-hashing bytes, so
+ * the STORED copy (which lives in the common git dir, not in the checkout) and a
+ * checkout copy carrying an uncommitted edit are compared on the same terms.
+ */
+function guardRevision(content) {
+  const wanted = gitBlobId(content);
+  if (wanted === null) return null;
+  let listed;
+  try {
+    listed = execFileSync("git", ["log", "--all", "--format=%H", "--", GUARD_RELATIVE_PATH], {
+      cwd: repoRoot,
+      encoding: "utf8",
+    })
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+  } catch {
+    return null;
+  }
+  for (const revision of listed) {
+    let blob;
+    try {
+      blob = execFileSync("git", ["rev-parse", `${revision}:${GUARD_RELATIVE_PATH}`], {
+        cwd: repoRoot,
+        encoding: "utf8",
+      }).trim();
+    } catch {
+      continue;
+    }
+    if (blob === wanted) return revision;
+  }
+  return null;
+}
+
+/**
+ * true / false, or null when git could not answer.
+ *
+ * Ancestry rather than commit timestamps, deliberately. Timestamps are second
+ * resolution, so two guard revisions committed in the same second are
+ * indistinguishable -- and the test fixture commits in the same second is not a
+ * contrived edge, it is what any fast local sequence produces. Measured: with
+ * timestamp ordering, an older and a newer guard committed in the same second
+ * compared equal, so the downgrade went ahead. Ancestry has no such tie: a commit
+ * is either reachable from another or it is not.
+ */
+function isAncestor(maybeAncestor, descendant) {
+  try {
+    execFileSync("git", ["merge-base", "--is-ancestor", maybeAncestor, descendant], { cwd: repoRoot });
+    return true;
+  } catch (error) {
+    // Exit 1 is git's "not an ancestor". Anything else is a real failure and
+    // must not be read as "not an ancestor".
+    return error && error.status === 1 ? false : null;
+  }
+}
+
+/**
+ * git's own id for some bytes, which is what a revision's `rev-parse <rev>:<path>`
+ * returns. `git hash-object --stdin` so it works for content that is not on disk
+ * at the guard's path -- the STORED copy lives in the common git dir, not in the
+ * checkout -- and for the checkout's copy when it carries an uncommitted edit.
+ */
+function gitBlobId(content) {
+  try {
+    return execFileSync("git", ["hash-object", "--stdin"], {
+      cwd: repoRoot,
+      input: content,
+      encoding: "utf8",
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Copy this checkout's guard over the stored one, but only when that is not a
+ * regression, and say which of the two it did.
+ *
+ * Returns "unchanged", "refreshed", "older" or "unknown".
+ *
+ * The refusing --install path calls this. It used to call refreshStoredGuard()
+ * unconditionally, on the argument that the guard is not the ambiguous object --
+ * only the shim is. That argument holds for the shim and misses for the guard,
+ * because the guard is copied FROM this lane's checkout: a lane behind the fleet
+ * has an older guard, so the copy pushes the older one to every worktree of the
+ * repository. Measured on KEE-958, from a lane whose guard is 0ed9476f against a
+ * stored 9a015171: exit 1, one "Refusing to guess" line, and stored(fleet)
+ * silently downgraded to 0ed9476f. 9a015171 is the revision that fails CLOSED
+ * when git rev-parse fails unexpectedly, so the run removed a fail-closed branch
+ * fleet-wide while reporting that it had refreshed the guard.
+ *
+ * Ordering is taken from the guard's own path-scoped history, not from a version
+ * number inside it, because the guard has no version marker and adding one would
+ * have to be carried into every revision that predates it.
+ *
+ * "unknown" means at least one side is not a revision this repository knows --
+ * a guard with an uncommitted edit in it, or one from a lane that is gone. That
+ * cannot prove a regression, so the refresh proceeds: this is the same decision
+ * the pre-existing test for the refusal path pins, where a `git pull` that
+ * arrived with a local edit is exactly what the operator is trying to publish.
+ * The limit is stated rather than hidden: an uncommitted guard in a lane BEHIND
+ * the stored one is still not detected as a downgrade.
+ */
+function refreshStoredGuardUnlessOlder() {
+  if (!existsSync(storedGuardPath)) {
+    refreshStoredGuard();
+    return "refreshed";
+  }
+  let stored;
+  let mine;
+  try {
+    stored = readFileSync(storedGuardPath, "utf8");
+    mine = readFileSync(guardPath, "utf8");
+  } catch {
+    refreshStoredGuard();
+    return "refreshed";
+  }
+  if (stored === mine) return "unchanged";
+  const storedRev = guardRevision(stored);
+  const mineRev = guardRevision(mine);
+  if (storedRev === null || mineRev === null) {
+    refreshStoredGuard();
+    return "unknown";
+  }
+  // Which of the two commits is ahead. "Is this lane's guard commit an ancestor
+  // of the stored one" answers it directly: if it is, the stored copy is
+  // already at or past this lane, so publishing this lane's would go backwards.
+  //
+  // Unrelated histories (a guard from a lane that was rebased away, say) cannot
+  // be ordered. That is not evidence of a regression, so the refresh proceeds,
+  // and the "unknown" return says so rather than reporting a decision it did
+  // not make.
+  if (mineRev === storedRev) return "unchanged";
+  const laneIsBehind = isAncestor(mineRev, storedRev);
+  if (laneIsBehind === true) return "older";
+  refreshStoredGuard();
+  return laneIsBehind === false ? "refreshed" : "unknown";
+}
+
+/**
  * Copy the hook that is about to be replaced to a timestamped sibling, so
  * replacing it is reversible.
  *
@@ -316,8 +482,9 @@ function refreshStoredGuard() {
  * inside our block, one --force run, zero copies of it left anywhere.
  *
  * The backup is a plain file next to the hook, in the same directory, named for
- * the revision that produced it and the time it was replaced. This host already
- * carries one from a hand repair -- pre-commit.pre-1023ffe31.20260926T064339Z.bak
+ * the revision that PRODUCED IT -- so the revision it came from, and the time it
+ * was replaced. This host already carries one from a hand repair --
+ * pre-commit.pre-1023ffe31.20260926T064339Z.bak
  * -- so the convention is the one an operator here will already recognise.
  *
  * It is a copy, not a rename: the rename onto the live hook is the atomic step
@@ -583,7 +750,8 @@ if (installed) {
       } else {
         // The shim is ambiguous and is being left alone, but the GUARD is not:
         // the stored copy is this script's own file, it is never hand-edited,
-        // and every commit in the fleet runs it. So refresh it before refusing.
+        // and every commit in the fleet runs it. So bring it in step before
+        // refusing.
         //
         // A deliberate change, because the alternative was to leave it alone and
         // the review is right that the refusal should not compound the problem.
@@ -597,7 +765,18 @@ if (installed) {
         // It is safe precisely because the two are not the same object: the
         // guard is copied from a known path with no decision to make about it,
         // and the shim is left exactly as it was found.
-        refreshStoredGuard();
+        //
+        // EXCEPT that the known path is this lane's checkout, and a lane can be
+        // behind the fleet -- 118 of 119 worktree HEADs on this host are. So
+        // "in step" has to mean "in step or newer", and not "whatever this lane
+        // happens to carry". Measured (KEE-958): lane guard 0ed9476f against a
+        // stored 9a015171, and the unconditional copy downgraded the stored
+        // guard fleet-wide on a run that also exited 1 saying it had refreshed
+        // it. 9a015171 is the revision that fails closed when git rev-parse
+        // fails unexpectedly, so that removed a fail-closed branch from every
+        // worktree while reporting an improvement. The exit code did not change,
+        // so nothing downstream could tell.
+        const guardOutcome = refreshStoredGuardUnlessOlder();
         process.stderr.write(
           `install-worktree-isolation-hook: ${hookPath} carries this script's marker and looks like\n` +
             `one of ours, but it is not the revision this script would write, and it cannot be told\n` +
@@ -609,10 +788,31 @@ if (installed) {
             `this again:\n` +
             `  rm ${hookPath}\n` +
             `If you have looked at it and want the new shim regardless:\n` +
-            `  node scripts/install-worktree-isolation-hook.mjs --install --force\n` +
-            `The stored guard has been refreshed, so commits in this repository are running the\n` +
-            `guard from this checkout. Only the shim above is unresolved.\n`,
+            `  node scripts/install-worktree-isolation-hook.mjs --install --force\n`,
         );
+        if (guardOutcome === "older") {
+          // Said explicitly, because the operator is standing in a lane that
+          // does not carry the current guard and the stored one is the newer of
+          // the two. Leaving it silent is how this reached a host at all.
+          process.stderr.write(
+            `The stored guard at ${storedGuardPath} has been left as it is: the guard in this\n` +
+              `checkout (${guardPath}) is an older revision than the one already stored, and the\n` +
+              `stored copy is the one every commit in this repository runs. Copying this lane's\n` +
+              `over it would roll the whole fleet back to a guard that has since been fixed.\n` +
+              `To put this lane's guard in force instead, run the installer from the lane that\n` +
+              `carries the current one.\n` +
+              `Only the shim above is unresolved.\n`,
+          );
+        } else {
+          // "unchanged" is folded in here deliberately: saying it was refreshed
+          // when the content is byte-identical would be a claim about an action
+          // that was not taken, which is the defect class this script exists to
+          // remove.
+          process.stderr.write(
+            `The stored guard has been refreshed, so commits in this repository are running the\n` +
+              `guard from this checkout. Only the shim above is unresolved.\n`,
+          );
+        }
         process.exit(1);
       }
     }

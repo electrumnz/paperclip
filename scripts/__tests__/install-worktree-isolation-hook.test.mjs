@@ -1115,3 +1115,149 @@ test("the refusal path refreshes the stored guard and still leaves the shim alon
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+// The test above cannot tell a DOWNGRADE from an update, because it only ever
+// runs from a lane that is current: it edits the checkout's guard forward, so
+// "this lane is newer" and "the stored copy should be replaced" are the same
+// observation. It passed on the revision that downgraded the fleet-wide guard
+// on every run, and passes on the one that does not.
+//
+// The hazard (KEE-958). The refusing --install path calls refreshStoredGuard(),
+// which copies the guard FROM THIS LANE'S CHECKOUT. 118 of 119 worktree HEADs
+// on this host are behind the fleet, so the common case is an operator standing
+// in a lane whose guard is OLDER than the stored one. Unconditionally copying it
+// over the stored copy rolls the guard back for every commit in every worktree
+// of the repository -- and the run still exits 1, prints one "Refusing to
+// guess" line, and says it has refreshed the guard, so nothing looks wrong.
+//
+// Measured on the revision that did this, from a lane carrying the guard as it
+// was at an earlier commit: stored(fleet) 9a015171 before, exit 1, 0ed9476f
+// after. Same start state, same exit code, same message, opposite outcome from
+// the pre-fix installer.
+//
+// So this is the sibling that discriminates: the stored guard is NEWER than the
+// lane's, and the stored copy must not regress.
+test("a refusing --install from a lane BEHIND the fleet does not roll the stored guard back", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const hookPath = path.join(main, ".git", "hooks", "pre-commit");
+    const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
+
+    // Two real revisions of the guard, committed, so the installer can order
+    // them. This is the whole mechanism: the stored copy carries no revision of
+    // its own, so "which is newer" is answered from the guard's own history.
+    const checkoutGuard = path.join(main, "scripts", "check-worktree-isolation.mjs");
+    const current = readFileSync(checkoutGuard, "utf8");
+    const older = `${current}\n// an older revision of the guard\n`;
+    writeFileSync(checkoutGuard, older);
+    git(["add", "-A"], main);
+    git(["commit", "-q", "-m", "guard: older revision"], main);
+    writeFileSync(checkoutGuard, current);
+    git(["add", "-A"], main);
+    git(["commit", "-q", "-m", "guard: current revision"], main);
+
+    // The fleet is on the CURRENT guard, stored by an install from this lane.
+    assert.equal(installHook(main, ["--install"]).status, 0);
+    const storedBefore = readFileSync(stored, "utf8");
+    assert.equal(storedBefore, current, "fixture is wrong: the stored guard is not the current one");
+
+    // A linked worktree at the EARLIER commit, sharing the same common hooks
+    // dir -- the operator's lane, behind the fleet.
+    const behind = path.join(root, "keece-issue-worktrees", "paperclip-kee-958-behind");
+    mkdirSync(path.dirname(behind), { recursive: true });
+    git(["worktree", "add", "-q", behind, "-b", "keece/kee-958-behind", "HEAD~1"], main);
+    assert.equal(
+      readFileSync(path.join(behind, "scripts", "check-worktree-isolation.mjs"), "utf8"),
+      older,
+      "fixture is wrong: the behind lane's guard is not the older revision",
+    );
+
+    // The stale shim, so --install takes the refusing branch at all.
+    const staleShim = readFileSync(hookPath, "utf8").replace(
+      "# Runs on every commit in every linked worktree of this repository.\n",
+      "",
+    );
+    writeFileSync(hookPath, staleShim, { mode: 0o755 });
+
+    const refused = installHook(behind, ["--install"]);
+    assert.equal(refused.status, 1, "control: the shim should still be refused");
+    assert.equal(
+      readFileSync(hookPath, "utf8"),
+      staleShim,
+      "the refusal path modified the shim anyway",
+    );
+
+    // The assertion this card exists for.
+    assert.equal(
+      readFileSync(stored, "utf8"),
+      storedBefore,
+      "a refusing --install from a lane behind the fleet DOWNGRADED the stored guard",
+    );
+
+    // And the operator is told, rather than the run quietly claiming a fix.
+    assert.match(
+      refused.stderr,
+      /has been left as it is: the guard in this/,
+      "the refusal does not say the stored guard was left alone, so a downgrade would be silent",
+    );
+    assert.doesNotMatch(
+      refused.stderr,
+      /stored guard has been refreshed/,
+      "the refusal claims a refresh that did not happen",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The other half of the ordering rule, and the one that makes the guard above
+// a real ordering test rather than a "refuse to touch it" test: a CURRENT lane
+// must still be able to fix the fleet on a refusing run. That is the KEE-955
+// benefit the unconditional refresh was added for, and a fix that removed the
+// downgrade by refusing to refresh at all would have given it away.
+//
+// Here this lane's guard IS the current revision and the stored one is the
+// older revision, both real commits, so the stored copy has to move forward
+// even though the shim is being refused.
+test("a refusing --install from a lane AHEAD of the stored guard still refreshes it", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const hookPath = path.join(main, ".git", "hooks", "pre-commit");
+    const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
+    const checkoutGuard = path.join(main, "scripts", "check-worktree-isolation.mjs");
+    const current = readFileSync(checkoutGuard, "utf8");
+
+    // Store the OLDER revision first, so this lane is the newer one.
+    const older = `${current}\n// an older revision of the guard\n`;
+    writeFileSync(checkoutGuard, older);
+    git(["add", "-A"], main);
+    git(["commit", "-q", "-m", "guard: older revision"], main);
+    assert.equal(installHook(main, ["--install"]).status, 0);
+    assert.equal(readFileSync(stored, "utf8"), older, "fixture is wrong: the stored guard is not the older one");
+
+    // Move this lane to the current guard.
+    writeFileSync(checkoutGuard, current);
+    git(["add", "-A"], main);
+    git(["commit", "-q", "-m", "guard: current revision"], main);
+
+    const staleShim = readFileSync(hookPath, "utf8").replace(
+      "# Runs on every commit in every linked worktree of this repository.\n",
+      "",
+    );
+    writeFileSync(hookPath, staleShim, { mode: 0o755 });
+
+    const refused = installHook(main, ["--install"]);
+    assert.equal(refused.status, 1, "control: the shim should still be refused");
+    assert.equal(readFileSync(hookPath, "utf8"), staleShim, "the refusal path modified the shim anyway");
+    assert.equal(
+      readFileSync(stored, "utf8"),
+      current,
+      "a current lane could not fix the fleet on a refusing run, which is the regression the refresh was added for",
+    );
+    assert.match(refused.stderr, /stored guard has been refreshed/, "the refusal does not say what it did fix");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
