@@ -56,6 +56,17 @@ const storedGuardPath = path.join(commonDir, "hooks", "worktree-isolation-guard.
 const guardPath = path.join(repoRoot, "scripts", "check-worktree-isolation.mjs").split(path.sep).join("/");
 
 const MARKER = "# installed by scripts/install-worktree-isolation-hook.mjs";
+
+// The shim's first line and its last two lines. Both are identical in every
+// revision of this script, so they are what identifies a hook as ours: the
+// header says who wrote it, the terminator says where our block ends and
+// anything after it belongs to somebody else.
+//
+// The terminator deliberately has no trailing newline. Everything here is
+// compared against trimmed content, because the file on disk is written from
+// `shim` and a raw byte comparison would never match its own output.
+const HEADER = "#!/bin/sh\n# One seat owns one worktree.";
+const TERMINATOR = 'node "$GUARD" "$@"\nexit $?';
 const shim = `#!/bin/sh
 # One seat owns one worktree. See scripts/check-worktree-isolation.mjs.
 # Runs on every commit in every linked worktree of this repository.
@@ -174,10 +185,12 @@ if (mode === "--uninstall") {
   }
   // Only remove what this script wrote. If somebody appended another check to
   // the same file, deleting it would silently drop their check from every
-  // worktree in this repository. Remove this script's block and leave the rest.
+  // worktree in this repository. Remove this script's block, identified by the
+  // header it starts with and the terminator it ends with, and leave the rest.
   const ours = shim.trimEnd();
-  if (current.includes(ours)) {
-    const remainder = current.replace(ours, "").trim();
+  const onDisk = current.trimEnd();
+  if (onDisk.startsWith(HEADER) && onDisk.includes(TERMINATOR)) {
+    const remainder = onDisk.slice(onDisk.indexOf(TERMINATOR) + TERMINATOR.length).trim();
     if (remainder.length === 0) {
       rmSync(hookPath);
     } else {
@@ -224,13 +237,45 @@ if (!existsSync(guardPath)) {
 }
 
 if (installed) {
-  // Re-install rather than skip: the stored guard may be older than the
-  // checkout's copy, and this is the only thing that keeps it fresh for
-  // worktrees whose own HEAD does not carry the guard.
-  copyFileSync(guardPath, storedGuardPath);
-  process.stdout.write(
-    `worktree isolation hook: already installed at ${hookPath}; guard refreshed at ${storedGuardPath}\n`,
-  );
+  // Re-install rather than skip. Both halves are refreshed: the stored guard,
+  // and the shim itself. Refreshing only the guard meant that after the shim
+  // was fixed, every host that had an older shim installed kept running it --
+  // the fixed installer never reached the live hook. That is the same
+  // "the code that runs is not the code I fixed" defect as the guard itself.
+  //
+  // Normalise trailing whitespace: the file on disk was written from `shim`,
+  // which ends in a newline, so comparing raw would never match its own output
+  // and an up-to-date hook would be rewritten on every run.
+  const ours = shim.trimEnd();
+  const onDisk = current.trimEnd();
+  if (onDisk === ours) {
+    process.stdout.write(
+      `worktree isolation hook: already installed at ${hookPath} and already current\n`,
+    );
+  } else if (onDisk.startsWith(HEADER)) {
+    // Ours, but an older revision of ours. Replace it wholesale. The boundary
+    // is the shim's own last two lines, which are the same in every revision
+    // and are the only thing this script emits. Anything after them is somebody
+    // else's and is kept. Splitting on that terminator rather than on a line
+    // count matters: the old revision may be longer or shorter than the new
+    // one, and a count taken from the new shim would slice into a foreign check
+    // or keep a tail of the stale shim.
+    const at = onDisk.indexOf(TERMINATOR);
+    const remainder = (at === -1 ? onDisk : onDisk.slice(at + TERMINATOR.length)).trim();
+    writeFileSync(hookPath, remainder.length > 0 ? `${ours}\n${remainder}\n` : `${ours}\n`, { mode: 0o755 });
+    process.stdout.write(`worktree isolation hook: outdated shim replaced at ${hookPath}\n`);
+  } else {
+    process.stderr.write(
+      `install-worktree-isolation-hook: ${hookPath} carries the marker but is not a revision of this\n` +
+        `script's shim, so it was left alone. It may be an older hook with a manual edit in it.\n` +
+        `Review it, then replace it deliberately.\n`,
+    );
+    process.exit(1);
+  }
+  const staging = `${storedGuardPath}.tmp-${process.pid}`;
+  copyFileSync(guardPath, staging);
+  renameSync(staging, storedGuardPath);
+  process.stdout.write(`worktree isolation guard: refreshed at ${storedGuardPath}\n`);
   process.exit(0);
 }
 
