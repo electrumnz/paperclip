@@ -7324,10 +7324,22 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           .where(eq(agents.id, agentId));
         release();
         if (next!)
-          await vi.waitFor(async () =>
-            expect((await heartbeat.getRun(next!.id))?.status).not.toBe(
-              "running",
-            ),
+          await vi.waitFor(
+            async () =>
+              expect((await heartbeat.getRun(next!.id))?.status).not.toBe(
+                "running",
+              ),
+            // The run only leaves `running` after executeRun's closing tail has
+            // settled: the deferred-comment promote, resumeRemoteStopComments,
+            // tool-action delivery and startNextQueuedRunForAgent, each a
+            // separate round trip. Without an explicit budget this inherits
+            // Vitest's 1000ms default, which is the only wait in this file
+            // that does — every other long drain here passes 2-3s. That is too
+            // tight once an earlier test's straggler is still draining (see the
+            // teardown barrier in afterEach), which is why only full-file runs
+            // hit it. Matches the file's other drain budgets, still well inside
+            // the 15s testTimeout.
+            { timeout: 5_000 },
           );
       }
     },
@@ -7430,28 +7442,51 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         },
       );
       try {
-        await vi.waitFor(async () => {
-          const [row] = await db.execute<{ count: number }>(sql`
+        // Everything between issuing the Stop and releaseRow() below runs while
+        // the Stop is blocked on the row lock this transaction holds. The Stop's
+        // terminalization runs under a 1s lock_timeout
+        // (terminalizeLegacyExecution, legacy-execution-recovery.ts), so the
+        // cumulative wall clock of these polls must stay well under 1s or
+        // Postgres abandons the update with 55P03 before the test releases it.
+        // Both waits are therefore explicitly bounded and tightly polled: the
+        // previous default 1000ms each could sum past the production budget on a
+        // loaded host. The assertions below still prove the Stop is genuinely
+        // blocked at the moment of release, so nothing is weakened.
+        await vi.waitFor(
+          async () => {
+            const [row] = await db.execute<{ count: number }>(sql`
           select count(*)::int as count from pg_stat_activity
           where datname = current_database() and ${pid} = any(pg_blocking_pids(pid))
             and query ilike '%update%heartbeat_runs%'
         `);
-          expect(row!.count).toBeGreaterThan(0);
-        });
+            expect(row!.count).toBeGreaterThan(0);
+          },
+          { timeout: 500, interval: 20 },
+        );
         releaseRegistration();
-        await vi.waitFor(() => expect(registrationAttempted).toBe(true));
+        await vi.waitFor(() => expect(registrationAttempted).toBe(true), {
+          timeout: 300,
+          interval: 10,
+        });
         // Readiness must remain behind the earlier Stop, without publishing a
         // joinable owner that would deadlock a duplicate Stop on this barrier.
         expect(adapterExecutionControls.has(runId)).toBe(false);
         expect(registered).toBe(false);
         expect(providerStarts).toBe(0);
         expect(stopReturned).toBe(false);
+        // Release the row lock the Stop is blocked on. This is the contract: the
+        // assertions above prove the Stop is still blocked at this instant, so
+        // the terminalization update must now win. The follow-up wait gets an
+        // explicit budget because the adapter still has to unblock and
+        // register after the lock drops.
         releaseRow();
         await lock;
         const result = await stopping;
         expect(result.error).toBeNull();
         expect(result.run).toMatchObject({ status: "cancelled" });
-        await vi.waitFor(() => expect(registered).toBe(true));
+        await vi.waitFor(() => expect(registered).toBe(true), {
+          timeout: 5_000,
+        });
         expect(context.signal?.aborted).toBe(true);
         expect(providerStarts).toBe(0);
         releaseAdapter();
