@@ -309,35 +309,48 @@ function refreshStoredGuard() {
 }
 
 /**
- * The newest commit whose guard is exactly this content, or null when the
- * repository has no such commit.
+ * blob id -> the commits carrying it, newest first, for the guard's path.
+ *
+ * A list per content rather than one commit, and that is the correction this
+ * function exists for. The same content is commonly carried by several commits
+ * -- a guard that is added, edited and then reverted -- and which carrier is
+ * "the" one depends on the question being asked:
+ *
+ *   - "is this lane ahead of the stored guard" is answered by the NEWEST
+ *     carrier, because that is the commit this lane is standing on;
+ *   - "has this lane's content ever been in force before the stored one" is
+ *     answered by ANY carrier, and only an any-carrier answer gets a revert
+ *     right.
+ *
+ * Taking the newest carrier for both questions is what shipped in 1f14cdd6e and
+ * it is wrong for a revert. History `c1 OLD -> c2 NEW -> c3 REVERT-to-OLD`, the
+ * fleet parked on NEW, the operator's lane on c3: the newest carrier of OLD is
+ * the REVERT, which is a DESCENDANT of c2, so "is this lane's carrier an
+ * ancestor of the stored one" answered false, the code read that as "this lane
+ * is ahead", and it published the OLD bytes over the NEW ones. Measured on
+ * KEE-960: stored 9a015171 -> 0ed9476f, exit 1, one refusal line, message
+ * claiming a refresh. The suite was 25/25 green on it, because a linear fixture
+ * cannot produce that ordering.
+ *
+ * `--all` is required, for the same reason as before: without it git lists only
+ * the commits reachable from THIS lane, and the lane that needs the comparison
+ * most is the one behind the fleet, which cannot see the newer guard's commit
+ * at all. Measured: from a behind lane, `git log -- <guard>` returned 2
+ * revisions and `git log --all -- <guard>` returned 3.
+ *
+ * Content is matched by git's own blob id rather than by re-hashing bytes, so
+ * the STORED copy (which lives in the common git dir, not in the checkout) and a
+ * checkout copy carrying an uncommitted edit are compared on the same terms.
  *
  * Ordering is taken from the guard's own path-scoped history, not from a version
  * number inside it, because the guard has no version marker and adding one would
  * have to be carried into every revision that predates it.
  *
- * Two details of that history are load-bearing, and both were wrong in the first
- * version of this:
- *
- *   - `--all` is required. Without it git lists only the commits reachable from
- *     THIS lane, and the lane that needs the comparison most is the one behind
- *     the fleet: it cannot see the newer guard's commit at all, so the two
- *     contents are ranked against different lists. Measured: from a behind lane,
- *     `git log -- <guard>` returned 2 revisions and `git log --all -- <guard>`
- *     returned 3.
- *
- *   - the NEWEST commit carrying the content wins, which is what `git log`
- *     already does by listing newest first. The same content is commonly carried
- *     by several commits -- a guard that is added, edited and then reverted -- so
- *     taking the last match would rank it by its oldest appearance instead.
- *
- * Content is matched by git's own blob id rather than by re-hashing bytes, so
- * the STORED copy (which lives in the common git dir, not in the checkout) and a
- * checkout copy carrying an uncommitted edit are compared on the same terms.
+ * Returns null when the history could not be read at all, which is different
+ * from an empty map: null means git refused, an empty map means the guard has
+ * never been committed. Callers must not read one as the other.
  */
-function guardRevision(content) {
-  const wanted = gitBlobId(content);
-  if (wanted === null) return null;
+function guardCarrierIndex() {
   let listed;
   try {
     listed = execFileSync("git", ["log", "--all", "--format=%H", "--", GUARD_RELATIVE_PATH], {
@@ -350,6 +363,7 @@ function guardRevision(content) {
   } catch {
     return null;
   }
+  const index = new Map();
   for (const revision of listed) {
     let blob;
     try {
@@ -360,9 +374,11 @@ function guardRevision(content) {
     } catch {
       continue;
     }
-    if (blob === wanted) return revision;
+    const carriers = index.get(blob);
+    if (carriers) carriers.push(revision);
+    else index.set(blob, [revision]);
   }
-  return null;
+  return index;
 }
 
 /**
@@ -377,6 +393,7 @@ function guardRevision(content) {
  * is either reachable from another or it is not.
  */
 function isAncestor(maybeAncestor, descendant) {
+  if (!maybeAncestor || !descendant) return null;
   try {
     execFileSync("git", ["merge-base", "--is-ancestor", maybeAncestor, descendant], { cwd: repoRoot });
     return true;
@@ -449,23 +466,49 @@ function refreshStoredGuardUnlessOlder() {
     return "refreshed";
   }
   if (stored === mine) return "unchanged";
-  const storedRev = guardRevision(stored);
-  const mineRev = guardRevision(mine);
-  if (storedRev === null || mineRev === null) {
+  const index = guardCarrierIndex();
+  if (index === null) {
     refreshStoredGuard();
     return "unknown";
   }
-  // Which of the two commits is ahead. "Is this lane's guard commit an ancestor
-  // of the stored one" answers it directly: if it is, the stored copy is
-  // already at or past this lane, so publishing this lane's would go backwards.
+  const storedCarriers = index.get(gitBlobId(stored)) ?? [];
+  const myCarriers = index.get(gitBlobId(mine)) ?? [];
+  if (storedCarriers.length === 0 || myCarriers.length === 0) {
+    refreshStoredGuard();
+    return "unknown";
+  }
+  // Two questions, two different answers, and conflating them is what shipped in
+  // 1f14cdd6e and had to be corrected after review.
   //
+  // (1) Has this lane's content EVER been in force at or before the stored
+  //     guard's newest carrier? Any carrier answers this, and the oldest of
+  //     this lane's carriers is the one that matters: in
+  //     `c1 OLD -> c2 NEW -> c3 REVERT-to-OLD` with the fleet parked on c2,
+  //     c1 is an ancestor of c2, so OLD is recognised as superseded and left
+  //     alone -- even though the newest carrier of OLD is c3, which is not.
+  //     Asking only about the newest carrier is the bug the review found: it
+  //     read c3 as "this lane is ahead" and published the old bytes.
+  //
+  // (2) Failing that, is this lane actually ahead of the stored guard? The
+  //     newest carrier answers it, because that is the commit this lane stands
+  //     on. A lane ahead of the stored guard fixes the fleet, which is the
+  //     KEE-955 benefit and the reason this refresh exists at all.
+  //
+  // (1) is checked first and it wins. A revert is the one case where the newest
+  // carrier says "ahead" and the answer is still "do not publish", and (1) is
+  // the only rule that catches it.
+  const storedNewest = storedCarriers[0];
+  const mineNewest = myCarriers[0];
+  const superseded = myCarriers.some((carrier) => isAncestor(carrier, storedNewest) === true);
+  if (superseded) return "older";
+  const laneIsBehind = isAncestor(mineNewest, storedNewest);
+  if (laneIsBehind === true) return "older";
   // Unrelated histories (a guard from a lane that was rebased away, say) cannot
   // be ordered. That is not evidence of a regression, so the refresh proceeds,
   // and the "unknown" return says so rather than reporting a decision it did
-  // not make.
-  if (mineRev === storedRev) return "unchanged";
-  const laneIsBehind = isAncestor(mineRev, storedRev);
-  if (laneIsBehind === true) return "older";
+  // not make. null from isAncestor is git failing to answer at all, which is
+  // reported the same way: the copy goes ahead, and the return value says the
+  // ordering was not established.
   refreshStoredGuard();
   return laneIsBehind === false ? "refreshed" : "unknown";
 }

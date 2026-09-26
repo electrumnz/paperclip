@@ -45,6 +45,17 @@ function git(args, cwd) {
 }
 
 /**
+ * git's own answer to "is a an ancestor of b": exit 0 yes, exit 1 no.
+ *
+ * Used by the fixtures to assert that the history shape they built really is
+ * the shape they are testing, so a green run cannot be a fixture that never
+ * produced it.
+ */
+function isAncestorExit(a, b, cwd) {
+  return spawnSync("git", ["merge-base", "--is-ancestor", a, b], { cwd, encoding: "utf8", env: gitEnv }).status;
+}
+
+/**
  * A repository laid out the way the fleet is: one common .git at the root, and
  * linked worktrees beside it. The hook is installed into the common dir, so the
  * commit has to run from a linked worktree to prove the coverage is real.
@@ -1212,35 +1223,60 @@ test("a refusing --install from a lane BEHIND the fleet does not roll the stored
 });
 
 // The other half of the ordering rule, and the one that makes the guard above
-// a real ordering test rather than a "refuse to touch it" test: a CURRENT lane
-// must still be able to fix the fleet on a refusing run. That is the KEE-955
-// benefit the unconditional refresh was added for, and a fix that removed the
-// downgrade by refusing to refresh at all would have given it away.
+// a real ordering test rather than a "refuse to touch it" test: a lane that
+// carries a genuinely NEWER guard must still be able to fix the fleet on a
+// refusing run. That is the KEE-955 benefit the unconditional refresh was added
+// for, and a fix that removed the downgrade by refusing to refresh at all would
+// have given it away.
 //
-// Here this lane's guard IS the current revision and the stored one is the
-// older revision, both real commits, so the stored copy has to move forward
-// even though the shim is being refused.
-test("a refusing --install from a lane AHEAD of the stored guard still refreshes it", () => {
+// The fixture has to build that case honestly, and the first version of this
+// test did not -- which is how the revert bug survived a green suite. It seeded
+// the repository with content A, committed B = A + comment, and then committed
+// A again as "current". So the lane's guard was A, the stored guard was B, and A
+// had been in force at the seed commit and superseded by B: a REVERT shape,
+// byte-for-byte the same state as the test above, with the opposite assertion.
+// The newest carrier of A was the newest commit, so the old rule read it as
+// "this lane is ahead" and refreshed -- and the test passed by way of exactly
+// the defect the review found.
+//
+// A genuine advance is the other shape: the lane's guard content is NOVEL, never
+// in force anywhere before. That is what an operator who just fixed the guard
+// has, and that is what this test now builds.
+test("a refusing --install from a lane carrying a NEWER guard still refreshes it", () => {
   const { root, main } = makeFleet();
   try {
     assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
     const hookPath = path.join(main, ".git", "hooks", "pre-commit");
     const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
     const checkoutGuard = path.join(main, "scripts", "check-worktree-isolation.mjs");
-    const current = readFileSync(checkoutGuard, "utf8");
+    const seed = readFileSync(checkoutGuard, "utf8");
 
-    // Store the OLDER revision first, so this lane is the newer one.
-    const older = `${current}\n// an older revision of the guard\n`;
-    writeFileSync(checkoutGuard, older);
-    git(["add", "-A"], main);
-    git(["commit", "-q", "-m", "guard: older revision"], main);
-    assert.equal(installHook(main, ["--install"]).status, 0);
-    assert.equal(readFileSync(stored, "utf8"), older, "fixture is wrong: the stored guard is not the older one");
+    // The fleet is on the SEED guard, stored by an install from this lane.
+    assert.equal(readFileSync(stored, "utf8"), seed, "fixture is wrong: the stored guard is not the seed one");
 
-    // Move this lane to the current guard.
-    writeFileSync(checkoutGuard, current);
+    // This lane now carries guard content that has never been in force anywhere.
+    const newer = `${seed}\n// a fix this repository has never carried before\n`;
+    writeFileSync(checkoutGuard, newer);
     git(["add", "-A"], main);
-    git(["commit", "-q", "-m", "guard: current revision"], main);
+    git(["commit", "-q", "-m", "guard: a fix"], main);
+
+    // Assert the shape, so a green run cannot be a fixture that never built it:
+    // the stored content's only carrier is the seed commit, and the new content
+    // is not reachable from it.
+    const seedCommit = git(["rev-parse", "HEAD~1"], main).trim();
+    const carriers = git(["log", "--all", "--format=%H", "--", "scripts/check-worktree-isolation.mjs"], main)
+      .split("\n")
+      .filter(Boolean);
+    assert.equal(
+      carriers.length,
+      2,
+      "fixture is wrong: the guard should have exactly two distinct contents in history",
+    );
+    assert.equal(
+      isAncestorExit(seedCommit, carriers[0], main),
+      0,
+      "fixture is wrong: the new content is not on top of the seed commit, so this is not an advance",
+    );
 
     const staleShim = readFileSync(hookPath, "utf8").replace(
       "# Runs on every commit in every linked worktree of this repository.\n",
@@ -1253,10 +1289,101 @@ test("a refusing --install from a lane AHEAD of the stored guard still refreshes
     assert.equal(readFileSync(hookPath, "utf8"), staleShim, "the refusal path modified the shim anyway");
     assert.equal(
       readFileSync(stored, "utf8"),
-      current,
-      "a current lane could not fix the fleet on a refusing run, which is the regression the refresh was added for",
+      newer,
+      "a lane with a genuinely newer guard could not fix the fleet on a refusing run, which is the regression the refresh was added for",
     );
     assert.match(refused.stderr, /stored guard has been refreshed/, "the refusal does not say what it did fix");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The BEHIND and AHEAD tests above are both strictly linear: c1 -> c2, and they
+// ask "which of the two carriers is ahead". A REVERT makes that question have
+// the wrong answer, and it is not a rare shape -- a bad guard change is reverted
+// in the normal course of maintaining one.
+//
+//   c1 OLD -> c2 NEW -> c3 REVERT-to-OLD
+//
+// The newest commit carrying OLD is c3, the revert, and c3 is a DESCENDANT of
+// c2. So "is this lane's carrier an ancestor of the stored carrier" answers
+// false, the code reads that as "this lane is ahead of the stored guard", and
+// publishes the OLD bytes over the NEW ones. The fleet is parked on NEW; the
+// operator's lane carries the reverted OLD guard; a refusing --install then
+// rolls the whole fleet back and says it refreshed the guard.
+//
+// Measured on KEE-960: stored 9a015171 -> 0ed9476f, exit 1, one refusal line,
+// and the message claimed a refresh while installing a regression. The suite was
+// 25/25 green on it, because a linear fixture cannot produce this ordering.
+test("a refusing --install from a REVERTED guard lane does not roll the stored guard back", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const hookPath = path.join(main, ".git", "hooks", "pre-commit");
+    const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
+    const checkoutGuard = path.join(main, "scripts", "check-worktree-isolation.mjs");
+    const current = readFileSync(checkoutGuard, "utf8");
+    const older = `${current}\n// an older revision of the guard\n`;
+
+    // c1: the OLD guard, committed.
+    writeFileSync(checkoutGuard, older);
+    git(["add", "-A"], main);
+    git(["commit", "-q", "-m", "guard: older revision"], main);
+
+    // c2: the NEW guard, committed. This is where the fleet is parked.
+    writeFileSync(checkoutGuard, current);
+    git(["add", "-A"], main);
+    git(["commit", "-q", "-m", "guard: current revision"], main);
+    assert.equal(installHook(main, ["--install"]).status, 0);
+    const storedBefore = readFileSync(stored, "utf8");
+    assert.equal(storedBefore, current, "fixture is wrong: the stored guard is not the current one");
+
+    // c3: revert the guard to the OLD bytes. Same content as c1, but its newest
+    // carrier is now a DESCENDANT of c2's -- which is the whole point.
+    writeFileSync(checkoutGuard, older);
+    git(["add", "-A"], main);
+    git(["commit", "-q", "-m", "Revert the guard to the older revision"], main);
+
+    // Prove the fixture really is the shape it claims, so a green run cannot be
+    // a fixture that never built the revert.
+    const carriers = git(["log", "--all", "--format=%H", "--", "scripts/check-worktree-isolation.mjs"], main)
+      .split("\n")
+      .filter(Boolean);
+    const revert = git(["rev-parse", "HEAD"], main).trim();
+    assert.equal(carriers[0], revert, "fixture is wrong: the revert is not the newest carrier of the old content");
+    const newCarrier = carriers.find((r) => r !== revert);
+    assert.ok(newCarrier, "fixture is wrong: the current content has no carrier");
+    assert.equal(
+      isAncestorExit(newCarrier, revert, main),
+      0,
+      "fixture is wrong: the revert is not a descendant of the new-content commit",
+    );
+
+    // The stale shim, so --install takes the refusing branch.
+    const staleShim = readFileSync(hookPath, "utf8").replace(
+      "# Runs on every commit in every linked worktree of this repository.\n",
+      "",
+    );
+    writeFileSync(hookPath, staleShim, { mode: 0o755 });
+
+    const refused = installHook(main, ["--install"]);
+    assert.equal(refused.status, 1, "control: the shim should still be refused");
+    assert.equal(readFileSync(hookPath, "utf8"), staleShim, "the refusal path modified the shim anyway");
+
+    // The assertion this test exists for: a revert lane must not outrank the
+    // stored guard just because the revert commit is the newer one.
+    assert.equal(
+      readFileSync(stored, "utf8"),
+      storedBefore,
+      "a refusing --install from a REVERTED guard lane DOWNGRADED the stored guard",
+    );
+
+    // And the message must not claim a refresh it did not perform.
+    assert.doesNotMatch(
+      refused.stderr,
+      /stored guard has been refreshed/,
+      "the refusal claims a refresh that did not happen",
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
