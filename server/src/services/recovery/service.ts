@@ -4456,6 +4456,23 @@ export function recoveryService(
         continue;
       }
 
+      // A cleared monitor is only a strand once every authority that could
+      // legitimately own the next action has declined it, so the strand verdict
+      // is needed by two lanes below: the legacy-continuation guard and the
+      // cleared-monitor escalation. Both read the same issue row and the same
+      // `latestRun` (this function never reassigns `latestRun` on a path that
+      // reaches the second lane), so resolve it once and reuse it rather than
+      // paying the durable-wait-path queries twice for one issue.
+      const isClearedMonitorStrand =
+        issue.status === "in_progress" && hasClearedIssueMonitor(issue);
+      let durableWaitPath: boolean | undefined;
+      const hasDurableWaitPath = async () => {
+        if (durableWaitPath === undefined) {
+          durableWaitPath = await hasPersistedDurableWaitPath(issue, latestRun);
+        }
+        return durableWaitPath;
+      };
+
       if (latestRun?.status === "succeeded" && issue.status !== "in_review") {
         const [source] = await db.select({ runtimeMode: heartbeatRuns.runtimeMode }).from(heartbeatRuns).where(eq(heartbeatRuns.id, latestRun.id)).limit(1);
         if (source?.runtimeMode !== "native") {
@@ -4464,11 +4481,7 @@ export function recoveryService(
           // disposition repair would manufacture an issue-bound continuation
           // and re-arm the timer churn this strand is meant to surface, so let
           // the issue fall through to the cleared-monitor escalation below.
-          const isClearedMonitorStrand =
-            issue.status === "in_progress" &&
-            hasClearedIssueMonitor(issue) &&
-            !(await hasPersistedDurableWaitPath(issue, latestRun));
-          if (!isClearedMonitorStrand) {
+          if (!(isClearedMonitorStrand && !(await hasDurableWaitPath()))) {
             const outcome = await reconcileLegacyContinuation(latestRun.id);
             if (outcome === "queued") {
               result.continuationRequeued += 1;
@@ -4554,36 +4567,6 @@ export function recoveryService(
       );
       if (activeRecoveryAction?.ownerType === "board") {
         result.skipped += 1;
-        continue;
-      }
-
-      const hasExplicitBlockerPath = await hasPersistedDurableWaitPath(
-        issue,
-        latestRun,
-      );
-      if (
-        issue.status === "in_progress" &&
-        hasClearedIssueMonitor(issue) &&
-        !hasExplicitBlockerPath
-      ) {
-        const updated = await escalateStrandedAssignedIssue({
-          issue,
-          previousStatus: "in_progress",
-          latestRun,
-          recoveryCause: "cleared_monitor_missing_wake_path",
-          notice: {
-            body:
-              "Paperclip found that this issue's monitor was cleared while the issue remained `in_progress`, and no blocker or other durable wait path owns the next action. Moving it to `blocked` so the missing wake path is visible for intervention.",
-            title: "Cleared monitor has no wake path",
-            tone: "danger",
-          },
-        });
-        if (updated) {
-          result.escalated += 1;
-          result.issueIds.push(issue.id);
-        } else {
-          result.skipped += 1;
-        }
         continue;
       }
 
@@ -4800,6 +4783,42 @@ export function recoveryService(
               latestRun,
               adapterFailureClassification,
             );
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+      }
+
+      // A cleared monitor is only a strand once every authority that could
+      // legitimately own the next action has declined it. An active subtree
+      // pause hold above means the board deliberately stopped the subtree, an
+      // operator-cancelled run means a human deliberately stopped the agent, and
+      // a failure-specific recovery path (provider quota monitor,
+      // configuration repair) owns the next step. Escalating `in_progress` to
+      // `blocked` before those lanes would fight a human decision and hide a
+      // monitor that is about to be scheduled.
+      if (isClearedMonitorStrand) {
+        // Same memoised read as the legacy-continuation guard above: this lane
+        // must not pay a second set of durable-wait-path queries for an issue
+        // the guard already resolved.
+        const hasExplicitBlockerPath = await hasDurableWaitPath();
+        if (!hasExplicitBlockerPath) {
+          const updated = await escalateStrandedAssignedIssue({
+            issue,
+            previousStatus: "in_progress",
+            latestRun,
+            recoveryCause: "cleared_monitor_missing_wake_path",
+            notice: {
+              body:
+                "Paperclip found that this issue's monitor was cleared while the issue remained `in_progress`, and no blocker or other durable wait path owns the next action. Moving it to `blocked` so the missing wake path is visible for intervention.",
+              title: "Cleared monitor has no wake path",
+              tone: "danger",
+            },
+          });
+          if (updated) {
             result.escalated += 1;
             result.issueIds.push(issue.id);
           } else {

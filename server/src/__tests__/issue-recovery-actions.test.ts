@@ -19,6 +19,7 @@ import {
   issueRecoveryActions,
   issueRelations,
   issueThreadInteractions,
+  issueTreeHolds,
   issues,
 } from "@paperclipai/db";
 import {
@@ -742,6 +743,181 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await db.select().from(issueRecoveryActions)).toEqual([expect.objectContaining({
       cause: "legacy_execution_requires_reconciliation", ownerType: "board", returnOwnerAgentId: coderId,
     })]);
+  });
+
+  // The three cases below are the review findings on PR #14076: the
+  // cleared-monitor escalation ran before the pause-hold, operator-cancel and
+  // adapter-failure lanes, so it fired even when a more specific authority
+  // owned the next action. A cleared monitor is only a strand after those
+  // lanes decline it.
+  async function seedClearedMonitorStrand() {
+    const seeded = await seedCompany();
+    await db
+      .update(issues)
+      .set({
+        monitorNextCheckAt: null,
+        executionPolicy: null,
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: {
+            status: "cleared",
+            nextCheckAt: null,
+            lastTriggeredAt: "2026-07-15T19:00:00.000Z",
+            attemptCount: 1,
+            notes: null,
+            scheduledBy: "assignee",
+            kind: null,
+            serviceName: null,
+            externalRef: null,
+            timeoutAt: null,
+            maxAttempts: null,
+            recoveryPolicy: null,
+            clearedAt: "2026-07-15T19:05:00.000Z",
+            clearReason: "invalid_status",
+          },
+        },
+      })
+      .where(eq(issues.id, seeded.sourceIssueId));
+    return seeded;
+  }
+
+  it("leaves a cleared in-progress monitor alone while a subtree pause hold is active", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedClearedMonitorStrand();
+    const rootIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: rootIssueId,
+      companyId,
+      title: "Paused recovery root",
+      status: "todo",
+      priority: "medium",
+      responsibleUserId: "responsible-user",
+      issueNumber: 2,
+      identifier: "RA-2",
+    });
+    await db
+      .update(issues)
+      .set({ parentId: rootIssueId })
+      .where(eq(issues.id, sourceIssueId));
+    await db.insert(issueTreeHolds).values({
+      companyId,
+      rootIssueId,
+      mode: "pause",
+      status: "active",
+      reason: "pause recovery subtree",
+      releasePolicy: { strategy: "manual" },
+    });
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "succeeded",
+      resultJson: { summary: "Cleared monitor strand under a pause hold." },
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+
+    const result = await recoveryService(db, { enqueueWakeup })
+      .reconcileStrandedAssignedIssues();
+
+    expect(result.escalated).toBe(0);
+    expect(result.skipped).toBe(1);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const [updated] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, sourceIssueId));
+    expect(updated?.status).toBe("in_progress");
+    expect(
+      await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId)),
+    ).toHaveLength(0);
+  });
+
+  it("leaves a cleared in-progress monitor alone after an operator cancelled the run", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedClearedMonitorStrand();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "cancelled",
+      error: "Interrupted by board comment",
+      errorCode: "operator_interrupted",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+
+    const result = await recoveryService(db, { enqueueWakeup })
+      .reconcileStrandedAssignedIssues();
+
+    expect(result.operatorCancelExempted).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    const [updated] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, sourceIssueId));
+    expect(updated?.status).toBe("in_progress");
+    expect(
+      await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId)),
+    ).toHaveLength(0);
+  });
+
+  it("keeps failure-specific recovery ahead of the cleared-monitor escalation", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedClearedMonitorStrand();
+    await db.insert(heartbeatRuns).values({
+      id: randomUUID(),
+      companyId,
+      agentId: coderId,
+      invocationSource: "manual",
+      status: "failed",
+      resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      error: "You've hit your usage limit for GPT-5. Try again at 12:00 AM (UTC).",
+      errorCode: "adapter_failed",
+      startedAt: new Date("2026-07-15T20:00:00.000Z"),
+      finishedAt: new Date("2026-07-15T20:01:00.000Z"),
+      contextSnapshot: { issueId: sourceIssueId },
+    });
+    const enqueueWakeup = vi.fn(async () => null);
+
+    const result = await recoveryService(db, { enqueueWakeup })
+      .reconcileStrandedAssignedIssues();
+
+    // The quota monitor owns the next action, so the issue must not be
+    // blocked as a cleared-monitor strand.
+    expect(result.providerQuotaMonitored).toBe(1);
+    expect(result.escalated).toBe(0);
+    const [updated] = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, sourceIssueId));
+    expect(updated?.status).toBe("in_progress");
+    expect(updated?.monitorNextCheckAt).toBeInstanceOf(Date);
+    expect(
+      await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, sourceIssueId)),
+    ).toHaveLength(0);
   });
 
   it("schedules a provider-quota monitor for the original assignee without creating recovery work", async () => {

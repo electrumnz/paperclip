@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -738,6 +739,93 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       },
     });
     expect(runRows).toHaveLength(0);
+  });
+
+  it("still finds actionable in-progress work on a later page when earlier pages are cleared monitors", async () => {
+    // Regression for the unbounded jsonb_agg aggregation: the replacement must
+    // keep answering correctly past one page while never materialising the
+    // whole backlog. 100 cleared strands sort first, the 101st has a scheduled
+    // monitor, so the bounded existence query misses it and only the keyset
+    // scan can find it.
+    const { companyId, agentId } = await seedCompanyAndAgent({
+      heartbeatConfig: {
+        enabled: true,
+        skipTimerWhenNoActionableWork: true,
+      },
+    });
+    const monitorNextCheckAt = new Date("2026-09-30T00:00:00.000Z");
+    const clearedExecutionState = {
+      status: "idle",
+      currentStageId: null,
+      currentStageIndex: null,
+      currentStageType: null,
+      currentParticipant: null,
+      returnAssignee: null,
+      reviewRequest: null,
+      completedStageIds: [],
+      lastDecisionId: null,
+      lastDecisionOutcome: null,
+      monitor: {
+        status: "cleared",
+        nextCheckAt: null,
+        lastTriggeredAt: "2026-09-24T00:00:00.000Z",
+        attemptCount: 1,
+        notes: null,
+        scheduledBy: "assignee",
+        kind: null,
+        serviceName: null,
+        externalRef: null,
+        timeoutAt: null,
+        maxAttempts: null,
+        recoveryPolicy: null,
+        clearedAt: "2026-09-24T00:00:00.000Z",
+        clearReason: "invalid_status",
+      },
+    };
+    // The keyset fallback pages by `id` ascending, so the ordering has to be
+    // deterministic or "later page" is a coin flip on random UUIDs. Give the
+    // 100 cleared strands ids that sort below the actionable one (`0000…` <
+    // `ffff…`) so the actionable issue is guaranteed to be on the second page.
+    const strandId = (index: number) =>
+      `00000000-0000-4000-8000-${String(index).padStart(12, "0")}`;
+    const actionableId = "ffffffff-ffff-4fff-bfff-ffffffffffff";
+    await db.insert(issues).values(
+      Array.from({ length: 100 }, (_, index) => ({
+        id: strandId(index),
+        companyId,
+        title: `Cleared monitor strand ${index}`,
+        status: "in_progress" as const,
+        priority: "medium" as const,
+        assigneeAgentId: agentId,
+        executionState: clearedExecutionState,
+        monitorNextCheckAt: null,
+      })),
+    );
+    await db.insert(issues).values({
+      id: actionableId,
+      companyId,
+      title: "Scheduled monitor on the next page",
+      status: "in_progress",
+      priority: "high",
+      assigneeAgentId: agentId,
+      executionState: {
+        ...clearedExecutionState,
+        monitor: { ...clearedExecutionState.monitor, status: "scheduled", nextCheckAt: monitorNextCheckAt.toISOString(), clearedAt: null, clearReason: null },
+      },
+      monitorNextCheckAt,
+    });
+
+    const run = await heartbeat.wakeup(agentId, {
+      source: "timer",
+      triggerDetail: "schedule",
+    });
+
+    expect(run).not.toBeNull();
+    expect(await waitForCondition(() => mockAdapterExecute.mock.calls.length === 1)).toBe(true);
+    await waitForCondition(async () => {
+      const runs = await db.select({ status: heartbeatRuns.status }).from(heartbeatRuns);
+      return runs.length === 1 && runs[0]?.status === "succeeded";
+    });
   });
 
   it("checks guarded issue status and assignee under the enqueue lock", async () => {
@@ -2036,5 +2124,51 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(countExecuteCallsForRun(runId)).toBe(1);
     await waitForCondition(async () => claimedIssue !== null);
     expect(claimedIssue).toEqual({ status: "in_progress", executionRunId: runId });
+  });
+});
+
+// Static guard for the resource-amplification defect in `hasActionableTimerWork`.
+// Deliberately a plain `describe`, not the embedded-Postgres one: it reads
+// source only, so it must keep running on hosts that skip the DB suites.
+//
+// The check answers a boolean, so no statement in it may carry per-row
+// execution state back for the whole candidate set. The original shape did
+// exactly that with `jsonb_agg(jsonb_build_object(...))` over every eligible
+// issue, on the hot path of every timer tick, scaling with the whole backlog.
+//
+// A source scan is used rather than a runtime query capture. Patching
+// `db.$client.unsafe` to observe SQL is not viable: the client is the
+// `withTransientWriteRetry` proxy, whose `unsafe` getter re-binds to the raw
+// target on every access, so a wrapper that calls back into the property it
+// replaced recurses until the stack overflows — that took out 31 unrelated tests
+// in the Postgres suite when first tried. This matches the existing guard style
+// in this repo (see authz-existence-oracle-guard.test.ts).
+describe("heartbeat timer actionable-work check", () => {
+  function readTimerCheckBody() {
+    const source = readFileSync(
+      new URL("../services/heartbeat.ts", import.meta.url),
+      "utf8",
+    );
+    const start = source.indexOf("async function hasActionableTimerWork(");
+    expect(start).toBeGreaterThan(-1);
+    const end = source.indexOf("\n  async function ", start + 1);
+    return source.slice(start, end === -1 ? undefined : end);
+  }
+
+  it("does not aggregate candidate rows into the result set", () => {
+    const body = readTimerCheckBody();
+    expect(body).not.toMatch(/jsonb_agg|jsonb_build_object|count\(\*\)/);
+  });
+
+  it("bounds every candidate read and pages past the first page", () => {
+    const body = readTimerCheckBody();
+    // The two existence probes and each keyset page carry an explicit limit.
+    expect(body.match(/\.limit\(/g)?.length ?? 0).toBeGreaterThanOrEqual(3);
+    // The keyset fallback is what keeps the answer correct past one page.
+    expect(body).toMatch(/gt\(issues\.id, cursor\)/);
+    expect(body).toMatch(/orderBy\(asc\(issues\.id\)\)/);
+    // It must re-check candidates with the authoritative JS predicate rather
+    // than trusting a SQL approximation of it.
+    expect(body).toMatch(/hasClearedIssueMonitor/);
   });
 });
