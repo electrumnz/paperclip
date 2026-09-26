@@ -3,7 +3,7 @@ import { createServer } from "node:http";
 import express from "express";
 import request from "supertest";
 import { WebSocketServer } from "ws";
-import { and, eq } from "drizzle-orm";
+import { and, eq, inArray } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -1073,9 +1073,45 @@ describeEmbeddedPostgres(
       expect(blocked.status, JSON.stringify(blocked.body)).toBe(200);
       expect(blocked.body.unblockDescriptor).toEqual(unblockDescriptor);
 
+      // The subject of this test is the stop relay, not the live-lock guard.
+      // The remaining steps below are ordinary non-terminal status writes, and
+      // the guard (added by this change) legitimately refuses those with 409
+      // while a run still holds execution on the issue.
+      //
+      // `seedLowTrustFixture` seeds three `running` heartbeat runs and pins
+      // `executionRunId` at one of them. Clearing the issue lock alone is not
+      // enough: `resolveActiveIssueRun` also falls back to the assignee's
+      // current active run, so the writes below kept flapping between `:1087`
+      // and `:1095` depending on background timing.
+      //
+      // Settle only the two runs that hold `assignedReview` and clear that
+      // issue's lock, so the guard has nothing live to refuse here. The third
+      // seeded run is deliberately left running: it holds `standardChild`, and
+      // the step below asserts the guard *does* return 409 for that issue.
+      // Settling the guard's own behaviour is covered directly in
+      // `issue-stale-execution-lock-routes.test.ts`.
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date() })
+        .where(
+          inArray(heartbeatRuns.id, [
+            fixture.runs.lowTrust.id,
+            fixture.runs.standard.id,
+          ]),
+        );
+      await db
+        .update(issues)
+        .set({
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+        })
+        .where(eq(issues.id, fixture.issues.assignedReview.id));
+
       await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
-        .send({ status: "todo" })
+        .send({ status: "todo", unblockDescriptor: null })
         .expect(200);
       await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
@@ -1083,7 +1119,7 @@ describeEmbeddedPostgres(
         .expect(200);
       await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
-        .send({ status: "todo" })
+        .send({ status: "todo", unblockDescriptor: null })
         .expect(200);
       await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
@@ -1106,10 +1142,24 @@ describeEmbeddedPostgres(
         })
         .expect(200);
 
+      // `standardChild` is standard-trust, so it produces no relay; this step
+      // only exists to prove a standard child's stop does not leak. The hold
+      // rules require an external status write to be refused while another run
+      // holds execution, so the board actor gets 409 here and must use the
+      // documented release path before the standard child can be completed.
       await request(app)
         .patch(`/api/issues/${fixture.issues.standardChild.id}`)
         .send({ status: "blocked", unblockDescriptor })
-        .expect(200);
+        .expect(409);
+      await db
+        .update(issues)
+        .set({
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+        })
+        .where(eq(issues.id, fixture.issues.standardChild.id));
       await request(app)
         .patch(`/api/issues/${fixture.issues.standardChild.id}`)
         .send({ status: "todo" })
