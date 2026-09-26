@@ -74,6 +74,14 @@ function installHook(main, args = []) {
   });
 }
 
+/**
+ * The same invocation as a full argv, for the one test that has to run the
+ * installer under `ulimit`, which needs to go through a shell.
+ */
+function installArgs(main, args = []) {
+  return [process.execPath, path.join(main, "scripts", "install-worktree-isolation-hook.mjs"), ...args];
+}
+
 test.after(() => {
   // Nothing global to clean; each test removes its own fleet.
 });
@@ -318,7 +326,13 @@ test("the stored guard is refreshed when the installer runs again", () => {
 // host that already had the older shim kept running it. The fixed installer
 // never reached the live hook -- the same "the code that runs is not the code I
 // fixed" shape as the guard itself.
-test("re-install replaces an outdated shim, and refuses a hook it cannot recognise", () => {
+// A shim that carries our marker but is not the revision this script would
+// write is refused, not replaced. "Unmodified older revision" and "somebody
+// hand-edited it" are the same observation, and guessing either way is a false
+// success: replacing destroys their check, refusing strands a host on a
+// known-bad shim. --force is the deliberate override, and the refusal has to
+// tell the operator which of the two commands applies.
+test("re-install refuses a shim it cannot recognise, and --force replaces it", () => {
   const { root, main } = makeFleet();
   try {
     assert.equal(installHook(main, ["--install"]).status, 0);
@@ -341,16 +355,31 @@ test("re-install replaces an outdated shim, and refuses a hook it cannot recogni
     assert.notEqual(staleShim, currentShim, "fixture is wrong: could not make an older shim");
     writeFileSync(hookPath, staleShim, { mode: 0o755 });
 
-    const reinstall = installHook(main, ["--install"]);
-    assert.equal(reinstall.status, 0, reinstall.stdout + reinstall.stderr);
-    assert.match(reinstall.stdout, /outdated shim replaced/);
+    // Refused, and it says how to resolve it both ways.
+    const refusedStale = installHook(main, ["--install"]);
+    assert.equal(refusedStale.status, 1, "a stale shim was replaced without being asked");
+    assert.match(refusedStale.stderr, /cannot be told\s+apart from a hand-edited hook/);
+    assert.match(refusedStale.stderr, /rm /, "the refusal does not say how to resolve it");
+    assert.match(refusedStale.stderr, /--force/, "the refusal does not mention the override");
+    assert.equal(
+      readFileSync(hookPath, "utf8"),
+      staleShim,
+      "a refused shim was modified anyway",
+    );
+
+    // The deliberate override does replace it, and says that it discarded
+    // whatever was there.
+    const forced = installHook(main, ["--install", "--force"]);
+    assert.equal(forced.status, 0, forced.stdout + forced.stderr);
+    assert.match(forced.stderr, /--force/);
+    assert.match(forced.stdout, /outdated shim replaced/);
     // Compared on trimmed content: the installer writes `shim` with its
     // trailing newline and compares normalised, so the raw file is not
     // byte-identical to the in-memory template.
     assert.equal(
       readFileSync(hookPath, "utf8").trimEnd(),
       currentShim.trimEnd(),
-      "the outdated shim was not replaced",
+      "--force did not replace the shim",
     );
 
     // Idempotence: a second run must report the shim is current, not rewrite it.
@@ -375,7 +404,16 @@ test("re-install replaces an outdated shim, and refuses a hook it cannot recogni
 // branch in the shim that has a stated argument behind it had no coverage at
 // all. It is pinned here deliberately, so the next person to "fix" it has to
 // come here and say why.
-test("with no guard anywhere the shim warns loudly and exits 0, and says what to do", () => {
+//
+// The argument has since changed sides. I chose exit 0 and put the decision to
+// the review to be made by someone other than me; the security review reached
+// the opposite conclusion independently, and on reflection it is right. A hook
+// that cannot enforce anything is indistinguishable from no hook, and a guard
+// that reports success while enforcing nothing is the failure this card exists
+// to end. So: fail CLOSED when a seat identity is set, which is the case the
+// control exists for, and keep the loud warning for a human with no seat
+// identity, who is not governed by the seat rule.
+test("with no guard anywhere a seat commit is refused, and a human commit is warned", () => {
   const { root, main } = makeFleet();
   try {
     // Install, then remove the guard everywhere the shim can look: the stored
@@ -400,16 +438,45 @@ test("with no guard anywhere the shim warns loudly and exits 0, and says what to
     );
     writeFileSync(path.join(own, "h.txt"), "h\n");
     git(["add", "h.txt"], own);
+    const headBefore = git(["rev-parse", "HEAD"], own).trim();
 
-    const commit = spawnSync("git", ["commit", "-m", "unguarded"], {
+    // A SEAT commit with no guard: refused, and the refusal is not silent.
+    const seatCommit = spawnSync("git", ["commit", "-m", "unguarded-seat"], {
       cwd: own,
       encoding: "utf8",
       env: { ...gitEnv, PAPERCLIP_AGENT_ID: SEAT_A, KEE_WORKTREE_ROOT: worktrees },
     });
-    const output = `${commit.stdout}${commit.stderr}`;
-    assert.equal(commit.status, 0, `NO GUARD FOUND should not block a commit: ${output}`);
-    assert.match(output, /NO GUARD FOUND/, "the unguarded state was silent");
-    assert.match(output, /install-worktree-isolation-hook/, "the warning does not say how to fix it");
+    const seatOutput = `${seatCommit.stdout}${seatCommit.stderr}`;
+    assert.notEqual(seatCommit.status, 0, `a seat commit with no guard was allowed: ${seatOutput}`);
+    assert.equal(
+      git(["rev-parse", "HEAD"], own).trim(),
+      headBefore,
+      "the commit landed even though the hook refused it",
+    );
+    assert.match(seatOutput, /NO GUARD FOUND/, "the refusal was silent");
+    assert.match(seatOutput, /refusing the commit/, "the refusal does not say what it is doing");
+    assert.match(seatOutput, /install-worktree-isolation-hook/, "the refusal does not say how to fix it");
+    // A hook that exits 0 having enforced nothing is the defect, so a crash is
+    // not an acceptable substitute for a decision.
+    assert.doesNotMatch(seatOutput, /Cannot find module/, "the shim crashed instead of deciding");
+
+    // A HUMAN commit with no guard: warned loudly, not blocked, and the
+    // warning still says that seat commits are refused.
+    writeFileSync(path.join(own, "h2.txt"), "h2\n");
+    git(["add", "h2.txt"], own);
+    const humanEnv = { ...gitEnv, KEE_WORKTREE_ROOT: worktrees };
+    delete humanEnv.PAPERCLIP_AGENT_ID;
+    const humanCommit = spawnSync("git", ["commit", "-m", "unguarded-human"], {
+      cwd: own,
+      encoding: "utf8",
+      env: humanEnv,
+    });
+    const humanOutput = `${humanCommit.stdout}${humanCommit.stderr}`;
+    assert.equal(humanCommit.status, 0, `a human commit should not be blocked: ${humanOutput}`);
+    assert.match(humanOutput, /NO GUARD FOUND/, "the unguarded state was silent for a human either");
+    assert.match(humanOutput, /will be refused/, "the human is not told seat commits are refused");
+    assert.match(humanOutput, /install-worktree-isolation-hook/, "the warning does not say how to fix it");
+
     // And --check must not call this healthy.
     assert.notEqual(installHook(main, ["--check"]).status, 0, "--check reported a guard that is gone");
   } finally {
@@ -566,7 +633,7 @@ test("the stored guard is written before the hook, and no staging file is left b
 
     const source = readFileSync(installer, "utf8");
     const storeAt = source.indexOf("renameSync(staging, storedGuardPath)");
-    const hookAt = source.indexOf("writeFileSync(hookPath, shim");
+    const hookAt = source.indexOf("writeFileAtomic(hookPath, shim");
     assert.ok(storeAt > -1 && hookAt > -1, "fixture is wrong: both writes should be present");
     assert.ok(
       storeAt < hookAt,
@@ -574,5 +641,203 @@ test("the stored guard is written before the hook, and no staging file is left b
     );
   } finally {
     rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The findings that arrived on e5788c1e0, after the KEE-943 review closed. All
+// four were reproduced by hand against the previous revision before being
+// fixed, and each is pinned here against the same shapes.
+
+// Greptile P1 "relative hooks path misses worktrees". Git resolves a relative
+// core.hooksPath against the repository the commit happens in. A linked
+// worktree's .git is a FILE, not a directory, so a relative path that is
+// correct from the installing checkout resolves somewhere else -- usually
+// nowhere -- from a linked worktree.
+//
+// The probe has to be decisive. A commit landing does not show whether the hook
+// ran and allowed it, or never ran at all, so the fixture replaces the hook
+// with one that always refuses and prints where it ran. That is the only way to
+// tell "allowed" from "never invoked".
+test("a relative core.hooksPath is refused: it does not resolve in a linked worktree", () => {
+  const { root, main } = makeFleet();
+  try {
+    // A hook that always refuses, so the result cannot be ambiguous.
+    const hookPath = path.join(main, ".git", "hooks", "pre-commit");
+    writeFileSync(hookPath, "#!/bin/sh\necho HOOK-RAN >&2\nexit 1\n", { mode: 0o755 });
+    git(["config", "core.hooksPath", ".git/hooks"], main);
+
+    const worktrees = path.join(root, "keece-issue-worktrees");
+    mkdirSync(worktrees, { recursive: true });
+    const lane = path.join(worktrees, "paperclip-kee-923");
+    git(["worktree", "add", "-q", lane, "-b", "keece/kee-923"], main);
+
+    // From the primary checkout the relative path IS correct, so this is the
+    // case the previous check resolved and accepted.
+    writeFileSync(path.join(main, "p.txt"), "p\n");
+    git(["add", "p.txt"], main);
+    const primary = spawnSync("git", ["commit", "-m", "primary"], {
+      cwd: main,
+      encoding: "utf8",
+      env: gitEnv,
+    });
+    assert.notEqual(primary.status, 0, "fixture is wrong: the probe hook did not refuse in the primary checkout");
+    assert.match(primary.stderr, /HOOK-RAN/, "the probe hook did not run in the primary checkout");
+
+    // And the shape that is broken: in the linked worktree git resolves the
+    // same relative path somewhere that has no hook, so the commit lands.
+    writeFileSync(path.join(lane, "l.txt"), "l\n");
+    git(["add", "l.txt"], lane);
+    const headBefore = git(["rev-parse", "HEAD"], lane).trim();
+    const inLane = spawnSync("git", ["commit", "-m", "linked"], {
+      cwd: lane,
+      encoding: "utf8",
+      env: gitEnv,
+    });
+    assert.equal(inLane.status, 0, "fixture is wrong: the linked worktree was not unguarded");
+    assert.doesNotMatch(inLane.stderr, /HOOK-RAN/, "fixture is wrong: the hook did run in the linked worktree");
+    assert.notEqual(git(["rev-parse", "HEAD"], lane).trim(), headBefore, "the probe commit did not land");
+
+    // So the installer must refuse this configuration rather than report a
+    // success that enforces nothing in the very worktrees that need it.
+    const refused = installHook(main, ["--install"]);
+    assert.equal(refused.status, 1, "a relative core.hooksPath was accepted");
+    assert.match(refused.stderr, /relative path/, "the refusal does not name the relative path as the problem");
+    assert.match(refused.stderr, /Unset core\.hooksPath/, "the refusal does not say how to fix it");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Greptile P1 "reinstall can truncate live hook". writeFileSync opens with
+// O_TRUNC and then writes, so an interrupted write leaves the live hook
+// truncated. That is worse than skipping the guard: the shim ends mid-string,
+// the shell fails to parse it, prints "unexpected EOF", and git ALLOWS the
+// commit anyway.
+//
+// Reproduced with `ulimit -f 1`, which lets the truncate land and then fails
+// the write. chmod 444 does not reproduce it: that fails at open(), before
+// anything is truncated, which is why an earlier attempt at this check passed
+// against the broken code.
+test("an interrupted re-install leaves the live hook byte-identical, not truncated", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0);
+    const hookPath = path.join(main, ".git", "hooks", "pre-commit");
+
+    // Make it a shim this script would not write, so the replace path is the
+    // one under test. --force is what an operator would use to get past the
+    // new refusal, and it is the path that used to truncate.
+    const stale = readFileSync(hookPath, "utf8").replace(
+      "# Runs on every commit in every linked worktree of this repository.\n",
+      "",
+    );
+    writeFileSync(hookPath, stale, { mode: 0o755 });
+    const before = readFileSync(hookPath, "utf8");
+
+    // RLIMIT_FSIZE of one block: the write fails part way, after the file has
+    // been opened for truncation.
+    const interrupted = spawnSync("sh", ["-c", 'ulimit -f 1; exec "$0" "$@"', ...installArgs(main, ["--install", "--force"])], {
+      cwd: main,
+      encoding: "utf8",
+    });
+    assert.notEqual(interrupted.status, 0, "fixture is wrong: the write was not interrupted");
+
+    const after = readFileSync(hookPath, "utf8");
+    assert.equal(after, before, "the live hook was truncated by an interrupted install");
+    assert.match(after, /\nexit \$\?\n$/, "the surviving shim does not end with the guard invocation");
+    // The staging file must be cleaned up, or it accumulates in .git/hooks.
+    const leftovers = readdirSync(path.join(main, ".git", "hooks")).filter((f) => f.includes(".tmp-"));
+    assert.deepEqual(leftovers, [], "a staging file was left behind by the failed install");
+
+    // And the shim still enforces: a cross-seat commit is refused.
+    const worktrees = path.join(root, "keece-issue-worktrees");
+    mkdirSync(worktrees, { recursive: true });
+    const shared = path.join(worktrees, "paperclip-kee-923");
+    git(["worktree", "add", "-q", shared, "-b", "keece/kee-923"], main);
+    writeFileSync(path.join(shared, "s.txt"), "s\n");
+    git(["add", "s.txt"], shared);
+    const headBefore = git(["rev-parse", "HEAD"], shared).trim();
+    const crossSeat = spawnSync("git", ["commit", "-m", "cross-seat"], {
+      cwd: shared,
+      encoding: "utf8",
+      env: { ...gitEnv, PAPERCLIP_AGENT_ID: SEAT_A, KEE_WORKTREE_ROOT: worktrees },
+    });
+    assert.notEqual(crossSeat.status, 0, "the surviving hook stopped enforcing");
+    assert.equal(git(["rev-parse", "HEAD"], shared).trim(), headBefore, "a cross-seat commit landed");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// Greptile P2 "reinstall discards hook edits". An operator's hand-edited hook
+// and an unmodified older revision of ours are the same observation, and the
+// previous behaviour picked "older revision" and destroyed their edit while
+// printing "outdated shim replaced" and exiting 0.
+//
+// Three shapes, because they are three different things and the distinction is
+// the point:
+//
+//   appended, body unchanged  -- our block is current, their check follows it.
+//                               Replacing our block keeps their content, which
+//                               is what the remainder path is for. Pinned so the
+//                               refusal below does not over-reach and start
+//                               blocking a case that is actually safe.
+//   appended, body changed   -- our block is stale AND their check follows it.
+//                               Ambiguous, so it must refuse rather than pick.
+//   in-block                 -- their edit is inside the shim we would rewrite,
+//                               so there is no remainder to preserve and the
+//                               only way to keep it is to refuse.
+test("re-install keeps an appended check, and refuses when the shim itself was edited", () => {
+  const shapes = [
+    { name: "appended, body unchanged", editBody: false, expectStatus: 0 },
+    { name: "appended, body changed", editBody: true, expectStatus: 1 },
+    { name: "in-block", editBody: true, expectStatus: 1, inBlock: true },
+  ];
+
+  for (const { name, editBody, expectStatus, inBlock = false } of shapes) {
+    const { root, main } = makeFleet();
+    try {
+      assert.equal(installHook(main, ["--install"]).status, 0, `fixture is wrong (${name})`);
+      const hookPath = path.join(main, ".git", "hooks", "pre-commit");
+      const current = readFileSync(hookPath, "utf8");
+
+      // Staleness, if this shape needs it: drop a line from our own block, so
+      // the shim on disk is not the revision this script would write.
+      const stale = editBody
+        ? current.replace("# Runs on every commit in every linked worktree of this repository.\n", "")
+        : current;
+
+      const edited = inBlock
+        ? stale.replace(
+            'GUARD="${KEE_WORKTREE_ISOLATION_GUARD:-}"',
+            'echo OPERATOR-CHECK >&2\nGUARD="${KEE_WORKTREE_ISOLATION_GUARD:-}"',
+          )
+        : `${stale}# operator's own check\necho OPERATOR-CHECK >&2\n`;
+      assert.match(edited, /OPERATOR-CHECK/, `fixture is wrong: the ${name} edit did not apply`);
+      writeFileSync(hookPath, edited, { mode: 0o755 });
+
+      const reinstall = installHook(main, ["--install"]);
+      assert.equal(
+        reinstall.status,
+        expectStatus,
+        `wrong outcome for ${name}: ${reinstall.stdout}${reinstall.stderr}`,
+      );
+      assert.match(
+        readFileSync(hookPath, "utf8"),
+        /OPERATOR-CHECK/,
+        `the operator's check was silently discarded in the ${name} case`,
+      );
+      if (expectStatus !== 0) {
+        assert.doesNotMatch(
+          reinstall.stdout,
+          /outdated shim replaced/,
+          `claimed to replace an edited hook in the ${name} case`,
+        );
+        assert.match(reinstall.stderr, /--force/, `the ${name} refusal does not say how to resolve it`);
+      }
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   }
 });
