@@ -482,12 +482,17 @@ index a1f4a70a003792c6eacf68b6b038f37bfec1db53..2f27d6938ad81c59cfc62191ab386154
  	}
  	async load(sessionId) {
  		await this.ensureDir();
-@@ -1835,7 +1907,7 @@ var FileSessionStore = class {
+@@ -1835,7 +1907,12 @@ var FileSessionStore = class {
  		const file = this.filePath(record.acpxRecordId);
  		const tempFile = createAtomicWriteTempPath(file);
  		const payload = JSON.stringify(persisted, null, 2);
 -		await fs.writeFile(tempFile, `${payload}\n`, "utf8");
 +		await fs.writeFile(tempFile, `${payload}\n`, { encoding: "utf8", mode: 0o600 });
++		// Owner-only at creation, not create-then-chmod: a chmod leaves a window
++		// where the record is world-readable under the process umask. This is
++		// narrowing, not a control that works: every seat runs as the same OS
++		// account, so 0o600 keeps these records from other OS users and from
++		// nothing else. Same-account access is unaffected by mode bits.
  		await fs.rename(tempFile, file);
  	}
  };

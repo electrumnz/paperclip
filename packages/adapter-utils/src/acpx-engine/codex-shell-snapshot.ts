@@ -14,6 +14,19 @@ import { parse as parseToml } from "smol-toml";
  * homes it materializes. The ACPX engine's effective Codex home may instead be
  * seeded from the operator's `~/.codex/config.toml`, so this module applies the
  * same policy before every Codex launch.
+ *
+ * SCOPE — this is narrowing, not a control that works. Every seat on this host
+ * runs as the same `love4vengeance` OS account, so `0o600` files and `0o700`
+ * directories keep these paths away from *other OS users* and from nothing
+ * else. They do not stop one seat, one process, or one compromised agent on
+ * this account from reading another seat's session records or shell snapshots;
+ * same-account access is unaffected by POSIX permission bits. The
+ * shared-account problem is untouched by this change and needs a separate
+ * control (per-seat OS users, or an encryption boundary above this layer).
+ * What this does buy: an accidental `0644` file, a backup/copy that escapes
+ * its directory, and a `ps`-visible or index-visible path stop being
+ * world-readable by default. Treat the achieved modes as a reduction in blast
+ * radius, not as the reason a credential is safe on disk.
  */
 const MANAGED_BEGIN = "# >>> paperclip codex runtime policy -- managed, do not edit >>>";
 const MANAGED_END = "# <<< paperclip codex runtime policy <<<";
