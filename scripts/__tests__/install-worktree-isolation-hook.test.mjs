@@ -82,6 +82,19 @@ function installArgs(main, args = []) {
   return [process.execPath, path.join(main, "scripts", "install-worktree-isolation-hook.mjs"), ...args];
 }
 
+/**
+ * The branch of the shim that prefers the stored guard, as a matcher.
+ *
+ * The shim is written with the absolute stored-guard path already interpolated
+ * into it, so the block is found by shape -- `if [ -f "<path>" ]` -- rather
+ * than by a hard-coded /tmp. The literal form only ever passed because mkdtemp
+ * happened to hand back a POSIX-looking path, which is the portability defect
+ * the KEE-954 review flagged, not a property of the installer.
+ */
+function storedGuardBranch() {
+  return /  if \[ -f "[^"]+" \]; then\n[\s\S]*?\n  fi\n/;
+}
+
 test.after(() => {
   // Nothing global to clean; each test removes its own fleet.
 });
@@ -342,14 +355,19 @@ test("re-install refuses a shim it cannot recognise, and --force replaces it", (
     // An older revision of our shim: the same header, but the checkout-first
     // resolution order that 1023ffe31 shipped. The first three lines of the
     // header are what identify the shim as ours, so those are kept.
-    const currentBlock = /  if \[ -f "\/tmp\/[^"]+" \]; then\n[\s\S]*?\n  fi\n/;
+    //
+    // The branch is matched by shape and the injected path is a real one under
+    // this fleet's own root, so the fixture reads the same on any platform.
+    // See storedGuardBranch for why a literal /tmp was wrong here.
+    const currentBlock = storedGuardBranch();
     assert.ok(currentBlock.test(currentShim), "fixture is wrong: no stored-guard branch found");
+    const elsewhere = path.join(root, "stored-elsewhere.mjs").split(path.sep).join("/");
     const staleBlock =
       '  TOPLEVEL=$(git rev-parse --show-toplevel 2>/dev/null) || TOPLEVEL=""\n' +
       '  if [ -n "$TOPLEVEL" ] && [ -f "$TOPLEVEL/scripts/check-worktree-isolation.mjs" ]; then\n' +
       '    GUARD="$TOPLEVEL/scripts/check-worktree-isolation.mjs"\n' +
-      '  elif [ -f "/tmp/stored-elsewhere.mjs" ]; then\n' +
-      '    GUARD="/tmp/stored-elsewhere.mjs"\n' +
+      `  elif [ -f "${elsewhere}" ]; then\n` +
+      `    GUARD="${elsewhere}"\n` +
       '  fi\n';
     const staleShim = currentShim.replace(currentBlock, staleBlock);
     assert.notEqual(staleShim, currentShim, "fixture is wrong: could not make an older shim");
@@ -839,5 +857,261 @@ test("re-install keeps an appended check, and refuses when the shim itself was e
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// KEE-955, from the third review of this branch (KEE-954). Four findings, each
+// reproduced by hand against 62d784879 before being fixed, and each pinned here
+// against the same shape so the fix cannot be quietly undone.
+//
+// The first one is the blocker. --check is the supported health command for
+// this hook, and it answered "is there a file carrying our marker" -- which is
+// true of a shim written by any revision of this script, including one written
+// before the fix. The re-install refusal makes that state permanent on purpose,
+// so the two commands disagreed about the same file and only one of them was
+// right. Measured at head: --check exit 0 and --install exit 1, on the same
+// host, on the same bytes.
+test("--check reports a shim that is not this revision, the way --install does", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const hookPath = path.join(main, ".git", "hooks", "pre-commit");
+    const current = readFileSync(hookPath, "utf8");
+
+    // The same older revision the neighbouring test builds, made here by
+    // dropping one line from our own block instead. Simpler, and it is the
+    // honest shape of the real host: a shim from a revision that had fewer
+    // lines than this one.
+    const stale = current.replace(
+      "# Runs on every commit in every linked worktree of this repository.\n",
+      "",
+    );
+    assert.notEqual(stale, current, "fixture is wrong: could not make an older shim");
+    writeFileSync(hookPath, stale, { mode: 0o755 });
+
+    const check = installHook(main, ["--check"]);
+    assert.equal(check.status, 1, `--check called a stale shim installed: ${check.stdout}`);
+    assert.match(
+      check.stderr,
+      /not the revision this script would write/,
+      "--check does not report the revision problem",
+    );
+    // It has to name both resolutions, or an operator reading it cannot act.
+    assert.match(check.stderr, /rm /, "--check does not say how to resolve a stale shim");
+    assert.match(check.stderr, /--force/, "--check does not mention the deliberate override");
+
+    // And --check and --install must agree, which is the entire finding.
+    const install = installHook(main, ["--install"]);
+    assert.equal(install.status, 1, "control: --install should also refuse this shim");
+    assert.equal(
+      check.status,
+      install.status,
+      "--check and --install disagree about the same file, which is the defect this test pins",
+    );
+
+    // A hook somebody appended a check to is NOT a revision problem: that
+    // addition is ours to keep, and the installer keeps it. Reporting it as
+    // stale would point an operator at a file that is actually fine.
+    writeFileSync(hookPath, current, { mode: 0o755 });
+    assert.equal(installHook(main, ["--check"]).status, 0, "the current shim is not reported current");
+    const withAppended = `${current}# somebody else's important check\nexit 0\n`;
+    writeFileSync(hookPath, withAppended, { mode: 0o755 });
+    const appended = installHook(main, ["--check"]);
+    assert.equal(
+      appended.status,
+      0,
+      `--check called a foreign appended check a revision problem: ${appended.stderr}`,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// --force is the one place this script destroys content it cannot reconstruct,
+// and it used to do so silently: the operator was told an edit was being
+// discarded, was not shown it, and no copy was left. This host already carries
+// a backup from a hand repair (pre-commit.pre-1023ffe31...bak), so the
+// convention exists and the installer was the only part not following it.
+test("--force keeps a copy of the hook it replaces, and says where", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const hookPath = path.join(main, ".git", "hooks", "pre-commit");
+    const hooksDir = path.dirname(hookPath);
+    const current = readFileSync(hookPath, "utf8");
+
+    // An edit INSIDE our block, leaving header and terminator in place. This is
+    // the case the review measured and the one that is unrecoverable: the file
+    // still looks like a revision of ours, so the installer cannot tell it from
+    // a stale shim, and the whole reason --force exists is that it cannot.
+    const edited = current.replace(
+      'GUARD="${KEE_WORKTREE_ISOLATION_GUARD:-}"',
+      'echo OPERATOR-CHECK >&2\nGUARD="${KEE_WORKTREE_ISOLATION_GUARD:-}"',
+    );
+    assert.match(edited, /OPERATOR-CHECK/, "fixture is wrong: the edit did not apply");
+    writeFileSync(hookPath, edited, { mode: 0o755 });
+
+    const before = readdirSync(hooksDir).filter((f) => f.endsWith(".bak"));
+    const forced = installHook(main, ["--install", "--force"]);
+    assert.equal(forced.status, 0, forced.stdout + forced.stderr);
+
+    // The operator's edit is gone from the live hook, as --force promises...
+    assert.doesNotMatch(
+      readFileSync(hookPath, "utf8"),
+      /OPERATOR-CHECK/,
+      "--force did not replace the shim",
+    );
+    // ...and is recoverable, which is the whole point of the fix.
+    const after = readdirSync(hooksDir).filter((f) => f.endsWith(".bak"));
+    assert.equal(after.length, before.length + 1, "--force left no backup of the hook it replaced");
+    const backup = readFileSync(path.join(hooksDir, after.find((f) => !before.includes(f))), "utf8");
+    assert.match(backup, /OPERATOR-CHECK/, "the backup does not contain the edit that was discarded");
+    assert.equal(backup, edited, "the backup is not the file that was actually replaced");
+    // It is named so an operator can tell which revision was replaced and when,
+    // and it is the same convention the hand repair on this host used.
+    const name = after.find((f) => !before.includes(f));
+    assert.match(name, /^pre-commit\.pre-[0-9a-f]+\.\d{8}T\d{6}Z\.bak$/, `unexpected backup name: ${name}`);
+    // And the message says where it went, rather than only that something was lost.
+    assert.match(forced.stderr, /kept at/, "--force does not say where the outgoing hook went");
+    assert.match(forced.stderr, new RegExp(name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// A seat blocked by NO GUARD FOUND is, on this host, almost always in a
+// worktree whose HEAD has no scripts/install-worktree-isolation-hook.mjs -- 56
+// of 58 at the time of the review. The message told it to run that script, which
+// is advice the blocked seat cannot follow, so the one command that would fix
+// the block pointed at a file that is not there.
+test("the no-guard refusal names a checkout that has the installer in it", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
+    rmSync(stored);
+    rmSync(path.join(main, "scripts", "check-worktree-isolation.mjs"));
+
+    const worktrees = path.join(root, "keece-issue-worktrees");
+    mkdirSync(worktrees, { recursive: true });
+    const blocked = path.join(worktrees, `paperclip-kee-923-${SEAT_B_SHORT}`);
+    git(["worktree", "add", "-q", blocked, "-b", "keece/kee-923-y"], main);
+    rmSync(path.join(blocked, "scripts", "check-worktree-isolation.mjs"), { force: true });
+    writeFileSync(path.join(blocked, "g.txt"), "g\n");
+    git(["add", "g.txt"], blocked);
+
+    const commit = spawnSync("git", ["commit", "-m", "unguarded"], {
+      cwd: blocked,
+      encoding: "utf8",
+      env: { ...gitEnv, PAPERCLIP_AGENT_ID: SEAT_A, KEE_WORKTREE_ROOT: worktrees },
+    });
+    const output = `${commit.stdout}${commit.stderr}`;
+    assert.notEqual(commit.status, 0, "control: a seat commit with no guard should be refused");
+    assert.match(output, /NO GUARD FOUND/, "control: the refusal did not fire");
+
+    // It has to name an absolute path a human can act on, and name the actor.
+    assert.match(
+      output,
+      new RegExp(main.split(path.sep).join("/")),
+      "the refusal does not name the lane the shim was installed from",
+    );
+    assert.match(output, /operator/i, "the refusal does not say who has to act");
+    assert.doesNotMatch(
+      output,
+      /^\s+Run: node scripts\/install-worktree-isolation-hook\.js\s*$/m,
+      "the refusal still tells a lane with no installer to run the installer",
+    );
+    // The bare relative instruction is what cannot work from the blocked lane.
+    assert.doesNotMatch(output, /Run: node scripts\/install-worktree-isolation-hook\.mjs/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The stored guard is preferred over the checkout's on purpose, because most
+// lanes have no guard of their own. But the two copies have different freshness
+// guarantees: the checkout's is refreshed by git pull on every merge, the
+// stored one only when an operator re-runs this script. The preference is
+// therefore systematically for the staler of the two, and --check said nothing
+// about it. Measured before the fix: stored sha1 9a015171 against checkout
+// f742cfbb, --check exit 0, no mention of either.
+test("--check names which guard is in force when the stored copy has drifted", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
+
+    // In step, and --check is quiet: there is nothing to say.
+    const agreed = installHook(main, ["--check"]);
+    assert.equal(agreed.status, 0, `control: a fleet in step is reported broken: ${agreed.stderr}`);
+
+    // Update the guard in the checkout only -- exactly what a `git pull` of a
+    // lane that carries the guard does, with no re-install anywhere.
+    const updated = `${readFileSync(stored, "utf8")}\n// guard update marker\n`;
+    writeFileSync(path.join(main, "scripts", "check-worktree-isolation.mjs"), updated);
+
+    const drifted = installHook(main, ["--check"]);
+    assert.equal(
+      drifted.status,
+      1,
+      `--check said nothing about a stored guard that is not the checkout's: ${drifted.stdout}`,
+    );
+    assert.match(drifted.stderr, /stored sha1 [0-9a-f]{8} vs checkout sha1 [0-9a-f]{8}/, "no hashes");
+    assert.match(drifted.stderr, /STORED/, "--check does not say which copy the shim runs");
+    assert.match(
+      drifted.stderr,
+      /install-worktree-isolation-hook\.mjs/,
+      "--check does not name the command that makes them agree",
+    );
+
+    // Re-installing resolves it, because the re-install path refreshes the
+    // stored copy from this checkout. This is the assertion that makes the
+    // message above a real instruction rather than a complaint.
+    assert.equal(installHook(main, ["--install"]).status, 0);
+    assert.equal(readFileSync(stored, "utf8"), updated, "the re-install did not refresh the stored guard");
+    assert.equal(installHook(main, ["--check"]).status, 0, "--check still complains after a re-install");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// The refusal path's other half. The shim is ambiguous and is left alone, which
+// is right. The stored guard is not ambiguous -- it is this script's own file,
+// copied from a known path, and every commit in the fleet runs it -- so leaving
+// it stale on the refusal path compounds the problem the operator is already
+// dealing with. This is the deliberate decision the review asked to be made
+// rather than defaulted to, so it is pinned in both directions: the guard is
+// refreshed, and the shim is still not touched.
+test("the refusal path refreshes the stored guard and still leaves the shim alone", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const hookPath = path.join(main, ".git", "hooks", "pre-commit");
+    const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
+
+    // A guard update in the checkout, and a shim this script cannot read the
+    // state of: both conditions at once, which is the real host.
+    const updated = `${readFileSync(stored, "utf8")}\n// guard update marker\n`;
+    writeFileSync(path.join(main, "scripts", "check-worktree-isolation.mjs"), updated);
+    const staleShim = readFileSync(hookPath, "utf8").replace(
+      "# Runs on every commit in every linked worktree of this repository.\n",
+      "",
+    );
+    writeFileSync(hookPath, staleShim, { mode: 0o755 });
+
+    const refused = installHook(main, ["--install"]);
+    assert.equal(refused.status, 1, "control: the shim should still be refused");
+    // The shim is untouched -- the refusal is still a refusal.
+    assert.equal(readFileSync(hookPath, "utf8"), staleShim, "the refusal path modified the shim anyway");
+    // The guard is not ambiguous, and is brought in step.
+    assert.equal(
+      readFileSync(stored, "utf8"),
+      updated,
+      "the refusal left the stored guard stale, so the fleet runs the old guard",
+    );
+    assert.match(refused.stderr, /stored guard has been refreshed/, "the refusal does not say what it did fix");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
