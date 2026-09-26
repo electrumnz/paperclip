@@ -451,6 +451,14 @@ function guardVersionOf(text) {
  * `differs` message names no override: it says to read both files and either
  * delete the stored copy or leave it, which is still true advice, and --force
  * resolves that state too for an operator who has read both.
+ *
+ * That is a promise about every call site, not about this function, and it was
+ * false for one of them for as long as the override was documented: the
+ * fresh-install call site did not forward `force`, so a refusal naming
+ * --install --force could name a command that did nothing on its first run
+ * (KEE-993). All three call sites now pass the flag through, and the
+ * fresh-install one prints what it actually did, so the messages and the
+ * behaviour are the same thing.
  */
 function decideStoredGuardWrite(relation, options = {}) {
   const { force = false } = options;
@@ -478,11 +486,23 @@ function decideStoredGuardWrite(relation, options = {}) {
  * path. They disagreed -- on the same state, the succeeding path let a
  * hand-edited guard take over while the refusing path withheld it -- and a rule
  * that exists in two places is a rule that will be changed in one of them.
+ *
+ * It also REPORTS whether it wrote, and why, so a caller that prints its own
+ * success lines afterwards cannot claim something this call declined to do.
+ * That return value is what stops a run which withheld here from also printing
+ * "guard: stored at" three lines below a refusal that says "NOT replaced" --
+ * two contradictory claims about one state, on one run, exit 0 (KEE-993).
+ * `write` is the same decision decideStoredGuardWrite() made, not a second
+ * opinion about it, and `reason` is that decision's reason, so a caller can
+ * report a refusal or an override without re-deriving either.
  */
 function guardRefreshOutcome(options = {}) {
   const relation = storedGuardRelation();
   const decision = decideStoredGuardWrite(relation, options);
-  if (!decision.write) return reportGuardWithheld(relation, decision);
+  if (!decision.write) {
+    reportGuardWithheld(relation, decision);
+    return { write: false, reason: decision.reason, relation };
+  }
   // Read the version that is in force BEFORE the write, because after the write
   // this path reports the guard that is now in place and the message would name
   // the unstamped copy's own zero as the version it replaced. Read it only when
@@ -500,9 +520,10 @@ function guardRefreshOutcome(options = {}) {
         `  repository now runs this checkout's copy, not the one it replaced. --force is the\n` +
         `  deliberate override; what it must never be is the way a downgrade happens quietly.\n`,
     );
-    return;
+    return { write: true, reason: decision.reason, relation };
   }
   process.stdout.write(`worktree isolation guard: refreshed at ${storedGuardPath}\n`);
+  return { write: true, reason: decision.reason, relation };
 }
 
 /**
@@ -1006,9 +1027,37 @@ mkdirSync(path.dirname(hookPath), { recursive: true });
 // the hook first meant an interrupted install could leave a live hook with no
 // guard, which then warns on every commit and allows all of them -- a partial
 // install that looks like a working one.
-guardRefreshOutcome();
+//
+// force is passed through, and this call site used to drop it. There are three
+// calls to guardRefreshOutcome() and this was the only one that did not forward
+// the flag, so on a fresh install --force never reached decideStoredGuardWrite()
+// and the withholding applied in `older`, `differs` and `unstamped` regardless
+// of what the operator asked for. The two calls that DID forward it meant the
+// same command worked on a re-install and did nothing on a fresh install, which
+// is the worst possible pair: the refusal above names --install --force, the
+// operator runs it, and it exits 0 having changed nothing.
+//
+// This path is not a corner case. An install interrupted between the guard
+// write below and the hook write after it leaves exactly the state this call
+// sees -- a stored guard in force and no hook -- and so does an operator who
+// removed the hook, or a repository that never had one.
+//
+// The returned outcome is used for the reporting line below, because printing
+// "stored at" after this call withheld would tell the operator the opposite of
+// what the refusal three lines above just told them, on one run, exit 0.
+const guardOutcome = guardRefreshOutcome({ force });
 writeFileAtomic(hookPath, shim, 0o755);
-process.stdout.write(
-  `worktree isolation hook: installed at ${hookPath}\n` +
-    `worktree isolation guard: stored at ${storedGuardPath}\n`,
-);
+process.stdout.write(`worktree isolation hook: installed at ${hookPath}\n`);
+if (guardOutcome.write) {
+  process.stdout.write(`worktree isolation guard: stored at ${storedGuardPath}\n`);
+} else {
+  // Say it once, and point at the refusal above rather than restate it. If
+  // --force was passed it cannot get here at all: the flag reaches
+  // decideStoredGuardWrite() now, and it resolves all three withheld relations.
+  // So this line only ever appears on an ordinary --install, and the refusal
+  // above it is the one that names --force.
+  process.stdout.write(
+    `worktree isolation guard: the copy in force was left alone; see the refusal above.\n` +
+      `  ${storedGuardPath}\n`,
+  );
+}
