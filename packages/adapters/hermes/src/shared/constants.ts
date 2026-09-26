@@ -18,6 +18,19 @@ export const DEFAULT_TIMEOUT_SEC = 1800;
 export const DEFAULT_GRACE_SEC = 10;
 
 /**
+ * Linux caps a SINGLE argv string at MAX_ARG_STRLEN = 131072 bytes, counting
+ * the terminating NUL byte. This is independent of ARG_MAX, which is 2097152
+ * on the same host, so the total argument budget looks generous while a single
+ * long argument still makes `spawn()` fail with E2BIG.
+ *
+ * `hermes chat -q <prompt>` puts the whole prompt in one such string, so a run
+ * whose wake history plus agent instructions exceed this size cannot start the
+ * agent at all. Measured on this repository's CI image: 131071 bytes spawns,
+ * 131072 bytes fails with E2BIG.
+ */
+export const HERMES_ARGV_PROMPT_LIMIT_BYTES = 131072;
+
+/**
  * Default model to use if none specified.
  *
  * Use "auto" so that Hermes resolves the model from the user's local

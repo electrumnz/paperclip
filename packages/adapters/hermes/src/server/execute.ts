@@ -47,6 +47,7 @@ import {
   DEFAULT_TIMEOUT_SEC,
   DEFAULT_GRACE_SEC,
   DEFAULT_MODEL,
+  HERMES_ARGV_PROMPT_LIMIT_BYTES,
   VALID_PROVIDERS,
 } from "../shared/constants.js";
 
@@ -54,6 +55,10 @@ import {
   detectModel,
   resolveProvider,
 } from "./detect-model.js";
+import {
+  hermesCommandSupportsQueryFile,
+  promptExceedsArgvLimit,
+} from "./cli-capabilities.js";
 import { reconcileHermesPaperclipSkills } from "./skills.js";
 
 // ---------------------------------------------------------------------------
@@ -441,7 +446,7 @@ export async function execute(
   // ── Build command args ─────────────────────────────────────────────────
   // Use -Q (quiet) to get clean output: just response + session_id line
   const useQuiet = cfgBoolean(config.quiet) === true; // default false
-  const args: string[] = ["chat", "-q", prompt];
+  const args: string[] = ["chat"];
   if (useQuiet) args.push("-Q");
 
   if (model) {
@@ -521,6 +526,83 @@ export async function execute(
     // Non-fatal
   }
 
+  // ── Choose the prompt transport ────────────────────────────────────────
+  // `hermes chat -q <prompt>` puts the whole prompt in ONE argv string. Linux
+  // caps a single argv string at MAX_ARG_STRLEN (131072 bytes) even though
+  // ARG_MAX is 2097152, so a long wake history plus the agent instructions
+  // makes spawn() fail with E2BIG and the agent never starts.
+  // `hermes chat --query-file -` reads the same query from stdin, which has no
+  // per-string ceiling, so a prompt at or above the limit takes that path.
+  //
+  // The decision is made only for prompts that exceed the limit, so ordinary
+  // runs keep today's single-spawn argv behaviour with no extra process. The
+  // probe is not cached either: an operator can upgrade Hermes while the server
+  // runs, and the next oversized run should pick that up without a restart.
+  //
+  // This block must stay after `env` and `cwd` are resolved, since the probe
+  // runs the operator's configured binary in the run's working directory.
+  const promptBytes = Buffer.byteLength(prompt, "utf8");
+  const useQueryFile = promptExceedsArgvLimit(prompt);
+  if (useQueryFile) {
+    const supported = await hermesCommandSupportsQueryFile({
+      command: hermesCmd,
+      cwd,
+      env,
+      // The probe is a child of the Paperclip server, so a cancelled run must
+      // take it down with it rather than leaving it running untracked.
+      signal: ctx.signal,
+    });
+    if (supported === true) {
+      // -q and --query-file are mutually exclusive in hermes' own parser, so
+      // the query argument is left off argv entirely in this branch.
+      args.push("--query-file", "-");
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Prompt is ${promptBytes} bytes, at or above the ${HERMES_ARGV_PROMPT_LIMIT_BYTES}-byte single-argument limit; sending it on stdin via --query-file -.\n`,
+      );
+    } else if (ctx.signal?.aborted) {
+      // The probe reports "inconclusive" for every reason it could not reach a
+      // conclusion, and operator cancellation is one of them. Blaming the CLI
+      // here would be wrong twice over: it tells the operator to upgrade
+      // Hermes when the real answer is that they stopped this run, and
+      // heartbeat.ts records this message as the run error. Report the
+      // cancellation the acpx engine already reports, so the run is
+      // classified as cancelled rather than as a capability failure.
+      await ctx.onLog(
+        "stderr",
+        `[hermes] Run cancelled while probing this hermes CLI for --query-file support; the prompt is ${promptBytes} bytes.\n`,
+      );
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorCode: "cancelled",
+        errorMessage: "Stopped before provider startup",
+        executionRecovery: { kind: "bootstrap", providerWorkStarted: false },
+        provider: resolvedProvider,
+        model,
+      } satisfies AdapterExecutionResult;
+    } else {
+      // The CLI cannot take the prompt on stdin. Passing it as one argument
+      // would fail in spawn() with a bare E2BIG that names neither the size
+      // nor the cause, so refuse here and say what to do about it.
+      await ctx.onLog(
+        "stderr",
+        `[hermes] Prompt is ${promptBytes} bytes, at or above the ${HERMES_ARGV_PROMPT_LIMIT_BYTES}-byte single-argument limit, but this hermes CLI does not support --query-file (probe result: ${supported === false ? "not advertised" : "inconclusive"}). Upgrade Hermes Agent, or reduce the agent instructions and the wake history, and retry.\n`,
+      );
+      return {
+        exitCode: null,
+        signal: null,
+        timedOut: false,
+        errorMessage: `Hermes prompt is ${promptBytes} bytes, which exceeds the ${HERMES_ARGV_PROMPT_LIMIT_BYTES}-byte single-argument limit, and this hermes CLI does not support --query-file.`,
+        provider: resolvedProvider,
+        model,
+      } satisfies AdapterExecutionResult;
+    }
+  } else {
+    args.push("-q", prompt);
+  }
+
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
     "stdout",
@@ -564,7 +646,23 @@ export async function execute(
     graceSec,
     onLog: wrappedOnLog,
     onSpawn: ctx.onSpawn,
+    // Only the stdin branch carries the prompt. Leaving this undefined in the
+    // argv branch keeps runChildProcess's stdio as "ignore" for stdin, exactly
+    // as before, so hermes keeps seeing a non-TTY stdin in both transports.
+    stdin: useQueryFile ? prompt : undefined,
   });
+
+  // A child that exits before draining stdin makes the write fail with EPIPE.
+  // On this transport that means the prompt may have been truncated or never
+  // reached the CLI, so the operator needs the distinction: "Hermes answered
+  // with exit 0" and "Hermes exited before reading the prompt" are not the
+  // same run, and without this line they look identical in the log.
+  if (useQueryFile && result.stdinWriteError) {
+    await ctx.onLog(
+      "stderr",
+      `[hermes] stdin write failed: ${result.stdinWriteError}. The prompt may not have reached the hermes CLI in full.\n`,
+    );
+  }
 
   // ── Parse output ───────────────────────────────────────────────────────
   const parsed = parseHermesOutput(result.stdout || "", result.stderr || "");
