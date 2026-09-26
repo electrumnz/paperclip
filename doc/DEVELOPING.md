@@ -1015,8 +1015,19 @@ bodies and Hermes prompt-template JSON variables remain supported.
 
 This removes the duplicate environment entry, not every possible `E2BIG` cause.
 Legacy CLI paths that put prompts in command-line arguments (Gemini, Grok, Kimi,
-Pi, and Hermes) still have argument-size limits. ACP turns, SDK requests, and
+and Pi) still have argument-size limits. ACP turns, SDK requests, and
 CLI paths that use stdin avoid that separate limit for the wake prompt.
+
+The `hermes_local` adapter probes the CLI for `--query-file` and sends a prompt of
+131072 bytes or more on stdin, so it no longer depends on the single-argument
+limit. The probe is not cached: it runs once per oversized run, because a wrapper
+or a fork behind `hermesCommand` can gain or lose the flag between runs. If the
+probe is negative or inconclusive, the run is refused with a message that names
+the size and the remedy, instead of failing in the spawn call with a bare
+`E2BIG`. Windows limits the full command line to about 32KB, so a Windows prompt
+below 131072 bytes still travels on the command line and can still fail there.
+The 131072-byte threshold is the Linux and BSD single-argument cap and is not a
+Windows value.
 
 ## Paperclip Runner Adapter Conversion
 
