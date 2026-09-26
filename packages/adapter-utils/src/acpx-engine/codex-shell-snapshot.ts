@@ -47,6 +47,65 @@ const MANAGED_KEY_COMMENT =
 
 const TABLE_HEADER = /^\s*\[/;
 
+// A line inside a multiline TOML string is text, not structure. Scanning line by
+// line without tracking that state means a `'''`-delimited value containing a
+// line like `[features]` gets the policy injected *into the string*: the file
+// still parses, so the self-parse check passes, but `features.shell_snapshot`
+// stays undefined and Codex launches with snapshots on. Track the delimiters and
+// skip every line inside a multiline string instead.
+//
+// TOML basic strings (`"""`), literal strings (`'''`) and their multi-line forms
+// all run to a matching closing delimiter. A delimiter may also appear escaped
+// inside a basic string, so a backslash escapes the next character there.
+type MultilineState = { delimiter: '"""' | "'''" } | null;
+
+const MULTILINE_OPENERS: ReadonlyArray<{ delimiter: '"""' | "'''"; escaped: boolean }> = [
+  { delimiter: '"""', escaped: false },
+  { delimiter: "'''", escaped: false },
+  { delimiter: '"""', escaped: true },
+];
+
+/** Advance the multiline-string tracker for one line of input. */
+function advanceMultilineState(line: string, state: MultilineState): MultilineState {
+  if (state) {
+    // Inside a string: scan for the closing delimiter, honouring backslash
+    // escapes in basic strings. Count runs so `''''` (escaped quote then close)
+    // is not read as an empty string followed by two more openers.
+    const { delimiter, escaped } = state.delimiter === "'''"
+      ? { delimiter: "'''" as const, escaped: false }
+      : { delimiter: '"""' as const, escaped: true };
+    let i = 0;
+    while (i < line.length) {
+      if (escaped && line[i] === "\\") { i += 2; continue; }
+      if (line.startsWith(delimiter, i)) return null;
+      i += 1;
+    }
+    return state;
+  }
+
+  // Outside a string: the first multiline delimiter on the line opens one.
+  for (const { delimiter, escaped } of MULTILINE_OPENERS) {
+    const at = findUnescapedDelimiter(line, delimiter, escaped);
+    if (at >= 0) {
+      // An opener on this line may also close on the same line (`"""x"""`).
+      const rest = line.slice(at + 3);
+      if (rest.includes(delimiter)) continue;
+      return { delimiter };
+    }
+  }
+  return null;
+}
+
+function findUnescapedDelimiter(line: string, delimiter: string, escaped: boolean): number {
+  let i = 0;
+  while (i < line.length) {
+    if (escaped && line[i] === "\\") { i += 2; continue; }
+    if (line.startsWith(delimiter, i)) return i;
+    i += 1;
+  }
+  return -1;
+}
+
 // TOML keys may be bare (`shell_snapshot`) or quoted (`"shell_snapshot"`,
 // `'shell_snapshot'`); a rewriter that only matches the bare form silently
 // ignores a quoted `[features]` table or a quoted `shell_snapshot` key and
@@ -119,12 +178,26 @@ export function applyShellSnapshotPolicy(configToml: string): ShellSnapshotPolic
 
   const lines = withoutManagedBlock.length > 0 ? withoutManagedBlock.split("\n") : [];
 
+  // Structural scan. A line inside a multiline string is text, not structure, so
+  // a `[features]` in a string body must never be mistaken for a table header and
+  // a `shell_snapshot = ...` in a string body must never be mistaken for a
+  // competing key. Keep every line, but remember which ones are inside a string:
+  // the structural scan uses only the outside ones, and the rewrite below
+  // re-inserts the inside ones verbatim so no operator text is lost.
+  const insideMultiline = new Array<boolean>(lines.length).fill(false);
+  let multiline: MultilineState = null;
+  for (const [index, line] of lines.entries()) {
+    insideMultiline[index] = multiline !== null;
+    multiline = advanceMultilineState(line, multiline);
+  }
+  const structural = lines.filter((_, index) => !insideMultiline[index]);
+
   // An inline `features = { ... }` root assignment cannot be merged with a
   // `[features]` table without reimplementing a TOML parser, and appending the
   // table anyway would make the file unparseable. Report and leave it alone —
   // unless the inline table already sets `shell_snapshot = false`, in which
   // case the policy is already in force and there is nothing to enforce.
-  const inlineIndex = lines.findIndex((line) => isFeaturesInlineTableAssignment(line));
+  const inlineIndex = structural.findIndex((line) => isFeaturesInlineTableAssignment(line));
   if (inlineIndex >= 0) {
     if (inlineFeaturesAlreadyDisableShellSnapshot(withoutManagedBlock)) {
       return { text: configToml, changed: false };
@@ -136,10 +209,12 @@ export function applyShellSnapshotPolicy(configToml: string): ShellSnapshotPolic
     };
   }
 
-  const headerIndex = lines.findIndex((line) => isFeaturesTableHeader(line));
+  const headerIndex = structural.findIndex((line) => isFeaturesTableHeader(line));
+  // Rewrite the full line list, not the filtered view, so every line inside a
+  // multiline string is carried through untouched and no operator text is lost.
   const next = headerIndex >= 0
-    ? setKeyInFeaturesTable(lines, headerIndex)
-    : appendManagedBlock(lines);
+    ? setKeyInFeaturesTable(lines, lines.indexOf(structural[headerIndex]), insideMultiline)
+    : appendManagedBlock(lines, insideMultiline);
 
   if (next === configToml) {
     return { text: next, changed: false };
@@ -150,13 +225,30 @@ export function applyShellSnapshotPolicy(configToml: string): ShellSnapshotPolic
   // valid input into invalid output. Codex reads this file at startup, so
   // parse the candidate before it ever replaces the file on disk; a rewrite
   // that doesn't parse is reported, not written.
+  let parsed: { features?: { shell_snapshot?: unknown } };
   try {
-    parseToml(next);
+    parsed = parseToml(next) as { features?: { shell_snapshot?: unknown } };
   } catch (err) {
     return {
       text: configToml,
       changed: false,
       unsupported: `rewriting config.toml would produce invalid TOML: ${errorText(err)}`,
+    };
+  }
+
+  // Syntax validity is not policy correctness. A rewrite that parses can still
+  // fail to land the policy — injecting into a multiline string produces valid
+  // TOML with `features.shell_snapshot` still undefined, which is exactly the
+  // case where Codex would launch with snapshots on. Assert the outcome on the
+  // parsed structure, not on the text, so that failure mode cannot come back.
+  if (parsed.features?.shell_snapshot !== false) {
+    return {
+      text: configToml,
+      changed: false,
+      unsupported:
+        "could not confirm features.shell_snapshot = false in the rewritten config.toml " +
+        "(the result parses but the policy is not in force; a [features] or shell_snapshot " +
+        "line inside a multiline string cannot be rewritten safely)",
     };
   }
 
@@ -192,10 +284,17 @@ function removeManagedBlock(configToml: string): string {
 // The operator's config already has a `[features]` table. Put the key inside it
 // rather than declaring the table twice, and drop any competing value — a
 // duplicate key is a TOML error, and a later `shell_snapshot = true` would win.
-function setKeyInFeaturesTable(lines: string[], headerIndex: number): string {
+function setKeyInFeaturesTable(lines: string[], headerIndex: number, insideMultiline: boolean[]): string {
   const result: string[] = [];
   let insideFeatures = false;
   for (const [index, line] of lines.entries()) {
+    // A line inside a multiline string is text, not structure. Never treat it
+    // as a table header, a competing key, or a managed comment — and never drop
+    // it, because it is operator content.
+    if (insideMultiline[index]) {
+      result.push(line);
+      continue;
+    }
     // A root-level `features.shell_snapshot = ...` dotted key collides with the
     // table key below, so it goes wherever it sits in the file.
     if (isDottedShellSnapshotAssignment(line)) continue;
@@ -214,11 +313,11 @@ function setKeyInFeaturesTable(lines: string[], headerIndex: number): string {
   return ensureTrailingNewline(result.join("\n"));
 }
 
-function appendManagedBlock(lines: string[]): string {
+function appendManagedBlock(lines: string[], insideMultiline: boolean[]): string {
   const body = lines.join("\n").replace(/\n+$/, "");
   const withoutDottedKey = body
     .split("\n")
-    .filter((line) => !isDottedShellSnapshotAssignment(line))
+    .filter((line, index) => insideMultiline[index] === true || !isDottedShellSnapshotAssignment(line))
     .join("\n")
     .replace(/\n+$/, "");
   // A TOML table header swallows every root key that follows it, so the managed
@@ -275,16 +374,44 @@ export async function enforceCodexShellSnapshotPolicy(codexHome: string): Promis
         "refusing to launch Codex without snapshot protection.",
     );
   }
-  if (!policy.changed) return [];
+
+  // Permissions first, and unconditionally. An earlier version returned early on
+  // `!policy.changed`, so a config whose policy text was already correct kept
+  // whatever mode it happened to have — a `0644` config.toml stayed
+  // world-readable forever, and the function's own comment promised otherwise.
+  // Correctness of the policy text and correctness of the file's mode are
+  // separate properties; a config can be policy-compliant and still be exposed.
+  // `config.toml` can carry literal provider secrets, so tighten on every run.
+  await fs.mkdir(codexHome, { recursive: true, mode: 0o700 });
+  try {
+    const existingMode = (await fs.stat(codexHome)).mode & 0o777;
+    if ((existingMode & 0o077) !== 0) await fs.chmod(codexHome, 0o700);
+  } catch (err) {
+    throw new CodexShellSnapshotPolicyError(
+      `Could not make "${codexHome}" owner-only while enforcing the Codex shell-snapshot policy: ` +
+        `${errorText(err)}. Refusing to launch Codex with a world-traversable Codex home.`,
+    );
+  }
+
+  if (!policy.changed) {
+    // Nothing to rewrite, but the file may still be readable by others. A chmod
+    // is the only way to correct a mode without rewriting content, and this
+    // path is already the one that has decided not to touch the text.
+    try {
+      const configMode = (await fs.stat(configPath)).mode & 0o777;
+      if ((configMode & 0o077) !== 0) await fs.chmod(configPath, 0o600);
+    } catch (err) {
+      if (!isMissingFile(err)) {
+        throw new CodexShellSnapshotPolicyError(
+          `Could not make "${configPath}" owner-only while enforcing the Codex shell-snapshot policy: ` +
+            `${errorText(err)}. Refusing to launch Codex with a world-readable config.toml.`,
+        );
+      }
+    }
+    return [];
+  }
 
   try {
-    await fs.mkdir(codexHome, { recursive: true, mode: 0o700 });
-    try {
-      const existingMode = (await fs.stat(codexHome)).mode & 0o777;
-      if ((existingMode & 0o077) !== 0) await fs.chmod(codexHome, 0o700);
-    } catch (err) {
-      throw err;
-    }
     // A PID-only suffix collides between concurrent runs sharing one company
     // Codex home: one writer's rename can land on the other's still-open temp
     // file. A random suffix per invocation makes the temp path unique instead.

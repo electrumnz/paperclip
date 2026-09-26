@@ -340,4 +340,106 @@ describe("enforceCodexShellSnapshotPolicy", () => {
       features: { shell_snapshot: false },
     });
   });
+
+  // KEE-216 review finding: `if (!policy.changed) return []` used to run before
+  // the mkdir/chmod/writeFile, so a config whose policy text was already correct
+  // kept whatever mode it happened to have. A 0644 config.toml that can carry
+  // literal provider secrets stayed world-readable forever. Assert the achieved
+  // mode on disk, not the argument that was passed to chmod.
+  it.skipIf(process.platform === "win32")(
+    "tightens a policy-compliant config that was left world-readable",
+    async () => {
+      // Write a config through the policy once so it is genuinely compliant,
+      // then re-loosen its mode to reproduce the reported condition.
+      const home = await createCodexHome('model = "gpt-5.6-sol"\n');
+      await enforceCodexShellSnapshotPolicy(home);
+      const compliant = await readConfig(home);
+      expect(applyShellSnapshotPolicy(compliant).changed).toBe(false);
+
+      const configPath = path.join(home, "config.toml");
+      await fs.chmod(configPath, 0o644);
+      await fs.chmod(home, 0o755);
+      expect(hasGroupOrOtherAccess((await fs.stat(configPath)).mode)).toBe(true);
+
+      const notes = await enforceCodexShellSnapshotPolicy(home);
+
+      // Nothing is rewritten — that part is correct — but the mode must still be
+      // fixed, which is exactly what the old early return skipped.
+      expect(notes).toEqual([]);
+      expect(hasGroupOrOtherAccess((await fs.stat(configPath)).mode)).toBe(false);
+      expect(hasGroupOrOtherAccess((await fs.stat(home)).mode)).toBe(false);
+      expect(await readConfig(home)).toBe(compliant);
+    },
+  );
+});
+
+describe("multiline string bodies are not structure", () => {
+  // KEE-216 review finding: a `[features]` line inside a `'''` value matched the
+  // table-header regex, so the rewriter injected the policy INTO the string. The
+  // result still parsed — which is exactly why the old self-parse check passed it
+  // — but `features.shell_snapshot` stayed undefined and Codex launched with
+  // snapshots on. These assert the parsed outcome, not that the text parses.
+  it("disables shell snapshots even when [features] appears inside a multiline string", () => {
+    const input = [
+      'model = "gpt-5.6-sol"',
+      "developer_instructions = '''",
+      "Be careful with this config.",
+      "[features]",
+      "telemetry = false",
+      "'''",
+      "",
+    ].join("\n");
+
+    const result = applyShellSnapshotPolicy(input);
+
+    expect(result.unsupported).toBeUndefined();
+    // The decisive assertion: the policy is in force in the PARSED structure.
+    expect(parsedFeatures(result.text)).toMatchObject({ shell_snapshot: false });
+    // And the operator's string content survives untouched.
+    const parsed = parseToml(result.text) as { developer_instructions?: string };
+    expect(parsed.developer_instructions).toContain("[features]");
+    expect(parsed.developer_instructions).toContain("Be careful with this config.");
+  });
+
+  it("does not treat a [features] line inside a basic multiline string as a table", () => {
+    const input = ['notes = """', "[features]", '"""', ""].join("\n");
+
+    const result = applyShellSnapshotPolicy(input);
+
+    expect(result.unsupported).toBeUndefined();
+    expect(parsedFeatures(result.text)).toMatchObject({ shell_snapshot: false });
+    // The string body survives verbatim, including the newline before the
+    // closing delimiter that a multi-line TOML string keeps.
+    expect((parseToml(result.text) as { notes?: string }).notes).toBe("[features]\n");
+  });
+
+  it("keeps a competing shell_snapshot line inside a string from colliding with the policy", () => {
+    const input = [
+      "instructions = '''",
+      "shell_snapshot = true",
+      "'''",
+      "[features]",
+      "shell_snapshot = true",
+      "",
+    ].join("\n");
+
+    const result = applyShellSnapshotPolicy(input);
+
+    expect(result.unsupported).toBeUndefined();
+    expect(parsedFeatures(result.text)).toMatchObject({ shell_snapshot: false });
+    // The in-string text is preserved exactly as the operator wrote it.
+    const parsed = parseToml(result.text) as { instructions?: string };
+    expect(parsed.instructions).toBe("shell_snapshot = true\n");
+  });
+
+  it("refuses rather than writing when the policy cannot be confirmed in the parsed result", () => {
+    // `features` defined as an inline table is a shape this line-oriented
+    // rewriter will not merge. It must report, never silently claim success.
+    const input = "features = { web_search = true }\n";
+
+    const result = applyShellSnapshotPolicy(input);
+
+    expect(result.changed).toBe(false);
+    expect(result.unsupported).toBeTruthy();
+  });
 });
