@@ -47,7 +47,7 @@
  *
  * FIXTURE RULES, learned the hard way. Every fixture asserts its precondition
  * before measuring, so a fixture that stops being the shape it claims fails
- * loudly instead of quietly measuring nothing. Eleven such defects were found
+ * loudly instead of quietly measuring nothing. Twelve such defects were found
  * across the probes behind this card, four of which produced clean-looking
  * wrong answers, and one of which -- defect 11, found in run 27d85309 -- cried
  * wolf: it reported a hazard on a revision that did not have one. See saidFlat()
@@ -89,6 +89,13 @@
  *      error this card is about, made by the test. saidFlat() now backs every
  *      reason-assertion, and the failures on 6f99a78f0 went 5 -> 4 with the four
  *      that remain all on genuine HAZARD assertions.
+ *  12. The first version of the TEETH test below gave the fleet and the lane
+ *      BYTE-IDENTICAL guards, so the installer rewrote the file with the same
+ *      bytes: the stored-guard assertion passed and only the message check
+ *      failed. A rewrite and a downgrade are different events, and a fixture
+ *      that cannot tell them apart is measuring neither. The lanes now differ
+ *      in content as well as in commit, and that difference is asserted before
+ *      anything is measured.
  */
 
 import assert from "node:assert/strict";
@@ -339,10 +346,112 @@ function said(result) {
  * product is the precise error this whole card is about: a measurement that
  * reports a downgrade where there was none, with a confident clean failure
  * message. Every reason-assertion must match against this, not against said().
+ *
+ * Collapsing whitespace is NECESSARY but not SUFFICIENT, and the reviewer was
+ * right to say so (KEE-977 Finding 1): a matcher that only fires on one
+ * phrasing of "not silent" still cannot detect the hazard, which is silence
+ * itself. So the assertions that carry the most weight use explainedBy(),
+ * which checks the CONTENT of the explanation -- the two version numbers the
+ * operator needs to read both states -- rather than any wording at all.
  */
 function saidFlat(result) {
   return said(result).replace(/\s+/g, " ");
 }
+
+/**
+ * The CONTENT of the reason the installer gave, independent of how it wrapped.
+ *
+ * An explanation that names the version in force AND the version in this
+ * checkout lets the operator read both states and decide. That is what the
+ * hazard is the absence of. So the assertion is on those two numbers, and a
+ * rewording that keeps them passes -- which is correct, because a rewording
+ * that keeps them is still an explanation. A message that drops them is the
+ * silent one, and this fails.
+ *
+ * Whitespace is collapsed for the same reason as in saidFlat(): the numbers are
+ * correct on every revision and the line break around them is not.
+ */
+function explainedBy(result, inForceVersion, hereVersion) {
+  const flat = saidFlat(result);
+  return flat.includes(`version ${inForceVersion}`) && flat.includes(`version ${hereVersion}`);
+}
+
+/**
+ * The one test that needs no version stamp, so it runs on every revision --
+ * including the pre-stamp line, where it is the ONLY thing this file says.
+ *
+ * KEE-977 Finding 2. The other tests here express the hazard as a RELATION
+ * between two version numbers, which is why they skip on 0727e4dde and
+ * 1f14cdd6e: those revisions order guards by git ancestry and carry no stamp to
+ * move. The file's stated reason for the skips is true of the stamp and FALSE
+ * of the hazard, which can be expressed in ancestry alone. The reviewer showed
+ * that dropping this test cost the pre-stamp rows their only real signal, and
+ * that the old suite's TEETH test failed there on the hazard assertion itself:
+ *
+ *     HAZARD: a lane behind the fleet replaced the fleet-wide stored guard
+ *
+ * The shape is therefore git-native. The fleet has a LATER commit that moves
+ * the guard on, and the lane's checkout holds the OLDER copy of those bytes --
+ * so the lane is behind the fleet in ancestry, and the content differs from
+ * what is in force. Ordering it the other way (the lane ahead) is the case the
+ * product is expected to write, so it is excluded rather than asserted, because
+ * the question here is only whether a copy that cannot prove it is newer can
+ * replace the copy in force.
+ *
+ * The lanes differ by CONTENT as well as by commit, which is what makes the
+ * test able to fail at all: an earlier attempt gave the fleet and the lane
+ * byte-identical guards, so the installer rewrote the file with the same bytes
+ * and the "downgrade" was a no-op write that only the message could object to.
+ * A measurement that cannot distinguish a rewrite from a downgrade is not a
+ * measurement of a downgrade -- that is fixture defect 12, and the first
+ * version of this test had it.
+ */
+test("TEETH: a lane behind the fleet cannot downgrade the guard, on EITHER ordering mechanism", (t) => {
+  const { root, main } = makeFleet();
+  try {
+    // Commit 1: the guard as seeded. Commit 2: the fleet's guard moves forward.
+    const oldGuard = guardIn(main);
+    writeFileSync(path.join(main, "note.txt"), "fleet moves on\n");
+    git(["add", "-A"], main);
+    commit(main, "fleet: unrelated commit, so the guard's own commit is behind");
+
+    // The lane is behind: its checkout keeps the OLD copy, and the fleet's
+    // newer copy is what is in force. Setup, written directly -- the state
+    // under test is SET UP, not PERFORMED by the code under test.
+    const fleetGuard = withTrailingComment(oldGuard, "fleet moved on");
+    assert.notEqual(fleetGuard, oldGuard,
+      "fixture is wrong: the fleet's guard must differ from the lane's, or a rewrite " +
+      "is indistinguishable from a downgrade");
+    putInForce(main, fleetGuard);
+    const before = storedGuard(main);
+
+    // The installer's own view: the guard in the checkout is the one from the
+    // earlier commit, so any ordering mechanism that works should recognise a
+    // lane that cannot prove it is newer.
+    const result = installHook(main, ["--install"]);
+
+    if (result.status !== 0) {
+      // The pre-stamp revisions REFUSE this install, which is correct for them
+      // and is a pass, not a skip. Checked, not assumed: a refusal that said
+      // nothing would be the hazard in another shape.
+      assert.match(said(result), /refus|leave it|left alone|unchanged|NOT replaced/i,
+        "a refusing --install must say why it refused; a silent refusal is the hazard " +
+        `in another shape. Installer said: ${JSON.stringify(said(result))}`);
+      assert.equal(storedGuard(main), before,
+        "HAZARD: a refusing --install still replaced the copy in force");
+      return;
+    }
+
+    // If it succeeded, the hazard is exactly this: the copy in force changed.
+    assert.equal(storedGuard(main), before,
+      "HAZARD: a lane behind the fleet replaced the fleet-wide stored guard on a " +
+      "succeeding --install, with nothing in the output saying so");
+    assert.match(said(result), /NOT replaced|refus|left alone|unchanged/i,
+      `the operator must be told the stored guard was left alone. Installer said: ${JSON.stringify(said(result))}`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
 
 test("a lane behind the fleet cannot roll the stored guard back on a succeeding --install", (t) => {
   // The KEE-962 hazard, on the ordinary path. No --force, no refusing shim: the
@@ -364,8 +473,10 @@ test("a lane behind the fleet cannot roll the stored guard back on a succeeding 
       "HAZARD: the succeeding --install replaced the fleet-wide stored guard with an older copy");
     assert.match(said(result), /NOT replaced/,
       "the operator must be told the stored guard was left alone; silent success IS the hazard");
-    assert.match(saidFlat(result), /not being moved backwards/,
-      "the message must say WHY it was left alone, not merely that it was");
+    assert.ok(explainedBy(result, inForceVersion, inForceVersion - 1),
+      "the message must say WHY it was left alone, naming both versions; " +
+      "an explanation that omits them is silence wearing a message's clothes. " +
+      `Installer said: ${JSON.stringify(said(result))}`);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
