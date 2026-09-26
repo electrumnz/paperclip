@@ -431,6 +431,93 @@ describeEmbeddedPostgres("heartbeat lock release on cross-agent reassignment", (
     });
   });
 
+  it("retries a failed assignment handoff exactly once after the promotion failure clears", async () => {
+    const { companyId, coderAgentId, reviewerAgentId, issueId, holderRunId } =
+      await seedCrossAgentScenario({ holderStatus: "queued" });
+    await db.update(agents).set({
+      runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } },
+    }).where(eq(agents.id, reviewerAgentId));
+    await db.insert(heartbeatRuns).values({
+      companyId,
+      agentId: reviewerAgentId,
+      status: "running",
+      startedAt: new Date(),
+      contextSnapshot: { wakeReason: "test_busy_slot" },
+    });
+    const [wake] = await db.insert(agentWakeupRequests).values({
+      companyId,
+      agentId: reviewerAgentId,
+      source: "assignment",
+      reason: "issue_execution_deferred",
+      status: "deferred_issue_execution",
+      payload: {
+        issueId,
+        deferredByRunId: holderRunId,
+        _paperclipWakeContext: {
+          issueId,
+          taskId: issueId,
+          wakeReason: "issue_assigned",
+        },
+      },
+      requestedByActorType: "user",
+      requestedByActorId: "responsible-user",
+    }).returning();
+    await db.execute(sql.raw(`CREATE FUNCTION fail_test_assignment_promotion() RETURNS trigger LANGUAGE plpgsql AS $$
+      BEGIN IF NEW.id = '${wake.id}' AND NEW.status = 'queued' THEN
+        RAISE EXCEPTION 'injected assignment promotion failure'; END IF; RETURN NEW; END $$`));
+    await db.execute(sql`CREATE TRIGGER fail_test_assignment_promotion BEFORE UPDATE ON agent_wakeup_requests
+      FOR EACH ROW EXECUTE FUNCTION fail_test_assignment_promotion()`);
+    try {
+      await heartbeat.resumeQueuedRuns();
+
+      const [failedAttempt] = await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wake.id));
+      expect(failedAttempt).toMatchObject({
+        status: "deferred_issue_execution",
+        runId: null,
+      });
+      expect(await db.select().from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, reviewerAgentId),
+          sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+        ))).toHaveLength(0);
+      const [failedHolder] = await db.select().from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, holderRunId));
+      expect(failedHolder.status).toBe("cancelled");
+
+      await db.execute(sql`DROP TRIGGER fail_test_assignment_promotion ON agent_wakeup_requests`);
+      await db.execute(sql`DROP FUNCTION fail_test_assignment_promotion()`);
+
+      await heartbeat.resumeQueuedRuns();
+
+      const [promoted] = await db.select().from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, wake.id));
+      expect(promoted).toMatchObject({ status: "queued" });
+      expect(promoted.runId).toBeTruthy();
+      const promotedRuns = await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.agentId, reviewerAgentId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+      ));
+      expect(promotedRuns).toHaveLength(1);
+      expect(promotedRuns[0]).toMatchObject({ id: promoted.runId, status: "queued" });
+      expect(coderAgentId).not.toBe(promotedRuns[0].agentId);
+
+      await heartbeat.resumeQueuedRuns();
+      const runsAfterSecondSweep = await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.agentId, reviewerAgentId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+      ));
+      expect(runsAfterSecondSweep).toHaveLength(1);
+      expect(runsAfterSecondSweep[0].id).toBe(promoted.runId);
+    } finally {
+      await db.execute(sql`DROP TRIGGER IF EXISTS fail_test_assignment_promotion ON agent_wakeup_requests`);
+      await db.execute(sql`DROP FUNCTION IF EXISTS fail_test_assignment_promotion()`);
+    }
+  }, 15_000);
+
   it("continues other task handoffs when one queued promotion fails", async () => {
     const { companyId, coderAgentId, reviewerAgentId, issueId, holderRunId } =
       await seedCrossAgentScenario({ holderStatus: "queued" });
