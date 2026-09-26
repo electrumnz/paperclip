@@ -1077,40 +1077,113 @@ test("--check names which guard is in force when the stored copy has drifted", (
 });
 
 // The refusal path's other half. The shim is ambiguous and is left alone, which
-// is right. The stored guard is not ambiguous -- it is this script's own file,
-// copied from a known path, and every commit in the fleet runs it -- so leaving
-// it stale on the refusal path compounds the problem the operator is already
-// dealing with. This is the deliberate decision the review asked to be made
+// is right. The stored guard is not the ambiguous object -- it is this script's
+// own file, copied from a known path, and every commit in the fleet runs it --
+// but it is not safe to overwrite merely because it is unambiguous. It is
+// refreshed only where doing so cannot lose ground, because a refresh from a
+// lane that is behind the fleet is a fleet-wide downgrade of the guard on a run
+// that refused. This is the deliberate decision the review asked to be made
 // rather than defaulted to, so it is pinned in both directions: the guard is
-// refreshed, and the shim is still not touched.
-test("the refusal path refreshes the stored guard and still leaves the shim alone", () => {
+// refreshed where it can be, withheld where it cannot, and the shim is never
+// touched either way.
+test("the refusal path leaves the shim alone, and refreshes the guard only when it cannot lose ground", () => {
   const { root, main } = makeFleet();
   try {
     assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
     const hookPath = path.join(main, ".git", "hooks", "pre-commit");
     const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
+    const guardInCheckout = path.join(main, "scripts", "check-worktree-isolation.mjs");
 
-    // A guard update in the checkout, and a shim this script cannot read the
-    // state of: both conditions at once, which is the real host.
-    const updated = `${readFileSync(stored, "utf8")}\n// guard update marker\n`;
-    writeFileSync(path.join(main, "scripts", "check-worktree-isolation.mjs"), updated);
+    // A shim this script cannot read the state of. The refusal is the point, and
+    // it must be a refusal in every case below.
     const staleShim = readFileSync(hookPath, "utf8").replace(
       "# Runs on every commit in every linked worktree of this repository.\n",
       "",
     );
     writeFileSync(hookPath, staleShim, { mode: 0o755 });
 
-    const refused = installHook(main, ["--install"]);
-    assert.equal(refused.status, 1, "control: the shim should still be refused");
-    // The shim is untouched -- the refusal is still a refusal.
+    // Case 1: no stored guard at all. There is nothing to lose, so the guard is
+    // written from this checkout and the message says so.
+    rmSync(stored, { force: true });
+    const created = installHook(main, ["--install"]);
+    assert.equal(created.status, 1, "control: the shim should still be refused");
     assert.equal(readFileSync(hookPath, "utf8"), staleShim, "the refusal path modified the shim anyway");
-    // The guard is not ambiguous, and is brought in step.
     assert.equal(
       readFileSync(stored, "utf8"),
-      updated,
-      "the refusal left the stored guard stale, so the fleet runs the old guard",
+      readFileSync(guardInCheckout, "utf8"),
+      "with no stored guard there is nothing to downgrade, so it should be written",
     );
-    assert.match(refused.stderr, /stored guard has been refreshed/, "the refusal does not say what it did fix");
+    assert.match(created.stderr, /stored guard has been refreshed/, "the refusal does not say what it did fix");
+
+    // Case 2: the stored guard and this checkout's already agree. Refreshing is
+    // a no-op in content, but the claim it makes is still a real one and is
+    // still what the operator is told.
+    const agreed = installHook(main, ["--install"]);
+    assert.equal(agreed.status, 1);
+    assert.equal(readFileSync(stored, "utf8"), readFileSync(guardInCheckout, "utf8"));
+    assert.match(agreed.stderr, /stored guard has been refreshed/);
+
+    // Case 3: they differ. The installer cannot tell which is newer, and the
+    // stored copy is the one every commit in every worktree runs, so it is left
+    // alone -- in BOTH directions, because a guess in the other direction is
+    // just as wrong. This is the KEE-957 finding 3 regression: a lane behind the
+    // fleet used to overwrite the fleet's guard with its own older one, on a run
+    // that exited 1 and said "Refusing to guess".
+    const otherLaneGuard = `${readFileSync(guardInCheckout, "utf8")}\n// a different lane's guard\n`;
+    writeFileSync(stored, otherLaneGuard);
+    writeFileSync(guardInCheckout, `${readFileSync(guardInCheckout, "utf8")}\n// this lane's guard\n`);
+    const withheld = installHook(main, ["--install"]);
+    assert.equal(withheld.status, 1, "control: the shim should still be refused");
+    assert.equal(
+      readFileSync(stored, "utf8"),
+      otherLaneGuard,
+      "the refusal replaced a fleet-wide guard with one lane's copy, which is a downgrade when that lane is behind",
+    );
+    assert.match(
+      withheld.stderr,
+      /stored guard has NOT been changed/,
+      "the refusal does not say it withheld the refresh, so the operator cannot tell what happened to the guard in force",
+    );
+    assert.doesNotMatch(
+      withheld.stderr,
+      /stored guard has been refreshed/,
+      "the refusal claims a refresh it did not perform",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("--check and --install agree on a whitespace-only edit inside the shim's block", () => {
+  // Not a defect, and not something the design set out to catch: the comparison
+  // is on bytes, so a change that only moves whitespace is a difference like any
+  // other and the installer refuses it. What matters, and what was untested, is
+  // that the two commands agree about it -- the KEE-955 blocker was precisely
+  // that they did not. Pinned so a future normalisation pass cannot change
+  // --check's answer without somebody deciding to.
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const hookPath = path.join(main, ".git", "hooks", "pre-commit");
+
+    // Indent a comment line inside our own block. Still valid sh, still ours,
+    // still running the same guard -- but not the bytes this script writes.
+    const respaced = readFileSync(hookPath, "utf8").replace(
+      "# One seat owns one worktree. See scripts/check-worktree-isolation.mjs.\n",
+      "#   One seat owns one worktree. See scripts/check-worktree-isolation.mjs.\n",
+    );
+    writeFileSync(hookPath, respaced, { mode: 0o755 });
+
+    const check = installHook(main, ["--check"]);
+    const install = installHook(main, ["--install"]);
+    assert.equal(check.status, 1, `--check accepted a shim that is not this revision: ${check.stdout}`);
+    assert.equal(install.status, 1, "the installer accepted a shim that is not this revision");
+    assert.match(check.stderr, /not the revision this script would write/, "--check does not name the problem");
+    assert.equal(
+      readFileSync(hookPath, "utf8"),
+      respaced,
+      "a refusal modified the shim it was refusing to guess about",
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

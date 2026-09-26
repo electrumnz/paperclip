@@ -305,6 +305,21 @@ function refreshStoredGuard() {
 }
 
 /**
+ * How this checkout's guard relates to the stored one.
+ *
+ * "same" is the only relation the installer can prove. It cannot tell which of
+ * two differing guards is newer, because the guard carries no version and the
+ * stored copy has no commit of its own -- so a comparison of content alone
+ * cannot order them. See the refusal path, where acting on a difference without
+ * being able to order it is what turns a refresh into a downgrade.
+ */
+function storedGuardRelation() {
+  if (!existsSync(storedGuardPath)) return "absent";
+  if (!existsSync(guardPath)) return "no-checkout-copy";
+  return readFileSync(storedGuardPath, "utf8") === readFileSync(guardPath, "utf8") ? "same" : "differs";
+}
+
+/**
  * Copy the hook that is about to be replaced to a timestamped sibling, so
  * replacing it is reversible.
  *
@@ -316,9 +331,13 @@ function refreshStoredGuard() {
  * inside our block, one --force run, zero copies of it left anywhere.
  *
  * The backup is a plain file next to the hook, in the same directory, named for
- * the revision that produced it and the time it was replaced. This host already
- * carries one from a hand repair -- pre-commit.pre-1023ffe31.20260926T064339Z.bak
- * -- so the convention is the one an operator here will already recognise.
+ * the revision being replaced -- which is the installing lane's HEAD, the lane the
+ * operator is standing in, and not necessarily the revision that produced the
+ * outgoing hook. The timestamp makes each name unique regardless, and what the
+ * name is for is to be recognisable to an operator, not to identify a
+ * provenance the script cannot actually establish. This host already carries
+ * one from a hand repair -- pre-commit.pre-1023ffe31.20260926T064339Z.bak --
+ * so the convention is the one an operator here will already recognise.
  *
  * It is a copy, not a rename: the rename onto the live hook is the atomic step
  * that makes the replacement safe, and a failed copy must not take the working
@@ -414,9 +433,11 @@ if (mode === "--check") {
   // This is a warning, not a refusal to run: the shim's resolution order is
   // deliberate, and an operator may be running a newer guard from a lane than
   // the one they happen to be standing in. So it names both, says which one
-  // wins, and names the command that makes them agree. The stored copy is
-  // refreshed on the re-install path, including the refusing path, so that
-  // command does what it says.
+  // wins, and names the command that makes them agree. It deliberately does NOT
+  // resolve the difference for you, because it cannot tell which of two
+  // differing guards is the newer one, and a guard is fleet-wide when it is
+  // stored: the refusing install path refreshes that copy only when it already
+  // matches this checkout, for the same reason.
   if (existsSync(storedGuardPath) && existsSync(guardPath)) {
     const stored = readFileSync(storedGuardPath, "utf8");
     const checkoutCopy = readFileSync(guardPath, "utf8");
@@ -581,23 +602,44 @@ if (installed) {
           );
         }
       } else {
-        // The shim is ambiguous and is being left alone, but the GUARD is not:
-        // the stored copy is this script's own file, it is never hand-edited,
-        // and every commit in the fleet runs it. So refresh it before refusing.
+        // The shim is ambiguous and is being left alone. The guard is not the
+        // ambiguous object, but "not ambiguous" is not the same as "safe to
+        // overwrite": it is only safe when this checkout's copy can be shown not
+        // to be older than the one in force.
         //
-        // A deliberate change, because the alternative was to leave it alone and
-        // the review is right that the refusal should not compound the problem.
-        // Measured before this fix: a host that refuses to install its shim
-        // keeps a stale guard AND a stale shim, so the one command --check
-        // offers to diagnose it now names both. Refusing to write the guard
-        // would mean the operator has to re-run the installer a second time,
-        // after resolving the shim, to fix a problem that was never the
-        // ambiguous object.
+        // Refresh it, but only where doing so cannot lose ground. Measured on
+        // this host before the fix: stored guard 9d35139e (current), an operator
+        // standing in a lane whose guard was 9a015171 (older), a shim this
+        // script refuses -- the run exited 1, refused the shim, and left the
+        // fleet-wide stored guard downgraded to 9a015171. Every commit in every
+        // worktree of the repository then ran the older guard, on a run whose
+        // output said "Refusing to guess", and the message underneath it claimed
+        // the guard "has been refreshed" as though that were good news.
         //
-        // It is safe precisely because the two are not the same object: the
-        // guard is copied from a known path with no decision to make about it,
-        // and the shim is left exactly as it was found.
-        refreshStoredGuard();
+        // That is the shape this whole change exists to end, run backwards: a
+        // message reporting the correct thing while the host moves the wrong way.
+        //
+        // The installer cannot order the two guards -- the guard carries no
+        // version and the stored copy is not in any commit, so "differs" does
+        // not mean "this one is newer". So it only writes where there is nothing
+        // to lose: the stored guard is absent, or it already matches this
+        // checkout. Where they differ, the refresh is withheld, because a fleet-
+        // wide guard is the last thing an installer should downgrade to make its
+        // own output tidier -- and the operator is told it was withheld, and
+        // told how to make the choice deliberately instead.
+        const relation = storedGuardRelation();
+        const refreshed = relation === "absent" || relation === "same";
+        if (refreshed) refreshStoredGuard();
+        const guardNote = refreshed
+          ? `The stored guard has been refreshed, so commits in this repository are running the\n` +
+            `guard from this checkout. Only the shim above is unresolved.\n`
+          : `The stored guard has NOT been changed. This checkout's guard is different from the one\n` +
+            `in force, and the installer cannot tell which is newer, so it is not going to replace a\n` +
+            `guard the whole fleet is using with one from a single lane on a run that refused. To put\n` +
+            `this checkout's guard in force, run the installer again from it with --force, after you\n` +
+            `have read the shim above. To keep the one already in force, do nothing: the stored copy\n` +
+            `  ${storedGuardPath}\n` +
+            `is the one the shim runs, and --check will tell you the two apart by sha1.\n`;
         process.stderr.write(
           `install-worktree-isolation-hook: ${hookPath} carries this script's marker and looks like\n` +
             `one of ours, but it is not the revision this script would write, and it cannot be told\n` +
@@ -610,8 +652,7 @@ if (installed) {
             `  rm ${hookPath}\n` +
             `If you have looked at it and want the new shim regardless:\n` +
             `  node scripts/install-worktree-isolation-hook.mjs --install --force\n` +
-            `The stored guard has been refreshed, so commits in this repository are running the\n` +
-            `guard from this checkout. Only the shim above is unresolved.\n`,
+            guardNote,
         );
         process.exit(1);
       }
