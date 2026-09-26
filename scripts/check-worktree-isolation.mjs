@@ -31,6 +31,7 @@
  */
 
 import { execFileSync } from "node:child_process";
+import { realpathSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
@@ -38,7 +39,15 @@ import process from "node:process";
 // real seat-named worktrees. It is not a bypass in any meaningful sense: a seat
 // that wanted to defeat this check could simply not run it, and CI checks the
 // repo out outside this root, where the check skips regardless.
-const WORKTREE_ROOT = process.env.KEE_WORKTREE_ROOT || "/home/love4vengeance/Work/keece-issue-worktrees";
+//
+// realpathSync on both sides is required, not cosmetic. git reports
+// --show-toplevel already resolved, so comparing it against an unresolved
+// literal root yields a bogus "../../../.." path.relative result and the guard
+// silently exits 0 on every path. That bug shipped in the first version of
+// this script and was caught only by testing the hook against a real worktree.
+const WORKTREE_ROOT = realpathSync(
+  process.env.KEE_WORKTREE_ROOT || "/home/love4vengeance/Work/keece-issue-worktrees",
+);
 
 function git(...args) {
   return execFileSync("git", args, { encoding: "utf8" }).trim();
