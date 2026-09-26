@@ -45,9 +45,10 @@ const guardPath = path.join(repoRoot, "scripts", "check-worktree-isolation.mjs")
 
 const MARKER = "# installed by scripts/install-worktree-isolation-hook.mjs";
 const shim = `#!/bin/sh
-# ${MARKER}
 # One seat owns one worktree. See scripts/check-worktree-isolation.mjs.
 # Runs on every commit in every linked worktree of this repository.
+#
+# ${MARKER}
 node "${guardPath}" "$@"
 exit $?
 `;
