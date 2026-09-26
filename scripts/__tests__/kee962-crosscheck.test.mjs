@@ -361,19 +361,35 @@ function saidFlat(result) {
 /**
  * The CONTENT of the reason the installer gave, independent of how it wrapped.
  *
- * An explanation that names the version in force AND the version in this
- * checkout lets the operator read both states and decide. That is what the
- * hazard is the absence of. So the assertion is on those two numbers, and a
- * rewording that keeps them passes -- which is correct, because a rewording
- * that keeps them is still an explanation. A message that drops them is the
- * silent one, and this fails.
+ * An explanation that says WHICH guard is which version lets the operator read
+ * both states and decide. That is what the hazard is the absence of. So the
+ * assertion is on the PAIRING, and a rewording that preserves the pairing passes
+ * -- which is correct, because a rewording that preserves the pairing is still
+ * an explanation. A message that drops either half is the silent one.
  *
- * Whitespace is collapsed for the same reason as in saidFlat(): the numbers are
- * correct on every revision and the line break around them is not.
+ * FIXTURE DEFECT 13, found in run b923223b by the KEE-977 reviewer, and it is a
+ * defect of the same family as 11. The first version of this function was two
+ * `includes` calls with no order and no direction, so it accepted a message that
+ * named both version numbers in the WRONG ORDER -- including one that told the
+ * operator the fleet WAS being moved backwards when the guard had been correctly
+ * left alone, and one that named the wrong file as the one in force. A confident,
+ * well-formatted FALSE explanation about the exact thing this card exists to
+ * police passed. The direction in this sentence is not decoration; it is the
+ * explanation, and "this checkout's guard is version 6" only explains anything
+ * because of what the number is attached to.
+ *
+ * "already" is optional here, and deliberately so: it is an adverb, and an
+ * adverb that comes or goes with a reword is not the explanation. The three
+ * mutants that motivated this are the test -- apply the pairing and they go red.
  */
 function explainedBy(result, inForceVersion, hereVersion) {
   const flat = saidFlat(result);
-  return flat.includes(`version ${inForceVersion}`) && flat.includes(`version ${hereVersion}`);
+  return (
+    flat.includes(`guard is version ${hereVersion}`) &&
+    flat.includes(`version ${inForceVersion} is`) &&
+    /is already in force|is in force/.test(flat) &&
+    /not being moved backwards/.test(flat)
+  );
 }
 
 /**
@@ -434,7 +450,7 @@ test("TEETH: a lane behind the fleet cannot downgrade the guard, on EITHER order
       // The pre-stamp revisions REFUSE this install, which is correct for them
       // and is a pass, not a skip. Checked, not assumed: a refusal that said
       // nothing would be the hazard in another shape.
-      assert.match(said(result), /refus|leave it|left alone|unchanged|NOT replaced/i,
+      assert.match(saidFlat(result), /refus|leave it|left alone|unchanged|NOT replaced/i,
         "a refusing --install must say why it refused; a silent refusal is the hazard " +
         `in another shape. Installer said: ${JSON.stringify(said(result))}`);
       assert.equal(storedGuard(main), before,
@@ -446,7 +462,7 @@ test("TEETH: a lane behind the fleet cannot downgrade the guard, on EITHER order
     assert.equal(storedGuard(main), before,
       "HAZARD: a lane behind the fleet replaced the fleet-wide stored guard on a " +
       "succeeding --install, with nothing in the output saying so");
-    assert.match(said(result), /NOT replaced|refus|left alone|unchanged/i,
+    assert.match(saidFlat(result), /NOT replaced|refus|left alone|unchanged/i,
       `the operator must be told the stored guard was left alone. Installer said: ${JSON.stringify(said(result))}`);
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -471,7 +487,7 @@ test("a lane behind the fleet cannot roll the stored guard back on a succeeding 
     assert.equal(result.status, 0, "the install itself should succeed: " + result.stderr);
     assert.equal(storedGuard(main), before,
       "HAZARD: the succeeding --install replaced the fleet-wide stored guard with an older copy");
-    assert.match(said(result), /NOT replaced/,
+    assert.match(saidFlat(result), /NOT replaced/,
       "the operator must be told the stored guard was left alone; silent success IS the hazard");
     assert.ok(explainedBy(result, inForceVersion, inForceVersion - 1),
       "the message must say WHY it was left alone, naming both versions; " +
@@ -508,8 +524,8 @@ test("same version, different content: the installer refuses to guess (KEE-962 o
     assert.equal(result.status, 0, "the install itself should succeed: " + result.stderr);
     assert.equal(storedGuard(main), before,
       "HAZARD: a same-version, different-content guard replaced the copy in force");
-    assert.match(said(result), /NOT replaced/);
-    assert.match(said(result), /Refusing to guess/,
+    assert.match(saidFlat(result), /NOT replaced/);
+    assert.match(saidFlat(result), /Refusing to guess/,
       "the operator must be told this is undecidable, not merely that something was withheld");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -537,10 +553,10 @@ test("an unstamped lane guard does not displace a stamped guard in force, and sa
     assert.equal(result.status, 0, "the install itself should succeed: " + result.stderr);
     assert.equal(storedGuard(main), before,
       "HAZARD: an UNSTAMPED guard replaced a stamped one in force, carrying no ordering at all");
-    assert.match(said(result), /NOT replaced/);
-    assert.match(said(result), /no version stamp/,
+    assert.match(saidFlat(result), /NOT replaced/);
+    assert.match(saidFlat(result), /no version stamp/,
       "the operator must be told the guard is unmeasured, not that something was merely withheld");
-    assert.match(said(result), /--force/,
+    assert.match(saidFlat(result), /--force/,
       "a withheld guard must name the one command that resolves it, or withholding is a dead end");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -566,7 +582,7 @@ test("a genuinely NEWER guard still takes the fleet over", (t) => {
       "a genuinely newer guard must still be allowed to take the fleet over");
     assert.equal(stampOf(storedGuard(main)), inForceVersion + 1,
       "the guard now in force must be the checkout's newer one");
-    assert.doesNotMatch(said(result), /NOT replaced/,
+    assert.doesNotMatch(saidFlat(result), /NOT replaced/,
       "a permitted write must not be reported as a withholding");
   } finally {
     rmSync(root, { recursive: true, force: true });
@@ -640,7 +656,7 @@ test("every write of the stored guard goes through one decision, on every path",
         `${relation}: expected the stored guard ${shouldWrite ? "to be replaced" : "to be left alone"}, ` +
         `and it was ${wrote ? "replaced" : "left alone"}`);
       if (!shouldWrite) {
-        assert.match(said(result), /NOT replaced/,
+        assert.match(saidFlat(result), /NOT replaced/,
           `${relation}: a withheld guard that is not announced is the hazard`);
       }
     } finally {
