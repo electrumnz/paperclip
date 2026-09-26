@@ -435,12 +435,15 @@ function guardVersionOf(text) {
  * the operator reaches for deliberately, having been told what is in force and
  * what would replace it.
  *
- * --force overrides the withholding for the unstamped case only. It is not an
- * escape hatch for `older` or `differs`: those guards have been measured
- * against what is in force and found to be a downgrade or an undecidable
- * hand-edit, and an override for those would put back the defect this rule
- * exists to close. An operator in that position reads both files -- the
- * message says where they are -- and decides.
+ * --force overrides the withholding in all three of them -- `older`, `differs`
+ * and `unstamped` -- and that is not a special case bolted on for one relation.
+ * The refusal message for `older` ends by naming --force, and the one for
+ * `unstamped` ends by printing the exact --install --force command. Scoping the
+ * override to a subset would leave those messages promising a command that does
+ * nothing, which is the false-success shape this file exists to end. The
+ * `differs` message names no override: it says to read both files and either
+ * delete the stored copy or leave it, which is still true advice, and --force
+ * resolves that state too for an operator who has read both.
  */
 function decideStoredGuardWrite(relation, options = {}) {
   const { force = false } = options;
@@ -451,14 +454,6 @@ function decideStoredGuardWrite(relation, options = {}) {
   // Everything else is a state the installer cannot order, or has ordered and
   // found wanting: `older` is a measured downgrade, `differs` and `unstamped`
   // are undecidable. An ordinary --install does not write in any of them.
-  //
-  // --force overrides all three, and that is not a special case bolted on for
-  // one relation: the rest of this installer has always resolved exactly this
-  // way ("refuse, name both states, and say the one command that resolves it"),
-  // and the refusal messages for `older` and `differs` have always ended by
-  // telling the operator to re-run with --force. Scoping the override to one
-  // relation would leave those messages promising a command that does nothing,
-  // which is the false-success shape this file exists to end.
   //
   // What --force does NOT do is write quietly. Every override says what it
   // replaced and what it replaced it with, because the hazard was never the
