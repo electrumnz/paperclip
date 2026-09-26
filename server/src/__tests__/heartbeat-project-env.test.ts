@@ -254,6 +254,47 @@ describe("resolveExecutionRunAdapterConfig", () => {
     expect(JSON.stringify(result.resolvedConfig.env)).not.toContain("PAPERCLIP_RUNNER_NETWORK_ACCESS");
   });
 
+  it("drops GH_CONFIG_DIR bindings so a run cannot point gh at a directory without hosts.yml", async () => {
+    const resolveAdapterConfigForRuntime = vi.fn(async (_companyId, config: Record<string, unknown>) => ({
+      config: { ...config, env: { ...(config.env as Record<string, unknown>) } },
+      secretKeys: new Set<string>(),
+      manifest: [],
+    }));
+    const resolveEnvBindings = vi.fn(async (_companyId, env: Record<string, unknown>) => ({
+      env: Object.fromEntries(
+        Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+      ),
+      secretKeys: new Set<string>(),
+      manifest: [],
+    }));
+
+    // KEE-953: a GH_CONFIG_DIR binding pointing at $HOME makes gh report "not
+    // logged into any GitHub hosts" for a token that is present and valid.
+    const result = await resolveExecutionRunAdapterConfig({
+      companyId: "company-1",
+      agentId: "agent-1",
+      environmentId: "environment-1",
+      environmentEnv: { GH_CONFIG_DIR: "/home/agent", ENV_ONLY: "environment-only" },
+      executionRunConfig: { env: { GH_CONFIG_DIR: "/home/agent", AGENT_ONLY: "agent-only" } },
+      projectEnv: { GH_CONFIG_DIR: "/home/agent", PROJECT_ONLY: "project-only" },
+      routineEnv: { GH_CONFIG_DIR: "/home/agent", ROUTINE_ONLY: "routine-only" },
+      routineId: "routine-1",
+      secretsSvc: { resolveAdapterConfigForRuntime, resolveEnvBindings } as any,
+    });
+
+    expect(resolveEnvBindings.mock.calls[0]?.[1]).toEqual({ ENV_ONLY: "environment-only" });
+    expect(resolveAdapterConfigForRuntime.mock.calls[0]?.[1]).toEqual({ env: { AGENT_ONLY: "agent-only" } });
+    expect(resolveEnvBindings.mock.calls[1]?.[1]).toEqual({ PROJECT_ONLY: "project-only" });
+    expect(resolveEnvBindings.mock.calls[2]?.[1]).toEqual({ ROUTINE_ONLY: "routine-only" });
+    expect(result.resolvedConfig.env).toEqual({
+      ENV_ONLY: "environment-only",
+      AGENT_ONLY: "agent-only",
+      PROJECT_ONLY: "project-only",
+      ROUTINE_ONLY: "routine-only",
+    });
+    expect(JSON.stringify(result.resolvedConfig.env)).not.toContain("GH_CONFIG_DIR");
+  });
+
   it("skips project env resolution when the project has no bindings", async () => {
     const resolveAdapterConfigForRuntime = vi.fn().mockResolvedValue({
       config: { env: { AGENT_ONLY: "agent-only" } },

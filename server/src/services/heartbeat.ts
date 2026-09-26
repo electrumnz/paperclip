@@ -1468,6 +1468,9 @@ const FORBIDDEN_ENV_BINDING_KEYS = new Set([
   "PAPERCLIP_GITHUB_BROKER_URL",
   "PAPERCLIP_GITHUB_BRIDGE_TOKEN",
   "PAPERCLIP_GITHUB_LAUNCHER_DIR",
+  // Runtime-resolved. A binding may point gh at a directory with no hosts.yml,
+  // which makes gh report "not logged into any GitHub hosts" for a valid token.
+  "GH_CONFIG_DIR",
 ]);
 const MANAGED_GITHUB_TOKEN_KEYS = new Set([
   "GH_TOKEN",
