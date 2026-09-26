@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
@@ -128,4 +128,38 @@ test("the script exists and is executable as node", () => {
   assert.ok(script.endsWith("check-worktree-isolation.mjs"));
   const out = execFileSync(process.execPath, ["--check", script], { encoding: "utf8" });
   assert.equal(out, "");
+});
+
+// Regression, KEE-929. The first version compared `git rev-parse
+// --show-toplevel` against a literal WORKTREE_ROOT without realpath'ing either
+// side. git returns the toplevel already resolved; the literal was not, so
+// path.relative produced "../../../../Work/keece-issue-worktrees/..." and the
+// guard took the "outside the root, skip" branch on every single path. It
+// passed all eleven unit tests here, because mkdtempSync under /tmp shares no
+// symlinked ancestor with the fixture root, and it silently allowed every
+// commit when installed as a real hook. The only thing that caught it was
+// running it against a real worktree under a symlinked ancestor.
+test("a symlinked ancestor on the worktree root does not disable the guard", () => {
+  const realRoot = mkdtempSync(path.join(tmpdir(), "keece-isolation-real-"));
+  // A symlink that resolves to the real root, mimicking a symlinked home or
+  // Work directory.
+  const linkRoot = path.join(realRoot, "link");
+  const realWorktrees = path.join(realRoot, "keece-issue-worktrees");
+  mkdirSync(realWorktrees, { recursive: true });
+  symlinkSync(realWorktrees, linkRoot);
+
+  try {
+    const dir = path.join(realWorktrees, "paperclip-kee-923");
+    mkdirSync(dir, { recursive: true });
+    execFileSync("git", ["init", "-q", dir], { encoding: "utf8" });
+
+    // Point the guard at the *symlinked* spelling of the root while git reports
+    // the resolved one. This is the case that silently disabled it.
+    const env = { ...process.env, PAPERCLIP_AGENT_ID: SEAT_A, KEE_WORKTREE_ROOT: linkRoot };
+    const result = spawnSync(process.execPath, [script], { cwd: dir, env, encoding: "utf8" });
+    assert.equal(result.status, 1, `guard allowed a shared path: ${result.stdout}`);
+    assert.match(result.stderr, /pre-isolation shared worktree/);
+  } finally {
+    rmSync(realRoot, { recursive: true, force: true });
+  }
 });
