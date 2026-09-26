@@ -370,6 +370,53 @@ test("re-install replaces an outdated shim, and refuses a hook it cannot recogni
   }
 });
 
+// The KEE-943 review found this decision completely untested: changing
+// NO GUARD FOUND from exit 0 to exit 1 changed no test result, so the one
+// branch in the shim that has a stated argument behind it had no coverage at
+// all. It is pinned here deliberately, so the next person to "fix" it has to
+// come here and say why.
+test("with no guard anywhere the shim warns loudly and exits 0, and says what to do", () => {
+  const { root, main } = makeFleet();
+  try {
+    // Install, then remove the guard everywhere the shim can look: the stored
+    // copy, the checkout it was installed from, AND the committing worktree's
+    // own copy. Removing only the first two is not enough -- git restores the
+    // worktree's file from HEAD, so the checkout fallback finds it and the
+    // shim correctly keeps working. That is the fallback doing its job, not the
+    // branch under test.
+    assert.equal(installHook(main, ["--install"]).status, 0);
+    const stored = path.join(main, ".git", "hooks", "worktree-isolation-guard.mjs");
+    rmSync(stored);
+    rmSync(path.join(main, "scripts", "check-worktree-isolation.mjs"));
+
+    const worktrees = path.join(root, "keece-issue-worktrees");
+    mkdirSync(worktrees, { recursive: true });
+    const own = path.join(worktrees, "paperclip-kee-929-4a323d0d");
+    git(["worktree", "add", "-q", own, "-b", "keece/kee-929-4a323d0d"], main);
+    rmSync(path.join(own, "scripts", "check-worktree-isolation.mjs"), { force: true });
+    assert.ok(
+      !existsSync(path.join(own, "scripts", "check-worktree-isolation.mjs")),
+      "fixture is wrong: this lane's checkout still has a guard",
+    );
+    writeFileSync(path.join(own, "h.txt"), "h\n");
+    git(["add", "h.txt"], own);
+
+    const commit = spawnSync("git", ["commit", "-m", "unguarded"], {
+      cwd: own,
+      encoding: "utf8",
+      env: { ...gitEnv, PAPERCLIP_AGENT_ID: SEAT_A, KEE_WORKTREE_ROOT: worktrees },
+    });
+    const output = `${commit.stdout}${commit.stderr}`;
+    assert.equal(commit.status, 0, `NO GUARD FOUND should not block a commit: ${output}`);
+    assert.match(output, /NO GUARD FOUND/, "the unguarded state was silent");
+    assert.match(output, /install-worktree-isolation-hook/, "the warning does not say how to fix it");
+    // And --check must not call this healthy.
+    assert.notEqual(installHook(main, ["--check"]).status, 0, "--check reported a guard that is gone");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("uninstall removes the stored guard as well as the hook", () => {
   const { root, main } = makeFleet();
   try {
