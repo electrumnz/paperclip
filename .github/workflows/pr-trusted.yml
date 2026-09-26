@@ -327,6 +327,9 @@ jobs:
       - name: Test worktree isolation guard
         run: node --test ./scripts/__tests__/check-worktree-isolation.test.mjs
 
+      - name: Test worktree isolation hook installer
+        run: node --test ./scripts/__tests__/install-worktree-isolation-hook.test.mjs
+
       - name: Test e2e shard partition
         run: node --test ./scripts/__tests__/e2e-shard.test.mjs
 
