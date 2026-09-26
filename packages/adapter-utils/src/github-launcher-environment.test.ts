@@ -176,6 +176,49 @@ describe("managed GitHub launcher environment", () => {
     expect(env.PAPERCLIP_GITHUB_LAUNCHER_DIR).toBeUndefined();
   });
 
+  it("replaces a GH_CONFIG_DIR that holds no gh hosts file, so gh does not report a valid token as missing", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-gh-config-dir-")); roots.push(root);
+    vi.stubEnv("HOME", root);
+    vi.stubEnv("XDG_CONFIG_HOME", path.join(root, ".config"));
+    await exec("git", ["init", path.join(root, "repo")]);
+
+    // KEE-953: a controller started with GH_CONFIG_DIR pointing at $HOME has no
+    // $HOME/hosts.yml, so gh reports "not logged into any GitHub hosts" even
+    // though the keyring token is valid. The runtime must not pass that through.
+    vi.stubEnv("GH_CONFIG_DIR", root);
+    const wrong = await prepareGitHubExecutionEnvironment({ target: null, cwd: path.join(root, "repo"), env: {}, hostCredentials: true, networkAccess: true });
+    expect(wrong.GH_CONFIG_DIR).toBe(path.join(root, ".config/gh"));
+    expect(wrong.GH_CONFIG_DIR).not.toBe(root);
+
+    // A directory that really is a gh config directory is still honoured.
+    const real = path.join(root, "real-gh");
+    await mkdir(real, { recursive: true });
+    await writeFile(path.join(real, "hosts.yml"), "host credential fixture");
+    vi.stubEnv("GH_CONFIG_DIR", real);
+    const honoured = await prepareGitHubExecutionEnvironment({ target: null, cwd: path.join(root, "repo"), env: {}, hostCredentials: true, networkAccess: true });
+    expect(honoured.GH_CONFIG_DIR).toBe(real);
+  });
+
+  it("does not let a run env binding point gh at a directory without hosts.yml", async () => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-gh-config-binding-")); roots.push(root);
+    vi.stubEnv("HOME", root);
+    vi.stubEnv("XDG_CONFIG_HOME", path.join(root, ".config"));
+    // Clear any inherited value so the runtime-resolved directory is this
+    // sandbox's, not whatever gh config the test host happens to have.
+    vi.stubEnv("GH_CONFIG_DIR", undefined);
+    const config = path.join(root, ".config/gh");
+    await mkdir(config, { recursive: true });
+    await writeFile(path.join(config, "hosts.yml"), "host credential fixture");
+    await exec("git", ["init", path.join(root, "repo")]);
+
+    const env = await prepareGitHubExecutionEnvironment({
+      target: null, cwd: path.join(root, "repo"), hostCredentials: true, networkAccess: true,
+      // An agent-supplied binding must not win over the runtime-resolved value.
+      env: { GH_CONFIG_DIR: root },
+    });
+    expect(env.GH_CONFIG_DIR).toBe(config);
+  });
+
   it("preserves local host credential helpers and validates worktree metadata", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-host-git-")); roots.push(root);
     vi.stubEnv("HOME", root);
