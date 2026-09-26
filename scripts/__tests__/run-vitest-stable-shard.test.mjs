@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
@@ -101,6 +101,93 @@ test("a route/authz suite never leaks into the general-server shards", () => {
 test("shard flags are rejected for the workspaces-b group", () => {
   const result = dryRun(["--mode", "general", "--group", "general-workspaces-b", "--shard-index", "0", "--shard-count", "3"]);
   assert.notEqual(result.status, 0, "workspaces-b must not accept shard flags");
+});
+
+// The root vitest.config.ts projects list and nonServerProjects are two
+// independent lists of the same workspaces. Only nonServerProjects decides what
+// CI runs, so a package that carries tests but is missing from it has its tests
+// skipped in every CI lane while `pnpm exec vitest` still collects them locally
+// — a green build over a suite that never ran. KEE-923 shipped regression tests
+// into that gap.
+const nonServerProjectsSource = readFileSync(script, "utf8");
+const rootVitestConfig = path.join(repoRoot, "vitest.config.ts");
+const rootVitestConfigSource = readFileSync(rootVitestConfig, "utf8");
+
+function listLiterals(source, variableName) {
+  const declaration = new RegExp(
+    `const ${variableName} = \\[([^\\]]*)\\]`,
+  ).exec(source);
+  assert.ok(declaration, `expected a literal array named ${variableName}`);
+  return [...declaration[1].matchAll(/"([^"]+)"/g)].map((match) => match[1]);
+}
+
+test("every root vitest project that has test files is also a CI project", () => {
+  const rootProjectPaths = [
+    ...new RegExp(/projects:\s*\[([\s\S]*?)\]/).exec(rootVitestConfigSource)[1]
+      .matchAll(/"([^"]+)"/g),
+  ].map((match) => match[1]);
+  // The root config names directories; nonServerProjects names packages.
+  const rootProjects = rootProjectPaths.map((dir) => {
+    const manifest = path.join(repoRoot, dir, "package.json");
+    assert.ok(existsSync(manifest), `root vitest project ${dir} has no package.json`);
+    return JSON.parse(readFileSync(manifest, "utf8")).name;
+  });
+  const ciProjects = new Set(listLiterals(nonServerProjectsSource, "nonServerProjects"));
+  // server and ui are run by their own dedicated, sharded lanes.
+  const laneOwnProjects = new Set(["@paperclipai/server", "@paperclipai/ui"]);
+
+  // Pre-existing gap, found while landing KEE-923 and deliberately NOT fixed
+  // there: these five adapters carry test files that no CI lane has ever run.
+  // They predate this change and each belongs to another adapter's lane, so
+  // adding them is a CI-budget decision, not a transport fix. The allowlist
+  // keeps the gap recorded in the repository where the next owner will see it,
+  // and makes the guard fail the moment a SIXTH package lands this way.
+  const knownMissing = [
+    "@paperclipai/adapter-cursor-cloud",
+    "@paperclipai/adapter-cursor-local",
+    "@paperclipai/adapter-gemini-local",
+    "@paperclipai/adapter-kimi-local",
+    "@paperclipai/adapter-pi-local",
+  ];
+
+  const missing = rootProjects.filter(
+    (project) =>
+      !ciProjects.has(project) && !laneOwnProjects.has(project) && !knownMissing.includes(project),
+  );
+  assert.deepEqual(missing, [],
+    `these root vitest projects carry tests but are absent from nonServerProjects, ` +
+    `so no CI lane runs them and a green build can hide a broken suite: ` +
+    `${missing.join(", ")}. Add each to nonServerProjects in ` +
+    `scripts/run-vitest-stable.mjs (KEE-927).`);
+
+  // Every allowlisted package must still exist and still be a real root project,
+  // so the allowlist cannot outlive the gap it records.
+  for (const project of knownMissing) {
+    assert.ok(rootProjects.includes(project),
+      `${project} is allowlisted as CI-missing but is no longer a root vitest project: remove it from knownMissing`);
+  }
+});
+
+test("the hermes adapter regression lane runs in an unsharded CI group", () => {
+  // KEE-923's large-prompt regression tests must be in the lane CI actually
+  // runs. workspaces-b takes no --shard, so adding the project there needs no
+  // matrix rebalancing and cannot perturb the workspaces-a or general-server
+  // shard partitions.
+  const workspacesB = dryRunJson(["--mode", "general", "--group", "general-workspaces-b"]);
+  assert.ok(
+    workspacesB.workspaceProjects.includes("@paperclipai/hermes-paperclip-adapter"),
+    "the hermes adapter must be a workspaces-b project, or its KEE-923 regression tests never run in CI",
+  );
+
+  const workspacesA = dryRunJson(["--mode", "general", "--group", "general-workspaces-a"]);
+  assert.ok(
+    !workspacesA.workspaceProjects.includes("@paperclipai/hermes-paperclip-adapter"),
+    "hermes belongs in workspaces-b; the ui-dominated workspaces-a lane is sharded and deliberately kept small",
+  );
+
+  // The sharded partitions must be untouched by a workspaces-b addition.
+  const shardRejection = dryRun(["--mode", "general", "--group", "general-workspaces-b", "--shard-index", "0", "--shard-count", "2"]);
+  assert.notEqual(shardRejection.status, 0, "workspaces-b must remain unsharded");
 });
 
 test("workspaces-a shards map to Vitest native --shard slices over a stable project list", () => {
