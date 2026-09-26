@@ -33,6 +33,7 @@ import {
   buildRuntimeToolsEnv,
   renderTemplate,
   ensureAbsoluteDirectory,
+  refreshPaperclipWorkspaceEnvForExecution,
   DEFAULT_PAPERCLIP_AGENT_PROMPT_TEMPLATE,
   DEFAULT_PAPERCLIP_CONVERSATION_PROMPT_TEMPLATE,
   joinPromptSections,
@@ -73,6 +74,17 @@ function cfgStringArray(v: unknown): string[] | undefined {
   return Array.isArray(v) && v.every((i) => typeof i === "string")
     ? (v as string[])
     : undefined;
+}
+
+/** True only for a non-empty path that is an existing directory. */
+async function directoryExists(candidate: string): Promise<boolean> {
+  if (!candidate) return false;
+  try {
+    const stat = await fs.stat(candidate);
+    return stat.isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 export function resolveHermesCommand(config: Record<string, unknown>): string {
@@ -513,13 +525,60 @@ export async function execute(
   if (envCommentId) env.PAPERCLIP_WAKE_COMMENT_ID = envCommentId;
 
   // ── Resolve working directory ──────────────────────────────────────────
-  const cwd =
-    cfgString(config.cwd) || cfgString(ctx.config?.workspaceDir) || ".";
+  // Paperclip's workspace resolver is authoritative for local runs. Prefer it
+  // over the adapterConfig default so the child never inherits the Paperclip
+  // server's own working directory (previously the `"."` fallback), which put
+  // the agent in an unrelated tree. `config.cwd` stays an explicit operator
+  // override, and is honoured for `agent_home` workspaces as elsewhere.
+  const workspaceContext = (typeof ctxContext.paperclipWorkspace === "object" &&
+    ctxContext.paperclipWorkspace !== null
+    ? ctxContext.paperclipWorkspace
+    : {}) as Record<string, unknown>;
+  const resolvedWorkspaceCwd = cfgString(workspaceContext.cwd) || "";
+  const workspaceSource = cfgString(workspaceContext.source) || "";
+  const configuredCwd = cfgString(config.cwd) || cfgString(ctx.config?.workspaceDir);
+  const useConfiguredInsteadOfAgentHome =
+    workspaceSource === "agent_home" && configuredCwd !== undefined;
+  const effectiveWorkspaceCwd = useConfiguredInsteadOfAgentHome ? "" : resolvedWorkspaceCwd;
+
+  // A resolver pointing at a directory that no longer exists must not become a
+  // hard spawn failure: fall back to the configured directory, then to this
+  // process's cwd, and say so in the run log.
+  let cwd =
+    (await directoryExists(effectiveWorkspaceCwd))
+      ? effectiveWorkspaceCwd
+      : configuredCwd || process.cwd();
+  if (effectiveWorkspaceCwd && cwd !== effectiveWorkspaceCwd) {
+    await ctx.onLog(
+      "stdout",
+      `[hermes] Resolved workspace ${effectiveWorkspaceCwd} is not a directory; falling back to ${cwd}\n`,
+    );
+  }
   try {
     await ensureAbsoluteDirectory(cwd);
   } catch {
     // Non-fatal
   }
+
+  // Publish the resolved workspace to the child process. This is the same
+  // handoff every other local adapter performs; without it the env carries no
+  // workspace context and the agent falls back to its own profile default.
+  refreshPaperclipWorkspaceEnvForExecution({
+    env,
+    envConfig: userEnv,
+    workspaceCwd: effectiveWorkspaceCwd,
+    workspaceSource,
+    workspaceStrategy: cfgString(workspaceContext.strategy) || "",
+    workspaceId: cfgString(workspaceContext.workspaceId) || null,
+    workspaceRepoUrl: cfgString(workspaceContext.repoUrl) || null,
+    workspaceRepoRef: cfgString(workspaceContext.repoRef) || null,
+    workspaceBranch: cfgString(workspaceContext.branchName) || null,
+    workspaceWorktreePath: cfgString(workspaceContext.worktreePath) || null,
+    workspaceHints: Array.isArray(ctxContext.paperclipWorkspaces)
+      ? (ctxContext.paperclipWorkspaces as Array<Record<string, unknown>>)
+      : [],
+    agentHome: cfgString(workspaceContext.agentHome) || null,
+  });
 
   // ── Log start ──────────────────────────────────────────────────────────
   await ctx.onLog(
