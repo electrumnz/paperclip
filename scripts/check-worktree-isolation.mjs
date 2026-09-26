@@ -2,6 +2,21 @@
 /**
  * check-worktree-isolation.mjs
  *
+ * worktree-isolation-guard-version: 2
+ *
+ * The version line above is read by scripts/install-worktree-isolation-hook.mjs
+ * to decide whether this guard is newer than the one already stored in a
+ * repository's shared hooks directory. It has to be a line comment and it has
+ * to parse as one, so it lives inside this block rather than on line 2: a bare
+ * `#` line between the shebang and the block is a syntax error under node's
+ * module rules, which would make the guard unrunnable -- the opposite of
+ * stamping it for orderability.
+ *
+ * Raise it by one when this file's behaviour changes. It is a monotonic
+ * integer, not a date and not a hash, because the only question asked of it is
+ * "which of these two is newer", and a number answers that without a rule for
+ * comparing the rest.
+ *
  * Fails when the current working tree is an issue worktree that does not
  * belong to the seat running the check.
  *
