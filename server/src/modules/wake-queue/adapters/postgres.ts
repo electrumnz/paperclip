@@ -6,6 +6,7 @@ import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm"
 import type { Db } from "@paperclipai/db";
 import { extractIssueReferenceIdentifiers, type IssueUnblockDescriptor } from "@paperclipai/shared";
 import {
+  activityLog,
   agentWakeupRequests,
   agents,
   chatActions,
