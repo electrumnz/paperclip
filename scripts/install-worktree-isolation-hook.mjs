@@ -174,22 +174,25 @@ if [ -z "$GUARD" ]; then
   # So the question the missing guard would have answered -- "is this a worktree
   # this control governs?" -- is asked here instead, using the same two facts the
   # guard uses. It is asked before refusing, and only for the case it is for.
+  # This has to agree with the guard's own resolution of the root, or the shim
+  # decides the guard would not have cared while the guard would have. The guard
+  # reads KEE_WORKTREE_ROOT with a fallback to a default literal, so an EMPTY
+  # variable means "use the default", not "there is no root" -- and this branch
+  # is only reached when there is no guard, so the guard's own source is not
+  # available to ask. Measured: with the variable set to the empty string, a
+  # first version of this block skipped every commit as "no root", which is the
+  # opposite of what the guard does with the same value.
+  KEE_ROOT="\${KEE_WORKTREE_ROOT:-/home/love4vengeance/Work/keece-issue-worktrees}"
   NEEDS_CHECK=0
-  if [ -n "\${PAPERCLIP_AGENT_ID:-}" ]; then
-    if [ ! -d "\${KEE_WORKTREE_ROOT:-}" ]; then
-      # The guard skips when the root does not exist, so there is nothing to
-      # police and nothing a missing guard could have caught.
-      :
-    else
-      TOPLEVEL_NG=$(git rev-parse --show-toplevel 2>/dev/null) || TOPLEVEL_NG=""
-      if [ -n "$TOPLEVEL_NG" ]; then
-        TOPLEVEL_NG=$(CDPATH= cd -- "$TOPLEVEL_NG" 2>/dev/null && pwd -P) || TOPLEVEL_NG=""
-        ROOT_NG=$(CDPATH= cd -- "\${KEE_WORKTREE_ROOT}" 2>/dev/null && pwd -P) || ROOT_NG=""
-        if [ -n "$TOPLEVEL_NG" ] && [ -n "$ROOT_NG" ]; then
-          case "$TOPLEVEL_NG/" in
-            "$ROOT_NG"/*) NEEDS_CHECK=1 ;;
-          esac
-        fi
+  if [ -n "\${PAPERCLIP_AGENT_ID:-}" ] && [ -d "$KEE_ROOT" ]; then
+    TOPLEVEL_NG=$(git rev-parse --show-toplevel 2>/dev/null) || TOPLEVEL_NG=""
+    if [ -n "$TOPLEVEL_NG" ]; then
+      TOPLEVEL_NG=$(CDPATH= cd -- "$TOPLEVEL_NG" 2>/dev/null && pwd -P) || TOPLEVEL_NG=""
+      ROOT_NG=$(CDPATH= cd -- "$KEE_ROOT" 2>/dev/null && pwd -P) || ROOT_NG=""
+      if [ -n "$TOPLEVEL_NG" ] && [ -n "$ROOT_NG" ]; then
+        case "$TOPLEVEL_NG/" in
+          "$ROOT_NG"/*) NEEDS_CHECK=1 ;;
+        esac
       fi
     fi
   fi
@@ -201,11 +204,14 @@ if [ -z "$GUARD" ]; then
     if [ -n "\${PAPERCLIP_AGENT_ID:-}" ]; then
       echo "  A seat identity is set, but this directory is not an issue worktree, so there is no" >&2
       echo "  cross-seat commit to catch here. The commit is allowed. Seat isolation is NOT" >&2
-      echo "  being enforced in this repository; a seat committing into an issue worktree will be" >&2
-      echo "  blocked until the guard is installed. From a checkout that carries the installer:" >&2
+      echo "  being enforced in this repository; a seat committing into an issue worktree will" >&2
+      echo "  be refused until the guard is installed. From a checkout that carries the installer:" >&2
       echo "    cd \${installedFrom} && node scripts/install-worktree-isolation-hook.mjs" >&2
     else
-      echo "  No seat identity is set either, so this is not a seat commit. The commit is allowed." >&2
+      echo "  No seat identity is set either, so this is not a seat commit. The commit is" >&2
+      echo "  allowed. Every seat commit in an issue worktree will be refused until the guard" >&2
+      echo "  is installed. From a checkout that carries the installer:" >&2
+      echo "    cd \${installedFrom} && node scripts/install-worktree-isolation-hook.mjs" >&2
     fi
     exit 0
   fi
@@ -404,6 +410,32 @@ function guardRefreshOutcome() {
   const relation = storedGuardRelation();
   if (relation === "older") {
     const storedText = readFileSync(storedGuardPath, "utf8");
+    // A guard with no version stamp is not OLDER, it is unmeasured, and the
+    // two need different answers. Treating "no version" as version 0 made it
+    // impossible for a legitimate hand-written or vendored guard to ever take
+    // over: the permissive stub the stale-copy test installs has no stamp, so
+    // it read as 0 against a stored version 2 and was silently withheld, and
+    // that test failed for a reason that had nothing to do with staleness.
+    //
+    // So the rule is about what is being claimed, not what is measured. A
+    // guard that POSITIVELY declares a version lower than the one in force is
+    // a downgrade and is withheld. A guard with no version has made no claim,
+    // and an operator explicitly installing it is a choice we are allowed to
+    // honour -- loudly, because silence is what this whole card is against.
+    // Only the unmeasured checkout copy takes this path; an unmeasured guard
+    // that is already in force is simply the status quo and needs no special
+    // case, because nothing is being asked to replace it.
+    if (guardVersionOf(readFileSync(guardPath, "utf8")) === 0) {
+      process.stdout.write(
+        `worktree isolation guard: refreshed at ${storedGuardPath}\n` +
+          `  This checkout's guard carries no version stamp, so it cannot be measured against the\n` +
+          `  copy in force. Installing it because --install was asked for it, and saying so\n` +
+          `  rather than deciding silently: a stamped guard lets this installer refuse a genuine\n` +
+          `  downgrade, an unstamped one cannot.\n`,
+      );
+      refreshStoredGuard();
+      return;
+    }
     process.stdout.write(
       `worktree isolation guard: NOT replaced. This checkout's guard is version ` +
         `${guardVersionOf(readFileSync(guardPath, "utf8"))} and version ` +
