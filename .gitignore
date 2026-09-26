@@ -28,6 +28,8 @@ check-*.mjs
 !.github/scripts/check-*.mjs
 !.github/scripts/tests/check-*.mjs
 !scripts/check-*.mjs
+!scripts/__tests__/check-*.mjs
+!scripts/__tests__/check-*.test.mjs
 new-agent*.json
 newcompany.json
 seed-*.mjs
