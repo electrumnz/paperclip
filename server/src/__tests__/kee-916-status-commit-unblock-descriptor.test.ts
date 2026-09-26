@@ -323,6 +323,43 @@ describe("status commit does not displace an existing unblock descriptor", () =>
     expect(bindBlockerEffects[0].descriptorSource).toBe("existing");
   });
 
+  it("does not wake the retained agent when a board-owned current_track blocker is committed", async () => {
+    // Greptile P1 on `03ec323f5`. `status-arbiter` emits the `current_track`
+    // blocked decision with a deliberately board-owned `bind_blocker` so the
+    // same agent is not woken to repeat blocked work. This card already carries
+    // an agent-owned descriptor, and the KEE-925 fix made the wake follow the
+    // retained owner — which resurrected exactly that repeat wake. A board-owned
+    // proposal must not wake anybody, whatever the card already names.
+    const responsibleAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: responsibleAgentId,
+      companyId,
+      name: "Already responsible agent",
+      adapterType: "codex_local",
+      status: "running",
+    });
+    const existing = {
+      owner: { agentId: responsibleAgentId },
+      action: "Re-run the failed migration.",
+    };
+    const { persisted, wakeAgentIds, bindBlockerEffects } =
+      await commitBlockedDecisionOverExistingDescriptor(existing, "board");
+
+    // The KEE-916 guarantee is untouched: the descriptor is still not displaced.
+    expect(persisted?.unblockDescriptor).toEqual(existing);
+    // But the board-owned proposal is a deliberate "do not wake" signal.
+    expect(wakeAgentIds).toEqual([]);
+    expect(wakeAgentIds).not.toContain(responsibleAgentId);
+
+    // The effect still reports the owner the card actually carries, so the log
+    // does not claim a board owner that was never written.
+    expect(bindBlockerEffects).toHaveLength(1);
+    expect(bindBlockerEffects[0].owner).toEqual({ agentId: responsibleAgentId });
+    expect(bindBlockerEffects[0].action).toBe(existing.action);
+    expect(bindBlockerEffects[0].wakeId).toBeNull();
+    expect(bindBlockerEffects[0].descriptorSource).toBe("existing");
+  });
+
   it("still wakes and reports the proposed agent when the descriptor is attached", async () => {
     // No existing descriptor: the proposed one is written, so the existing
     // behaviour is correct and must not change.

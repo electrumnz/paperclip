@@ -781,12 +781,25 @@ async function materializeDecisionEffect(input: {
       )
       .returning({ id: issues.id });
     if (!bound) throw new Error("native_blocker_binding_not_persisted");
-    // `retained.descriptor.owner` is the whole point: it is agent-owned only
-    // when the agent is genuinely the recorded blocker owner, whether that came
-    // from this effect or from a descriptor this commit declined to displace.
+    // `retained.descriptor.owner` is what the card ends up blaming, and
+    // `effect.owner` is what this decision proposed. The wake is issued only
+    // when BOTH agree that an agent owns the block.
+    //
+    // Both halves are load-bearing. Requiring the retained owner alone means a
+    // `current_track` decision — which deliberately proposes a board-owned
+    // blocker to avoid waking the same agent to repeat blocked work — would
+    // still wake an agent that a pre-existing descriptor happens to name.
+    // Requiring the proposed owner alone reintroduces the divergence the
+    // retained owner exists to prevent, where the card stores one owner while
+    // the effect wakes another. See `status-arbiter.ts`, where the current-track
+    // branch binds `owner: "board"` precisely so no agent is woken.
     const blockerOwner = retained.descriptor.owner;
     let wakeId: string | null = null;
-    if (blockerOwner !== "board" && "agentId" in blockerOwner) {
+    if (
+      effect.owner !== "board" &&
+      blockerOwner !== "board" &&
+      "agentId" in blockerOwner
+    ) {
       wakeId = await enqueueWake({
         tx: input.tx,
         companyId: input.companyId,
