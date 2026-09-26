@@ -80,6 +80,31 @@ function cfgStringArray(v: unknown): string[] | undefined {
     : undefined;
 }
 
+/**
+ * Drop bare `--` end-of-options markers from operator-supplied extraArgs.
+ *
+ * `hermes chat` is a CPython argparse subparser and it declares no positional
+ * arguments, so a bare `--` in argv ends option parsing and every remaining
+ * token is then rejected as an unrecognised argument. It can never make a
+ * following token do anything useful here, so keeping it can only turn a run
+ * into a usage error.
+ *
+ * Removing it is not "silently dropping a flag the operator set": a config that
+ * already carries a bare `--` already fails today, so this converts an
+ * already-broken run into a working one rather than breaking a working config.
+ * The caller logs the change so the edit is never silent.
+ *
+ * Only an exact `--` is removed. A value that merely starts with two hyphens
+ * (`--foo`, `-p`) is a real option and is left alone.
+ */
+export function stripBareDoubleDash(args: string[]): {
+  args: string[];
+  removed: number;
+} {
+  const kept = args.filter((a) => a !== "--");
+  return { args: kept, removed: args.length - kept.length };
+}
+
 export function resolveHermesCommand(config: Record<string, unknown>): string {
   return cfgString(config.hermesCommand) || cfgString(config.command) || HERMES_CLI;
 }
@@ -487,7 +512,19 @@ export async function execute(
   }
 
   if (extraArgs?.length) {
-    args.push(...extraArgs);
+    // Argparse ordering: the adapter's own transport flag (`-q <prompt>`) is
+    // already on argv at index 1, and every adapter flag is pushed before this
+    // block, so an operator's extraArgs cannot displace the prompt. A bare
+    // `--` in extraArgs is the one thing that can still break the run, because
+    // it ends option parsing for everything after it, so remove it here.
+    const stripped = stripBareDoubleDash(extraArgs);
+    if (stripped.removed > 0) {
+      await ctx.onLog(
+        "stdout",
+        `[hermes] Ignored ${stripped.removed} bare "--" token(s) in the configured extraArgs: \`hermes chat\` takes no positional arguments, so an end-of-options marker there can only produce a usage error.\n`,
+      );
+    }
+    args.push(...stripped.args);
   }
 
   // ── Build environment ──────────────────────────────────────────────────
