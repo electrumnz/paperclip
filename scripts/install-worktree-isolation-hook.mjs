@@ -34,7 +34,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { constants as fsConstants, accessSync as fsAccessSync, copyFileSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -64,21 +64,27 @@ ${MARKER}
 #
 # Resolution order, in order of freshness:
 #   1. KEE_WORKTREE_ISOLATION_GUARD, for an explicit override
-#   2. the copy in the checkout being committed to
-#   3. the copy stored beside this hook in the common git dir
+#   2. the stored copy, which the installer keeps in step with the checkout it
+#      was installed from
+#   3. the copy in the checkout being committed to
 #
-# Step 2 is not the only step on purpose. The guard exists on branches that
-# carry it, and most worktree HEADs do not, so a shim that stopped at step 2
-# would find no guard and allow the commit -- failing open precisely on the
-# shared pre-isolation worktrees this exists to protect. Step 3 is why that
-# does not happen.
+# The stored copy is preferred over the checkout's on purpose. The other order
+# lets a worktree whose guard is an older revision decide the commit on its
+# own, so a fixed or tightened guard is not in force in that worktree, which is
+# the original failure of this card one level up. The installer refreshes the
+# stored copy on every run, so it is the one that is current.
+#
+# A checkout with no guard at all still works: 118 of 119 worktree HEADs here
+# do not carry the guard, and step 2 is what covers them.
 GUARD="\${KEE_WORKTREE_ISOLATION_GUARD:-}"
 if [ -z "$GUARD" ]; then
-  TOPLEVEL=$(git rev-parse --show-toplevel 2>/dev/null) || TOPLEVEL=""
-  if [ -n "$TOPLEVEL" ] && [ -f "$TOPLEVEL/scripts/check-worktree-isolation.mjs" ]; then
-    GUARD="$TOPLEVEL/scripts/check-worktree-isolation.mjs"
-  elif [ -f "${storedGuardPath}" ]; then
+  if [ -f "${storedGuardPath}" ]; then
     GUARD="${storedGuardPath}"
+  else
+    TOPLEVEL=$(git rev-parse --show-toplevel 2>/dev/null) || TOPLEVEL=""
+    if [ -n "$TOPLEVEL" ] && [ -f "$TOPLEVEL/scripts/check-worktree-isolation.mjs" ]; then
+      GUARD="$TOPLEVEL/scripts/check-worktree-isolation.mjs"
+    fi
   fi
 fi
 
@@ -104,16 +110,61 @@ const mode = process.argv[2] || "--install";
 const current = existsSync(hookPath) ? readFileSync(hookPath, "utf8") : null;
 const installed = current !== null && current.includes(MARKER);
 
+// Where git will actually look for hooks. If core.hooksPath is set, the
+// common .git/hooks directory is not consulted at all, so writing a hook there
+// looks like success and enforces nothing. That is a false "installed", and it
+// was found in review: with core.hooksPath pointing elsewhere, a cross-seat
+// commit landed while the installer reported the hook installed.
+let hooksPath = null;
+try {
+  hooksPath = execFileSync("git", ["config", "--get", "core.hooksPath"], { encoding: "utf8" }).trim() || null;
+} catch {
+  hooksPath = null;
+}
+if (hooksPath) {
+  const resolved = path.isAbsolute(hooksPath) ? hooksPath : path.resolve(repoRoot, hooksPath);
+  const expected = path.join(commonDir, "hooks");
+  if (path.resolve(resolved) !== expected) {
+    process.stderr.write(
+      `install-worktree-isolation-hook: core.hooksPath is set to ${hooksPath}, which is not\n` +
+        `the repository's hooks directory (${expected}). Git will not run a hook written to\n` +
+        `the common .git/hooks, so installing there would report success and enforce nothing.\n` +
+        `Point core.hooksPath at ${expected}, or unset it, and run this again.\n`,
+    );
+    process.exit(1);
+  }
+}
+
+// git runs a hook only if it is executable. A hook that lost its bit is
+// reported installed by a marker check alone, and is silently inert.
+function hookIsRunnable(file) {
+  if (!existsSync(file)) return false;
+  try {
+    fsAccessSync(file, fsConstants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 if (mode === "--check") {
-  const guardPresent = installed && existsSync(storedGuardPath);
-  process.stdout.write(
-    guardPresent
-      ? `worktree isolation hook: installed at ${hookPath} (guard ${storedGuardPath})\n`
-      : installed
-        ? `worktree isolation hook: hook installed at ${hookPath} but NO STORED GUARD at ${storedGuardPath}; commits fall back to the checkout only\n`
-        : `worktree isolation hook: NOT installed (${hookPath})\n`,
-  );
-  process.exit(guardPresent ? 0 : 1);
+  const problems = [];
+  if (!installed) {
+    process.stdout.write(`worktree isolation hook: NOT installed (${hookPath})\n`);
+    process.exit(1);
+  }
+  if (!existsSync(storedGuardPath)) {
+    problems.push(`no stored guard at ${storedGuardPath}; commits fall back to the checkout's copy`);
+  }
+  if (!hookIsRunnable(hookPath)) {
+    problems.push(`${hookPath} is not executable, so git will skip it`);
+  }
+  if (problems.length > 0) {
+    for (const problem of problems) process.stderr.write(`install-worktree-isolation-hook: ${problem}\n`);
+    process.exit(1);
+  }
+  process.stdout.write(`worktree isolation hook: installed at ${hookPath} (guard ${storedGuardPath})\n`);
+  process.exit(0);
 }
 
 if (mode === "--uninstall") {
@@ -121,9 +172,30 @@ if (mode === "--uninstall") {
     process.stdout.write("worktree isolation hook: nothing to remove\n");
     process.exit(0);
   }
-  rmSync(hookPath);
+  // Only remove what this script wrote. If somebody appended another check to
+  // the same file, deleting it would silently drop their check from every
+  // worktree in this repository. Remove this script's block and leave the rest.
+  const ours = shim.trimEnd();
+  if (current.includes(ours)) {
+    const remainder = current.replace(ours, "").trim();
+    if (remainder.length === 0) {
+      rmSync(hookPath);
+    } else {
+      process.stderr.write(
+        `install-worktree-isolation-hook: ${hookPath} also contains content this script did not\n` +
+          `write. Removing only the worktree isolation block and leaving the rest in place.\n`,
+      );
+      writeFileSync(hookPath, `${remainder}\n`, { mode: 0o755 });
+    }
+  } else {
+    process.stderr.write(
+      `install-worktree-isolation-hook: ${hookPath} carries the marker but is not the block this\n` +
+        `script writes. Refusing to remove it, so an edited hook is not deleted.\n`,
+    );
+    process.exit(1);
+  }
   rmSync(storedGuardPath, { force: true });
-  process.stdout.write(`worktree isolation hook: removed ${hookPath}\n`);
+  process.stdout.write(`worktree isolation hook: removed from ${hookPath}\n`);
   process.exit(0);
 }
 
@@ -163,8 +235,16 @@ if (installed) {
 }
 
 mkdirSync(path.dirname(hookPath), { recursive: true });
+
+// The stored guard is written FIRST, and through a temporary file so a failed
+// copy cannot leave a truncated guard that node would fail to parse. Writing
+// the hook first meant an interrupted install could leave a live hook with no
+// guard, which then warns on every commit and allows all of them -- a partial
+// install that looks like a working one.
+const staging = `${storedGuardPath}.tmp-${process.pid}`;
+copyFileSync(guardPath, staging);
+renameSync(staging, storedGuardPath);
 writeFileSync(hookPath, shim, { mode: 0o755 });
-copyFileSync(guardPath, storedGuardPath);
 process.stdout.write(
   `worktree isolation hook: installed at ${hookPath}\n` +
     `worktree isolation guard: stored at ${storedGuardPath}\n`,
