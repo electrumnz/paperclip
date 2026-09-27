@@ -52,11 +52,38 @@ jobs:
             exit 1
           fi
 
-      - name: Create or update pull request
-        id: upsert-pr
+      - name: Claim the refresh branch or refuse
+        id: branch-claim
         env:
           GH_TOKEN: ${{ github.token }}
           REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          # The branch name is a shared, unguarded string: a human can open a PR
+          # on it, and the manual lockfile exemption uses the plain name. Decide
+          # ownership before touching the ref, so a collision stops the run here
+          # instead of destroying someone else's commits further down.
+          BRANCH="$(node .github/scripts/refresh-lockfile-branch.mjs --print-branch)"
+
+          # A PR opened by a fork cannot collide with a push to this repository.
+          prs="$(
+            gh pr list --state open --head "$BRANCH" --json url,headRefName,author,headRepositoryOwner
+          )"
+          # Exits 3 when a pull request on this branch belongs to someone else.
+          # On that path `branch` is never emitted, so the step below is skipped
+          # entirely and no push, adoption, or delete can happen.
+          plan="$(printf '%s' "$prs" | node .github/scripts/refresh-lockfile-branch.mjs)" || {
+            echo "::notice title=Lockfile refresh::Branch $BRANCH has a non-bot pull request. Nothing was pushed."
+            echo "branch=" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$(printf '%s' "$plan" | jq -r '.prUrl')" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update pull request
+        id: upsert-pr
+        if: steps.branch-claim.outputs.branch != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if git diff --quiet -- pnpm-lock.yaml; then
             echo "Lockfile unchanged, nothing to do."
@@ -64,21 +91,18 @@ jobs:
             exit 0
           fi
 
-          BRANCH="chore/refresh-lockfile"
+          BRANCH="${{ steps.branch-claim.outputs.branch }}"
           git config user.name "lockfile-bot"
           git config user.email "lockfile-bot@users.noreply.github.com"
 
           git checkout -B "$BRANCH"
           git add pnpm-lock.yaml
           git commit -m "chore(lockfile): refresh pnpm-lock.yaml"
+          # --force is safe only because the claim step above proved every open
+          # pull request on this branch belongs to the bot.
           git push --force origin "$BRANCH"
 
-          # Only reuse an open PR from this repository owner, not a fork with the same branch name.
-          pr_url="$(
-            gh pr list --state open --head "$BRANCH" --json url,headRepositoryOwner \
-              --jq ".[] | select(.headRepositoryOwner.login == \"$REPO_OWNER\") | .url" |
-            head -n 1
-          )"
+          pr_url="${{ steps.branch-claim.outputs.pr_url }}"
           if [ -z "$pr_url" ]; then
             pr_url="$(gh pr create \
               --head "$BRANCH" \

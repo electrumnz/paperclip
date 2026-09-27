@@ -5,20 +5,26 @@
  * Export: checkLockfile(files, prAuthor, prBranch) → { passed, failures }
  */
 import { fileURLToPath } from 'node:url';
+import { REFRESH_BRANCH, MANUAL_EXEMPTION_BRANCH } from './refresh-lockfile-branch.mjs';
 
 export function checkLockfile(files, prAuthor, prBranch) {
   const lockfileChanged = files.some(f => f.filename === 'pnpm-lock.yaml');
   if (!lockfileChanged) return { passed: true, failures: [] };
 
-  const isRefreshBot =
-    prAuthor === 'github-actions[bot]' && prBranch === 'chore/refresh-lockfile';
+  // The bot is exempt only on its own branch, or on the legacy plain name while
+  // an older refresh PR is still open. The bot on any other branch is not
+  // exempt: that keeps a mis-set branch from silently passing the gate. A human
+  // is never the bot, on any branch.
+  const isRefreshBotAuthor =
+    prAuthor === 'github-actions[bot]' &&
+    (prBranch === REFRESH_BRANCH || prBranch === MANUAL_EXEMPTION_BRANCH);
 
   return {
-    passed: isRefreshBot,
-    failures: isRefreshBot ? [] : [
+    passed: isRefreshBotAuthor,
+    failures: isRefreshBotAuthor ? [] : [
       'You have changes to `pnpm-lock.yaml` — `pr.yml` will hard-fail this PR with a confusing message about lockfile edits. ' +
       'To fix: run `pnpm install` locally, exclude the lockfile from your commit, push again. ' +
-      'The lockfile is regenerated automatically by the refresh bot on a schedule.',
+      `The lockfile is regenerated automatically by the refresh bot on a schedule, on \`${MANUAL_EXEMPTION_BRANCH}\`'s own branch.`,
     ],
   };
 }
