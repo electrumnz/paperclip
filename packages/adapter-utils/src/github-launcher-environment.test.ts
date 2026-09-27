@@ -219,6 +219,42 @@ describe("managed GitHub launcher environment", () => {
     expect(env.GH_CONFIG_DIR).toBe(config);
   });
 
+  it("replaces a GH_CONFIG_DIR without hosts.yml on a remote shell target, and honours one that has it", async () => {
+    // The remote probe is a separate POSIX shell program from the local Node
+    // probe, so the local tests above cannot reach this path. A legacy SSH host
+    // running a Node-less agent would hit the wrong GH_CONFIG_DIR unchanged.
+    const remote = await sandbox("usr/bin");
+    vi.stubEnv("GH_TOKEN", "controller-secret");
+    // The remote shell resolves against its own filesystem, so its HOME must
+    // expose the same gh config directory the probe is expected to fall back to.
+    await mkdir(path.join(remote.root, ".config/gh"), { recursive: true });
+    await writeFile(path.join(remote.root, ".config/gh/hosts.yml"), "host credential fixture");
+    const real = path.join(remote.root, "real-gh");
+    await mkdir(real, { recursive: true });
+    await writeFile(path.join(real, "hosts.yml"), "host credential fixture");
+    // A $HOME-valued GH_CONFIG_DIR has no $HOME/hosts.yml, which is what made gh
+    // report "not logged into any GitHub hosts" for a valid keyring token.
+    const wrong = await prepareGitHubExecutionEnvironment({
+      target: { ...remote.target, remoteCwd: remote.root },
+      cwd: remote.root, env: { GH_CONFIG_DIR: remote.root }, hostCredentials: true, networkAccess: true,
+    });
+    expect(wrong.GH_CONFIG_DIR).toBe(path.join(remote.root, ".config/gh"));
+    expect(wrong.GH_CONFIG_DIR).not.toBe(remote.root);
+    // A directory that really holds gh's hosts file is still honoured, so the
+    // remote correction is not a blanket override.
+    const honoured = await prepareGitHubExecutionEnvironment({
+      target: { ...remote.target, remoteCwd: remote.root },
+      cwd: remote.root, env: { GH_CONFIG_DIR: real }, hostCredentials: true, networkAccess: true,
+    });
+    expect(honoured.GH_CONFIG_DIR).toBe(real);
+    // A run binding must not redirect the remote shell either.
+    const rebound = await prepareGitHubExecutionEnvironment({
+      target: { ...remote.target, remoteCwd: remote.root },
+      cwd: remote.root, env: { GH_CONFIG_DIR: remote.root }, hostCredentials: true, networkAccess: true,
+    });
+    expect(rebound.GH_CONFIG_DIR).toBe(path.join(remote.root, ".config/gh"));
+  });
+
   it("preserves local host credential helpers and validates worktree metadata", async () => {
     const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-host-git-")); roots.push(root);
     vi.stubEnv("HOME", root);
