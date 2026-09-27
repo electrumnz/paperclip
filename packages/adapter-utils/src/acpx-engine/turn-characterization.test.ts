@@ -608,6 +608,108 @@ describe("ACPX engine turn characterization", () => {
     expect(result.costUsd).toBeCloseTo(0.31);
   });
 
+  it("fails an end_turn terminal whose only output is a provider model rejection", async () => {
+    // The KEE-276 run: the provider refused the model, answered the 400 as
+    // assistant text, and ended the turn `end_turn` with exit 0. Recording that
+    // as `succeeded` is what leaves an assigned card sitting still on a seat
+    // every operator surface reads as healthy.
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+    const logs: Array<{ stream: string; text: string }> = [];
+
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () =>
+        turnRuntime({
+          events: async function* () {
+            yield {
+              type: "text_delta",
+              text: "Warning: Model metadata for `claude-haiku-4-5` not found. Defaulting to fallback metadata...",
+            };
+            yield {
+              type: "text_delta",
+              text: JSON.stringify({
+                type: "error",
+                status: 400,
+                error: {
+                  type: "invalid_request_error",
+                  message:
+                    "The 'claude-haiku-4-5' model is not supported when using Codex with a ChatGPT account.",
+                },
+              }),
+            };
+            yield { type: "done", stopReason: "end_turn" };
+          },
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+        }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-model-rejected",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir },
+      context: {},
+      onLog: async (stream: "stdout" | "stderr", text: string) => {
+        logs.push({ stream, text });
+      },
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.exitCode).toBe(1);
+    // `model_not_found` is what routes the run away from the normal
+    // comment/liveness path via isConfigurationIncompleteFailedRun.
+    expect(result.errorCode).toBe("model_not_found");
+    expect(result.errorMessage).toContain("is not supported when using Codex with a ChatGPT account");
+    const resultJson = result.resultJson as Record<string, unknown>;
+    expect(resultJson.status).toBe("failed");
+    expect(resultJson.outputRejection).toBe("model_rejected");
+    // The provider's own stop reason stays on the record as the evidence.
+    expect(resultJson.stopReason).toBe("end_turn");
+    // The relay still forwards the provider's own `done` event verbatim; it is
+    // the run's finalization log that must report the failure. The transcript
+    // also interleaves plain `[paperclip]` notices with the JSON stream events;
+    // only the latter are structured.
+    const emitted = logs
+      .map((entry) => entry.text.trim())
+      .filter((text) => text.startsWith("{"))
+      .map((text) => JSON.parse(text) as Record<string, unknown>);
+    expect(
+      emitted.some((event) => event.type === "acpx.error" && event.summary === "model_rejected"),
+    ).toBe(true);
+  });
+
+  it("leaves a zero-tool-call turn that only talked as a success", async () => {
+    // The companion pin for the guard above: most zero-tool-call runs are
+    // legitimate no-op heartbeats, and no tool count alone may fail one.
+    const root = await makeTempRoot();
+    const stateDir = path.join(root, "state");
+
+    const execute = createAcpxEngineExecutor({
+      createRuntime: () =>
+        turnRuntime({
+          events: async function* () {
+            yield { type: "text_delta", text: "Nothing to do this heartbeat; the board is quiet." };
+            yield { type: "done", stopReason: "end_turn" };
+          },
+          result: Promise.resolve({ status: "completed", stopReason: "end_turn" }),
+        }) as never,
+    });
+
+    const result = await execute({
+      runId: "run-quiet-heartbeat",
+      agent: { id: "agent-1", companyId: "company-1" },
+      runtime: {},
+      config: { agent: "custom", agentCommand: "node ./fake-acp.js", stateDir },
+      context: {},
+      onLog: async () => {},
+      onMeta: async () => {},
+    } as never);
+
+    expect(result.exitCode).toBe(0);
+    expect(result.errorCode).toBeNull();
+    expect((result.resultJson as Record<string, unknown>)?.status).toBe("completed");
+  });
+
   it("computes usage the same way summarizeAcpxTurnUsage does for the event fallback", () => {
     // Pin the exported helper the turn path calls: with no getStatus snapshots the
     // event breakdown and cost drive the per-run usage.
