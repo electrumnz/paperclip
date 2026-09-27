@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   buildReleasePackagePlan,
   checkConfiguration,
+  findSkillsPackages,
   findUnpublishableWorkspaceEdges,
   getReleasePackages,
 } from "./release-package-map.mjs";
@@ -64,6 +65,46 @@ test("Hermes release surface publishes the unified built-in package and keeps ga
 
 test("release package configuration validates successfully", () => {
   assert.doesNotThrow(() => checkConfiguration());
+});
+
+// KEE-1129: release.sh used to copy skills/ into a hand-written list of three
+// packages while seven declared "skills" in files[], so cursor-local,
+// gemini-local and opencode-local published without a skills/ directory. The
+// set must be derived from files[], and the adapters that resolve skills at
+// runtime must stay in it.
+test("every published package that declares skills in files[] is in the skills staging set", () => {
+  const skillsDirs = findSkillsPackages(getReleasePackages()).map((pkg) => pkg.dir);
+
+  assert.deepEqual(
+    skillsDirs,
+    [
+      "packages/adapters/claude-local",
+      "packages/adapters/codex-local",
+      "packages/adapters/cursor-local",
+      "packages/adapters/gemini-local",
+      "packages/adapters/opencode-local",
+      "packages/adapters/hermes",
+      "server",
+    ],
+    "the skills staging set must be derived from files[] and cover every package that claims it",
+  );
+});
+
+test("no published package claims skills in files[] without appearing in the staging set", () => {
+  const selected = new Set(findSkillsPackages(getReleasePackages()).map((pkg) => pkg.dir));
+  const missing = getReleasePackages().filter(
+    (pkg) => Array.isArray(pkg.pkg.files) && pkg.pkg.files.includes("skills") && !selected.has(pkg.dir),
+  );
+
+  assert.deepEqual(missing, [], "every skills-claiming package must be staged");
+});
+
+test("packages that do not claim skills in files[] are never staged", () => {
+  const selected = new Set(findSkillsPackages(getReleasePackages()).map((pkg) => pkg.dir));
+
+  for (const dir of ["cli", "ui", "packages/adapters/grok-local", "packages/adapters/kimi-local"]) {
+    assert.ok(!selected.has(dir), `${dir} does not declare skills in files[] and must not be staged`);
+  }
 });
 
 test("guard flags a publishFromCi:true package depending on a publishFromCi:false package", () => {

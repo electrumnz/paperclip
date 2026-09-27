@@ -276,6 +276,26 @@ function setVersion(version) {
   }
 }
 
+// Every published package whose files[] claims "skills" must receive a copy of
+// the repo-root skills/ tree, or `pnpm pack` silently omits the entry and the
+// published package resolves zero skills at runtime. Packages that already
+// carry a committed skills/ directory (packages/adapters/hermes) are listed
+// here too so the selection stays a pure function of the manifest and
+// files[]; release.sh skips those that already have the directory. Deriving
+// the set here keeps it from drifting the way the old hand-written list did
+// (KEE-1129).
+function findSkillsPackages(packages) {
+  return packages.filter(
+    (pkg) => Array.isArray(pkg.pkg.files) && pkg.pkg.files.includes("skills"),
+  );
+}
+
+function listSkillsPackageDirs() {
+  for (const pkg of findSkillsPackages(getReleasePackages())) {
+    process.stdout.write(`${pkg.dir}\n`);
+  }
+}
+
 function listPackages() {
   const packages = getReleasePackages();
   for (const pkg of packages) {
@@ -302,6 +322,7 @@ function usage() {
     [
       "Usage:",
       "  node scripts/release-package-map.mjs list",
+      "  node scripts/release-package-map.mjs list-skills-dirs",
       "  node scripts/release-package-map.mjs check",
       "  node scripts/release-package-map.mjs set-version <version>",
       "",
@@ -315,6 +336,11 @@ const isDirectRun = process.argv[1] && resolve(process.argv[1]) === fileURLToPat
 if (isDirectRun) {
   if (command === "list") {
     listPackages();
+    process.exit(0);
+  }
+
+  if (command === "list-skills-dirs") {
+    listSkillsPackageDirs();
     process.exit(0);
   }
 
@@ -340,6 +366,7 @@ export {
   buildReleasePackagePlan,
   checkConfiguration,
   discoverPublicPackages,
+  findSkillsPackages,
   findUnpublishableWorkspaceEdges,
   getReleasePackages,
   loadReleaseManifest,
