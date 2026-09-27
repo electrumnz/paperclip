@@ -55,7 +55,7 @@ async function readStdin() {
   return Buffer.concat(chunks).toString('utf8');
 }
 
-async function main(argv) {
+export async function main(argv) {
   if (argv[0] === '--print-branch') {
     process.stdout.write(`${REFRESH_BRANCH}\n`);
     return 0;

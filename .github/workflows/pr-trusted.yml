@@ -336,6 +336,15 @@ jobs:
       - name: Test PR quality-gate scripts
         run: node --test '.github/scripts/tests/*.test.mjs'
 
+      # The lockfile refresh claim step is shell, so the only tests that
+      # exercise it are the collision ones. They build a throwaway git remote
+      # and stub `gh`, so they need no network, no token, and about three
+      # seconds. Running them here is what keeps the fail-closed guard honest:
+      # the static-text tests above stay green even when `claim_rc` handling is
+      # mutated away, so this is the only step that catches it.
+      - name: Test lockfile refresh collision guards
+        run: bash .github/scripts/tests/manual/refresh-lockfile-collision-e2e.sh
+
       - name: Test general-server shard partition
         run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
 
