@@ -8,9 +8,11 @@ import { testEnvironment } from "@paperclipai/adapter-cursor-local/server";
 async function writeFakeAgentCommand(binDir: string, argsCapturePath: string): Promise<string> {
   const commandPath = path.join(binDir, "agent");
   // Bind the interpreter to the node binary running this test. Remote sandbox
-  // children get a managed PATH built from `defaultPathForPlatform()`, which has
-  // no `node` on hosts that install node through a version manager shim, so an
-  // `#!/usr/bin/env node` fixture would exit 127 there and on CI alike.
+  // children get a managed PATH built from `defaultPathForPlatform()`, which on
+  // a workstation that installs node through a version-manager shim contains no
+  // `node` at all, so an `#!/usr/bin/env node` fixture cannot resolve its
+  // interpreter and the child exits 127. (CI has a real node on PATH, so it
+  // never saw this; it is host-dependent, not lane-specific.)
   const script = `#!${process.execPath}
 const fs = require("node:fs");
 const outPath = process.env.PAPERCLIP_TEST_ARGS_PATH;
