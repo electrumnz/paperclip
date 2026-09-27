@@ -37,6 +37,26 @@ export type CommandRunner = (
 
 type ReleasePackageEntry = { dir: string; name: string };
 
+// Packages that list a "skills" entry in files[] and are populated by
+// scripts/release.sh copying the repo-root skills/ directory into them.
+export const GIT_INSTALL_SKILL_PACKAGE_DIRS = [
+  "server",
+  "packages/adapters/claude-local",
+  "packages/adapters/codex-local",
+];
+
+// Confirms the staged workspace tarball for a bundled package really carries the
+// entries the running control plane needs. The UI check matters most: with
+// uiMode=static, server/src/app.ts only serves the board from <pkg>/ui-dist, so a
+// tarball without it installs cleanly and then serves an API with no UI.
+export function describePackagedWorkspaceEntries(payloadPath: string, packageName: string, entries: string[]): Record<string, boolean> {
+  const present: Record<string, boolean> = {};
+  for (const entry of entries) {
+    present[entry] = fs.existsSync(path.join(payloadPath, "node_modules", packageName, entry));
+  }
+  return present;
+}
+
 export async function runCommandWithDiagnostics(
   file: string,
   args: string[],
@@ -278,6 +298,20 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+    // The server build above never touches ui/, so server/ui-dist does not exist
+    // yet. scripts/release.sh prepares it (and copies skills/ into the packages
+    // that ship it) before packaging; without the same step here, a staged
+    // @paperclipai/server has no UI and no skills, and the installed control
+    // plane serves an API with no board. Reuse the flag release.sh exports so a
+    // prepared ui/dist is not rebuilt a second time by server prepack.
+    const uiDistEnv = buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" });
+    await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: checkoutPath, env: uiDistEnv, maxBuffer: 32 * 1024 * 1024 });
+    for (const pkgDir of GIT_INSTALL_SKILL_PACKAGE_DIRS) {
+      const skillsSource = path.join(checkoutPath, "skills");
+      const skillsTarget = path.join(checkoutPath, pkgDir, "skills");
+      if (!fs.existsSync(skillsSource) || fs.existsSync(skillsTarget)) continue;
+      fs.cpSync(skillsSource, skillsTarget, { recursive: true });
+    }
     const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
     for (const [index, workspacePackage] of workspacePackages.entries()) {
@@ -286,8 +320,12 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       const bundledDependencies = packageJson.bundleDependencies ?? packageJson.bundledDependencies ?? [];
       if (bundledDependencies.length > 0) {
         const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
+        // --ignore-scripts matches scripts/release.sh: the staged package is a
+        // build output, and its prepack/postpack reference repo-relative scripts
+        // (../scripts/...) that staging never copies, so running them here fails
+        // with exit 127 instead of producing a tarball.
         await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
+        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot, "--ignore-scripts"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
       } else {
         await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
       }
@@ -300,6 +338,20 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       throw new Error(`Git install packaging produced ${workspaceTarballs.length} workspace tarballs; expected ${workspacePackages.length}.`);
     }
     await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
+    // @paperclipai/server is the only package with bundleDependencies, so it is
+    // the only one that takes the prepare-bundled-package branch. Report that
+    // branch explicitly and refuse to publish a payload whose server package has
+    // no ui-dist: the install would succeed and then serve an API with no board,
+    // which is a worse failure than the crash this replaced.
+    const serverEntries = describePackagedWorkspaceEntries(stagedPayload, "@paperclipai/server", ["ui-dist", "skills"]);
+    console.log(
+      `  -> @paperclipai/server staged via prepare-bundled-package (bundleDependencies): ui-dist=${serverEntries["ui-dist"] ? "present" : "MISSING"}, skills=${serverEntries.skills ? "present" : "MISSING"}`,
+    );
+    if (!serverEntries["ui-dist"]) {
+      throw new Error(
+        "Staged @paperclipai/server has no ui-dist, so the installed control plane would serve no UI. This is a packaging defect, not an install error.",
+      );
+    }
     await smokePayload(stagedPayload, metadata.version, runCommand);
     fs.renameSync(stagedPayload, payloadPath);
     return { payloadPath, reused: false, version: metadata.version };

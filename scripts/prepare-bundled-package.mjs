@@ -136,6 +136,28 @@ export function applyBundledDependencyPatches(destinationDir, bundledDependencie
   }
 }
 
+// Copies a package's declared `files[]` entries into the staging directory.
+//
+// A fresh git checkout does not contain every `files[]` entry: `server/ui-dist` is
+// gitignored and `server/skills` is materialised by scripts/release.sh at release
+// time only, so both are absent for a `--ref` install. Skipping them silently
+// would ship a package that looks complete but is missing the UI or the skills,
+// so report every entry that could not be copied and let the caller decide.
+export function copyPackageFiles(sourceDir, destinationDir, entries = []) {
+  const copied = [];
+  const missing = [];
+  for (const entry of entries) {
+    const sourcePath = resolve(sourceDir, entry);
+    if (!existsSync(sourcePath)) {
+      missing.push(entry);
+      continue;
+    }
+    cpSync(sourcePath, resolve(destinationDir, entry), { recursive: true });
+    copied.push(entry);
+  }
+  return { copied, missing };
+}
+
 export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = repoRoot } = {}) {
   const sourcePackagePath = resolve(sourceDir, "package.json");
   const sourcePackage = JSON.parse(readFileSync(sourcePackagePath, "utf8"));
@@ -147,9 +169,7 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
 
   rmSync(destinationDir, { recursive: true, force: true });
   mkdirSync(destinationDir, { recursive: true });
-  for (const entry of sourcePackage.files ?? []) {
-    cpSync(resolve(sourceDir, entry), resolve(destinationDir, entry), { recursive: true });
-  }
+  const { copied, missing } = copyPackageFiles(sourceDir, destinationDir, sourcePackage.files ?? []);
   for (const entry of ["README.md", "LICENSE", "LICENSE.md"]) {
     const sourcePath = resolve(sourceDir, entry);
     if (existsSync(sourcePath)) cpSync(sourcePath, resolve(destinationDir, entry));
@@ -210,6 +230,14 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
     writeFileSync(deployedPackagePath, `${JSON.stringify(stagedPackage, null, 2)}\n`);
     rmSync(resolve(destinationDir, "node_modules/@embedded-postgres"), { recursive: true, force: true });
   }
+
+  if (missing.length > 0) {
+    console.warn(
+      `  -> Warning: ${sourcePackage.name} staging skipped files[] entries that do not exist in this checkout: ${missing.join(", ")}`,
+    );
+  }
+
+  return { copied, missing };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
