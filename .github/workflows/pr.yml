@@ -12,4 +12,21 @@ jobs:
   ci:
     # Master requires CODEOWNERS review for .github/**, including this workflow.
     # The AWS runner group permits pr-trusted.yml@refs/heads/master.
-    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
+    #
+    # Pinned to an immutable commit rather than @master. pr-trusted.yml's own
+    # header prescribes this as rollout step 2: an @master caller lets the
+    # active CI definition drift from this file, and that drift was measurable.
+    # A @master caller fanned out 47 jobs (9 serialized-server shards, 8 e2e
+    # shards, 12 general-server, 3 chat); the older pinned SHA fanned out only
+    # 25 (5 / 3 / 5 / 0), so a PR could go green on roughly half the suite
+    # depending only on which ref this line carried. This SHA is upstream master
+    # as of 2026-09-27 and is byte-identical to the pr-trusted.yml checked into
+    # this fork, so the executed definition and the reviewed one agree again.
+    # Re-pin deliberately when syncing upstream; do not restore the movable ref.
+    #
+    # The gate still refuses the AWS self-hosted fleet on this fork, by design:
+    # AWS_CI_ENABLED is unset here, so its fail_closed route selects
+    # ubuntu-latest and the whole suite runs on GitHub-hosted runners with no
+    # repository variables and no secrets. That is the untrusted-fork control
+    # working, not a failure. Do not add AWS_CI_* to make the fleet route.
+    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@640dee18029f7651d56ae0f1828d04228f9ab044
