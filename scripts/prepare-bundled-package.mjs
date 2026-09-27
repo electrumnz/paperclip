@@ -231,20 +231,22 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
     rmSync(resolve(destinationDir, "node_modules/@embedded-postgres"), { recursive: true, force: true });
   }
 
-  if (missing.length > 0) {
-    console.warn(
-      `  -> Warning: ${sourcePackage.name} staging skipped files[] entries that do not exist in this checkout: ${missing.join(", ")}`,
-    );
-  }
-
-  return { copied, missing };
+  return { packageName: sourcePackage.name, copied, missing };
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const [sourceDir, destinationDir] = process.argv.slice(2);
+  const args = process.argv.slice(2);
+  // --json makes the result machine-readable on stdout so a caller that runs
+  // this as a subprocess with piped stdio (scripts/release.sh and the CLI's
+  // git install path) can act on what was skipped instead of discarding it.
+  const asJson = args.includes("--json");
+  const [sourceDir, destinationDir] = args.filter((arg) => !arg.startsWith("--"));
   if (!sourceDir || !destinationDir) {
-    console.error("Usage: prepare-bundled-package.mjs <source-dir> <destination-dir>");
+    console.error("Usage: prepare-bundled-package.mjs <source-dir> <destination-dir> [--json]");
     process.exit(1);
   }
-  prepareBundledPackage(resolve(sourceDir), resolve(destinationDir));
+  const result = prepareBundledPackage(resolve(sourceDir), resolve(destinationDir));
+  if (asJson) {
+    console.log(JSON.stringify({ name: result.packageName, copied: result.copied, missing: result.missing }));
+  }
 }

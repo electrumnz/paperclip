@@ -37,13 +37,28 @@ export type CommandRunner = (
 
 type ReleasePackageEntry = { dir: string; name: string };
 
-// Packages that list a "skills" entry in files[] and are populated by
-// scripts/release.sh copying the repo-root skills/ directory into them.
-export const GIT_INSTALL_SKILL_PACKAGE_DIRS = [
-  "server",
-  "packages/adapters/claude-local",
-  "packages/adapters/codex-local",
-];
+// Every released package that ships a "skills" entry in files[] needs the
+// repo-root skills/ directory copied into it before packing, because a fresh
+// checkout has no skills/ there. This was a hard-coded list copied from
+// scripts/release.sh, and it had already drifted: cursor-local, gemini-local and
+// opencode-local all declare "skills" in files[] and were staged without one, and
+// `pnpm pack` omits a missing files[] entry without failing, so those adapters
+// shipped with no skills at all. Derive the set from the same release manifest
+// this function already reads, so it cannot drift again.
+export function resolveGitInstallSkillPackageDirs(checkoutPath: string): string[] {
+  return resolveGitInstallWorkspacePackages(checkoutPath)
+    .filter((entry) => {
+      try {
+        const manifest = JSON.parse(fs.readFileSync(path.join(checkoutPath, entry.dir, "package.json"), "utf8")) as { files?: string[] };
+        return (manifest.files ?? []).includes("skills");
+      } catch {
+        // A manifest we cannot read cannot ship skills; staging will fail loudly
+        // on the package itself rather than silently dropping the entry.
+        return false;
+      }
+    })
+    .map((entry) => entry.dir);
+}
 
 // Confirms the staged workspace tarball for a bundled package really carries the
 // entries the running control plane needs. The UI check matters most: with
@@ -55,6 +70,39 @@ export function describePackagedWorkspaceEntries(payloadPath: string, packageNam
     present[entry] = fs.existsSync(path.join(payloadPath, "node_modules", packageName, entry));
   }
   return present;
+}
+
+// prepare-bundled-package.mjs reports the files[] entries it had to skip on
+// stdout. The install path runs it as a subprocess with piped stdio, so without
+// this the report is discarded and a silently under-staged package looks like a
+// clean install.
+export function formatSkippedFilesReport(reports: { packageName: string; missing: string[] }[]): string[] {
+  return reports
+    .filter((report) => report.missing.length > 0)
+    .map((report) => `  -> Warning: ${report.packageName} staged without files[] entries missing from this checkout: ${report.missing.join(", ")}`);
+}
+
+// Reads the --json report prepare-bundled-package.mjs writes to stdout. Anything
+// unparseable is reported as a skipped entry for every declared files[] value
+// rather than being dropped, so a change to the script's output shape can only
+// make this noisier, never quieter than the package really is.
+export function parseStagedPackageReport(stdout: string, fallbackName: string | undefined, declaredEntries: string[] = []): { packageName: string; missing: string[] } {
+  const packageName = fallbackName ?? "workspace package";
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as { name?: unknown; missing?: unknown };
+      if (!Array.isArray(parsed.missing)) continue;
+      return {
+        packageName: typeof parsed.name === "string" && parsed.name ? parsed.name : packageName,
+        missing: parsed.missing.filter((entry): entry is string => typeof entry === "string"),
+      };
+    } catch {
+      continue;
+    }
+  }
+  return { packageName, missing: declaredEntries };
 }
 
 export async function runCommandWithDiagnostics(
@@ -302,11 +350,13 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     // yet. scripts/release.sh prepares it (and copies skills/ into the packages
     // that ship it) before packaging; without the same step here, a staged
     // @paperclipai/server has no UI and no skills, and the installed control
-    // plane serves an API with no board. Reuse the flag release.sh exports so a
-    // prepared ui/dist is not rebuilt a second time by server prepack.
-    const uiDistEnv = buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" });
-    await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: checkoutPath, env: uiDistEnv, maxBuffer: 32 * 1024 * 1024 });
-    for (const pkgDir of GIT_INSTALL_SKILL_PACKAGE_DIRS) {
+    // plane serves an API with no board. The package set is derived from the
+    // release manifest rather than listed by hand, because a package that
+    // declares "skills" in files[] and is missed here ships without skills and
+    // `pnpm pack` does not fail on the omission. Existing directories are left
+    // alone so a package with committed skills keeps its own copy.
+    await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
+    for (const pkgDir of resolveGitInstallSkillPackageDirs(checkoutPath)) {
       const skillsSource = path.join(checkoutPath, "skills");
       const skillsTarget = path.join(checkoutPath, pkgDir, "skills");
       if (!fs.existsSync(skillsSource) || fs.existsSync(skillsTarget)) continue;
@@ -325,22 +375,33 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "release-package-map.mjs"), "set-version", checkoutVersion], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 4 * 1024 * 1024 });
     const metadata = JSON.parse(fs.readFileSync(cliPackageJsonPath, "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
+    const skippedFilesReports: { packageName: string; missing: string[] }[] = [];
     for (const [index, workspacePackage] of workspacePackages.entries()) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
-      const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
+      const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { name?: string; files?: string[]; bundleDependencies?: string[]; bundledDependencies?: string[] };
       const bundledDependencies = packageJson.bundleDependencies ?? packageJson.bundledDependencies ?? [];
       if (bundledDependencies.length > 0) {
         const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
         // --ignore-scripts matches scripts/release.sh: the staged package is a
         // build output, and its prepack/postpack reference repo-relative scripts
         // (../scripts/...) that staging never copies, so running them here fails
-        // with exit 127 instead of producing a tarball.
-        await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+        // with exit 127 instead of producing a tarball. It also stops the
+        // server's `postpack: rm -rf ui-dist` from deleting the artifact back out
+        // of the staging directory, which is what makes the presence check below
+        // meaningful.
+        //
+        // --json is captured rather than discarded: the staged package can be
+        // missing a files[] entry, and an install that quietly shipped a
+        // package without a declared file is the failure mode this whole change
+        // exists to prevent.
+        const prepareResult = await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage, "--json"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+        skippedFilesReports.push(parseStagedPackageReport(prepareResult.stdout, packageJson.name, packageJson.files ?? []));
         await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot, "--ignore-scripts"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
       } else {
         await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
       }
     }
+    for (const line of formatSkippedFilesReport(skippedFilesReports)) console.log(line);
     await runCommand("npm", ["pack", "--pack-destination", stagingRoot], { cwd: path.join(checkoutPath, "cli"), env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
     const tarballs = fs.readdirSync(stagingRoot).filter((entry) => entry.endsWith(".tgz"));
     const cliTarball = tarballs.find((entry) => entry === `paperclipai-${metadata.version}.tgz`);
