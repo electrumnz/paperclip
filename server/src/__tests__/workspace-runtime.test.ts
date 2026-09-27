@@ -158,6 +158,47 @@ async function writeRegisteredSourceConfig(baseCwd: string, instanceId = "source
   );
 }
 
+/**
+ * Runs `body` with a PATH that cannot reach a host-installed `paperclipai`.
+ *
+ * `provision-worktree.sh` picks its CLI via `pnpm paperclipai --help`, then
+ * `pnpm paperclipai worktree init`, then a bare `paperclipai` on PATH. On a
+ * machine where Paperclip is installed globally (an operator workstation, a
+ * managed `~/.local/bin` shim) the last two resolve against the ambient PATH,
+ * so the provision child runs the operator's real CLI against a throwaway
+ * temp-repo fixture whose `.paperclip/config.json` is the deliberate `{}` stub
+ * above. The real CLI rejects that stub (`$meta: expected object`) and
+ * provisioning fails, which reads as five red tests that are not a regression
+ * and that CI never reproduces because CI has no global install.
+ *
+ * Isolating PATH keeps these fixtures on the config-writer path they actually
+ * assert, which is what the neighbouring "writes an isolated repo-local
+ * Paperclip config" fixture already does for the same reason. The stub config
+ * stays exactly as it is; nothing about the assertions changes.
+ */
+async function withIsolatedProvisionCliPath<T>(body: () => Promise<T>): Promise<T> {
+  const previousPath = process.env.PATH;
+  const isolatedBin = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-isolated-bin-"));
+  try {
+    // provision-worktree.sh needs a real `node` for its inline heredocs and a
+    // real `bash`; it must NOT see the host's `paperclipai`.
+    await fs.symlink(process.execPath, path.join(isolatedBin, "node"));
+    process.env.PATH = [
+      isolatedBin,
+      ...(previousPath ?? "")
+        .split(path.delimiter)
+        .filter((entry) => entry.length > 0)
+        // Drop any host `paperclipai` the operator's shell is exposing.
+        .filter((entry) => !existsSync(path.join(entry, "paperclipai"))),
+    ].join(path.delimiter);
+    return await body();
+  } finally {
+    if (previousPath === undefined) delete process.env.PATH;
+    else process.env.PATH = previousPath;
+    await fs.rm(isolatedBin, { recursive: true, force: true });
+  }
+}
+
 async function createTempRepo(defaultBranch = "main") {
   const repoRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-repo-"));
   await runGit(repoRoot, ["init"]);
@@ -1876,6 +1917,7 @@ describe("realizeExecutionWorkspace", () => {
   it(
     "provisions worktree-local pnpm node_modules instead of reusing base-repo links",
     async () => {
+    return await withIsolatedProvisionCliPath(async () => {
     const repoRoot = await createTempRepo();
     await writeRegisteredSourceConfig(repoRoot);
     await fs.mkdir(path.join(repoRoot, "scripts"), { recursive: true });
@@ -1974,11 +2016,13 @@ describe("realizeExecutionWorkspace", () => {
     await expect(fs.realpath(path.join(repoRoot, "server", "node_modules", "@repo", "shared"))).resolves.toBe(
       await fs.realpath(path.join(repoRoot, "packages", "shared")),
     );
+    });
     },
     30_000,
   );
 
   it("provisions successfully when install is needed but there are no symlinked node_modules to move", async () => {
+    return await withIsolatedProvisionCliPath(async () => {
     const repoRoot = await createTempRepo();
     await writeRegisteredSourceConfig(repoRoot);
     await fs.mkdir(path.join(repoRoot, "scripts"), { recursive: true });
@@ -2050,9 +2094,11 @@ describe("realizeExecutionWorkspace", () => {
     await expect(fs.readFile(path.join(workspace.cwd, ".paperclip", "config.json"), "utf8")).resolves.toContain(
       "\"database\"",
     );
+    });
   }, 30_000);
 
   it("reinstalls worktree-local pnpm dependencies when package metadata changes", async () => {
+    return await withIsolatedProvisionCliPath(async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-stale-deps-"));
     const baseRoot = path.join(tempRoot, "base");
     const worktreeRoot = path.join(tempRoot, "worktree");
@@ -2144,6 +2190,7 @@ describe("realizeExecutionWorkspace", () => {
     } finally {
       await fs.rm(tempRoot, { recursive: true, force: true });
     }
+    });
   }, 30_000);
 
   it("fails instead of writing an unseeded fallback config when worktree init errors after CLI detection succeeds", async () => {
@@ -2296,6 +2343,7 @@ describe("realizeExecutionWorkspace", () => {
   });
 
   it("retries worktree-local pnpm install without a frozen lockfile when the lockfile is outdated", async () => {
+    return await withIsolatedProvisionCliPath(async () => {
     const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-outdated-lockfile-"));
     const baseRoot = path.join(tempRoot, "base");
     const worktreeRoot = path.join(tempRoot, "worktree");
@@ -2369,11 +2417,13 @@ describe("realizeExecutionWorkspace", () => {
     } finally {
       await fs.rm(tempRoot, { recursive: true, force: true });
     }
+    });
   });
 
   it(
     "provisions worktree-local pnpm node_modules instead of reusing base-repo links",
     async () => {
+    return await withIsolatedProvisionCliPath(async () => {
     const repoRoot = await createTempRepo();
     await writeRegisteredSourceConfig(repoRoot);
     await fs.mkdir(path.join(repoRoot, "scripts"), { recursive: true });
@@ -2472,6 +2522,7 @@ describe("realizeExecutionWorkspace", () => {
     await expect(fs.realpath(path.join(repoRoot, "server", "node_modules", "@repo", "shared"))).resolves.toBe(
       await fs.realpath(path.join(repoRoot, "packages", "shared")),
     );
+    });
     },
     15_000,
   );
