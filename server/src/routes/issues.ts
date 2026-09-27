@@ -347,9 +347,22 @@ import {
 } from "../services/issue-queued-comment-queue.js";
 
 const MAX_ISSUE_COMMENT_LIMIT = 500;
-const updateIssueRouteSchema = updateIssueSchema.extend({
-  interrupt: z.boolean().optional(),
-});
+// KEE-579: an issue PATCH used to strip an unrecognised body key and still
+// answer 200, so `{"assigneeId": ...}` reported success while assigning
+// nothing. `.strict()` turns that silent no-op into a 400 that names the
+// unknown field. Strictness is applied here, at the route, rather than on the
+// shared `updateIssueSchema`, so the create route and the other consumers of
+// that schema keep their existing lenient shape and this stays a scoped fix.
+// KEE-1038: an earlier revision of this comment claimed `.strict()` had to be
+// the last call in the chain. That is false in Zod 4.4.3 — `.strict().extend()`
+// and `.extend().strict()` behave identically — so the claim is gone. The test
+// "still recognises the route-only `interrupt` field" still guards that
+// `interrupt` is a known key; it just no longer rests on an ordering rule.
+const updateIssueRouteSchema = updateIssueSchema
+  .extend({
+    interrupt: z.boolean().optional(),
+  })
+  .strict();
 const queuedCommentMutationTargetSchema = z.object({
   queueId: z.string().min(1),
   revision: z.string().min(1),
