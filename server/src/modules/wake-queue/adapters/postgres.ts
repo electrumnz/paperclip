@@ -4,8 +4,9 @@ import { currentConversationCommentCondition } from "../../../services/agent-con
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { extractIssueReferenceIdentifiers } from "@paperclipai/shared";
+import { extractIssueReferenceIdentifiers, type IssueUnblockDescriptor } from "@paperclipai/shared";
 import {
+  activityLog,
   agentWakeupRequests,
   agents,
   chatActions,
@@ -27,6 +28,7 @@ import { HttpError } from "../../../errors.js";
 import { evaluateAgentInvokabilityFromDb } from "../../../services/agent-invokability.js";
 import { issueTreeControlService, isVerifiedIssueTreeControlInteractionWake } from "../../../services/issue-tree-control.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "../../../services/recovery/pause-hold-guard.js";
+import { boardDescriptorForBlock } from "../../../services/recovery/blocked-descriptor.js";
 import { classifyContinuationFailure } from "../../../services/recovery/service.js";
 import { issueService } from "../../../services/issues.js";
 import { issueRecoveryActionService } from "../../../services/issue-recovery-actions.js";
@@ -720,7 +722,11 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
   if (!applies || isAcknowledgedNativeStop(run)) return false;
 
   const existing = await tx
-    .select({ id: issueRecoveryActions.id })
+    .select({
+      id: issueRecoveryActions.id,
+      evidence: issueRecoveryActions.evidence,
+      nextAction: issueRecoveryActions.nextAction,
+    })
     .from(issueRecoveryActions)
     .where(
       and(
@@ -733,7 +739,56 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
       ),
     )
     .limit(1);
+  let nativeFailureBlock: { runId: string; statusVersion: number } | undefined;
+  if (issue.status !== "blocked") {
+    // Reuse a valid existing recovery action when one already names the next
+    // step. The native terminal check still owns this blocked projection.
+    //
+    // Only reuse an action that belongs to *this* run. The query above also
+    // admits any other active action on the issue, and putting that action's
+    // next step on this card would send the board to a different failure.
+    // Recovery evidence records the run in a few places depending on the
+    // writer, so accept any of them rather than trusting one shape.
+    const evidence = existing[0]?.evidence as
+      | { runId?: string; automaticRecovery?: { runId?: string } }
+      | undefined;
+    const ownerRunId = evidence?.automaticRecovery?.runId ?? evidence?.runId;
+    const runScopedAction = ownerRunId === run.id ? existing[0] : undefined;
+    const unblockAction = runScopedAction?.nextAction?.trim() ||
+      "Inspect the original failure and reconcile the previous execution before continuing. Automatic recovery cannot start another incident.";
+    const unblockDescriptor = boardDescriptorForBlock({
+      existing: issue.unblockDescriptor,
+      action: unblockAction,
+    });
+    const projected = await issueService(tx).update(
+      issue.id,
+      {
+        status: "blocked",
+        ...(unblockDescriptor ? { unblockDescriptor } : {}),
+      },
+      tx,
+    );
+    if (projected) {
+      nativeFailureBlock = { runId: run.id, statusVersion: projected.statusVersion };
+      await tx.insert(activityLog).values({
+        companyId: issue.companyId, actorType: "system", actorId: "execution-recovery",
+        action: "issue.updated", entityType: "issue", entityId: issue.id, runId: run.id,
+        details: { status: "blocked", previousStatus: issue.status, reason: "native_continuation_requires_reconciliation" },
+      });
+    }
+  }
+  // Status projection is required even when restart/finalization created the
+  // incident first. Preserve its owner, cause, retry budget, and prior evidence.
+  if (nativeFailureBlock) {
+    for (const action of existing) {
+      await tx.update(issueRecoveryActions).set({
+        evidence: { ...action.evidence, nativeFailureBlock }, updatedAt: now,
+      }).where(and(eq(issueRecoveryActions.id, action.id), eq(issueRecoveryActions.companyId, issue.companyId)));
+    }
+  }
   if (!existing.length) {
+    const unblockAction =
+      "Inspect the original failure and reconcile the previous execution before continuing. Automatic recovery cannot start another incident.";
     await tx
       .update(nativeRunFinalizations)
       .set({
@@ -760,9 +815,8 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
       returnOwnerAgentId: run.agentId,
       cause: "native_continuation_requires_reconciliation",
       fingerprint: `native-continuation:${run.id}`,
-      evidence: { runId: run.id, originalFailureCode: run.errorCode },
-      nextAction:
-        "Inspect the original failure and reconcile the previous execution before continuing. Automatic recovery cannot start another incident.",
+      evidence: { runId: run.id, originalFailureCode: run.errorCode, ...(nativeFailureBlock ? { nativeFailureBlock } : {}) },
+      nextAction: unblockAction,
       maxAttempts: 3,
       wakePolicy: null,
       supersedeOnIdentityChange: true,

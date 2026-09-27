@@ -148,7 +148,12 @@ const state = vi.hoisted(() => ({
     },
   })),
   publishActivity: vi.fn(),
-  upsertRecoveryAction: vi.fn(async () => ({})),
+  upsertRecoveryAction: vi.fn(
+    async (_input: {
+      nextAction: string;
+      [key: string]: unknown;
+    }) => ({}),
+  ),
   stageNativeRunnerWakeAttachments: vi.fn(
     async (): Promise<{
       attachments: Array<Record<string, unknown>>;
@@ -6172,7 +6177,8 @@ describe("native session bounded recovery", () => {
             ),
           },
         });
-        expect(state.upsertRecoveryAction).toHaveBeenCalledWith(
+        const recoveryAction = state.upsertRecoveryAction.mock.calls.at(-1)?.[0];
+        expect(recoveryAction).toEqual(
           expect.objectContaining({
             cause: "native_event_replay_conflict",
             ownerType: "board",
@@ -6181,7 +6187,13 @@ describe("native session bounded recovery", () => {
         );
         expect(updateIssue).toHaveBeenCalledWith(
           execution.binding.issueId,
-          { status: "blocked" },
+          {
+            status: "blocked",
+            unblockDescriptor: {
+              owner: "board",
+              action: recoveryAction?.nextAction,
+            },
+          },
           expect.anything(),
         );
       } finally {
@@ -6264,7 +6276,8 @@ describe("native session bounded recovery", () => {
           ),
         },
       });
-      expect(state.upsertRecoveryAction).toHaveBeenCalledWith(
+      const recoveryAction = state.upsertRecoveryAction.mock.calls.at(-1)?.[0];
+      expect(recoveryAction).toEqual(
         expect.objectContaining({
           cause: "native_session_cleanup_quarantined",
           evidence: expect.objectContaining({ nativeFailureBlock: { runId: execution.binding.runId, statusVersion: 7 } }),
@@ -6277,7 +6290,13 @@ describe("native session bounded recovery", () => {
       );
       expect(updateIssue).toHaveBeenCalledWith(
         execution.binding.issueId,
-        { status: "blocked" },
+        {
+          status: "blocked",
+          unblockDescriptor: {
+            owner: "board",
+            action: recoveryAction?.nextAction,
+          },
+        },
         expect.anything(),
       );
     } finally {

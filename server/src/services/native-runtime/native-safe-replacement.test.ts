@@ -186,7 +186,18 @@ const support = externalDatabaseUrl
       await Promise.all([settleUnrecoverableExecutions(db), settleUnrecoverableExecutions(db)]);
       await settleUnrecoverableExecutions(db);
       const [task] = await db.select().from(issues).where(eq(issues.id, source.issueId));
-      expect(task).toMatchObject({ status: "blocked", assigneeAgentId: source.agentId, executionRunId: null, checkoutRunId: null });
+      expect(task).toMatchObject({
+        status: "blocked",
+        assigneeAgentId: source.agentId,
+        executionRunId: null,
+        checkoutRunId: null,
+        unblockDescriptor: {
+          owner: "board",
+          action:
+            "Inspect the original failure and choose a recovery action; three execution attempts have been used.",
+        },
+        blockedTransitionAt: expect.any(Date),
+      });
       const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, source.issueId));
       expect(actions).toHaveLength(1);
       expect(actions[0]).toMatchObject({ status: "resolved", outcome: "blocked", evidence: {

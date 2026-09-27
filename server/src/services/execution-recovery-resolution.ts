@@ -18,8 +18,10 @@ import { buildExecutionContinuation } from "./execution-continuation.js";
 import {
   EXECUTION_RECONCILIATION_CAUSES,
   type ExecutionReconciliation,
+  type IssueUnblockDescriptor,
 } from "@paperclipai/shared";
 import { parseIssueExecutionState } from "./issue-execution-policy.js";
+import { boardDescriptorForBlock, repairedBlockedTransitionAt } from "./recovery/blocked-descriptor.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
@@ -475,10 +477,43 @@ export async function settleUnrecoverableExecutions(
           : "Recovery closed because the task's owner, execution, or status changed. No work was replayed.";
         let nativeFailureBlock = action.evidence.nativeFailureBlock;
         if (current) {
+          // Preserve the action that created a durable block. The recovery
+          // action is the best source of the concrete next step when the task
+          // has no descriptor yet. Replacing it with a generic disposition note
+          // would send board operators to the wrong next step.
+          //
+          // If the task is already blocked with a valid descriptor, that block
+          // belongs to someone else. Downgrading it to a board-owned descriptor
+          // would sever the existing path to an agent- or user-owned unblock
+          // owner, because `deliverAgentUnblockNotification` only wakes
+          // agent-owned descriptors. Leave the existing descriptor untouched.
+          const unblockAction = task.unblockDescriptor?.action?.trim() || action.nextAction || note;
+          const unblockDescriptor = boardDescriptorForBlock({
+            existing: task.unblockDescriptor,
+            action: unblockAction,
+          });
+          // This is a raw `tx.update(issues)`, so it bypasses the stamp and clear
+          // logic in `issuesSvc.update`. A card that is already `blocked` with a
+          // null or pre-rollout `blockedTransitionAt` - exactly what the
+          // pre-KEE-250 recovery path produced - would keep that value, and
+          // `isProspectiveBlockedTransition` would then return false, leaving a
+          // card that is `blocked` with a descriptor but still invisible to
+          // board attention. That is the original defect of this issue, so the
+          // timestamp is repaired here too.
+          const repairedTransitionAt = repairedBlockedTransitionAt({
+            status: task.status,
+            blockedTransitionAt: task.blockedTransitionAt,
+            now,
+          });
           const [projected] = await tx
             .update(issues)
             .set({
               status: "blocked",
+              ...(unblockDescriptor ? { unblockDescriptor } : {}),
+              blockedTransitionAt:
+                task.status === "blocked"
+                  ? (repairedTransitionAt ?? task.blockedTransitionAt)
+                  : now,
               executionRunId: null,
               checkoutRunId: null,
               updatedAt: now,
