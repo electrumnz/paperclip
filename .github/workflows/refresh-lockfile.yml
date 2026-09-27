@@ -58,31 +58,54 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO_OWNER: ${{ github.repository_owner }}
         run: |
+          # This step must never fail the job. It is scheduled on every merge to
+          # master, and a red run here looks like a broken refresh loop rather
+          # than the refusal it actually is.
+          #
+          # The step declares no `shell:`, so Actions runs `bash -e`, where any
+          # command that exits non-zero kills the step immediately. That applies
+          # to a bare assignment whose command substitution fails, which is how
+          # both `gh pr list` and the ownership script are called. `set -e` is
+          # therefore disabled for the whole step and each fallible call is
+          # checked explicitly. Every command below is accounted for:
+          #   - the branch name: a missing script is a real setup error
+          #   - `gh pr list`: a rate limit or 5xx must not red the job
+          #   - the ownership script: exit 2 (unreadable) and 3 (conflict)
+          #   - `jq`: a missing jq must not red the job
+          #   - `git ls-remote`: a failed lookup must not red the job
+          set +e
+
           # The branch name is a shared, unguarded string: a human can open a PR
           # on it, and the manual lockfile exemption uses the plain name. Decide
           # ownership before touching the ref, so a collision stops the run here
           # instead of destroying someone else's commits further down.
           BRANCH="$(node .github/scripts/refresh-lockfile-branch.mjs --print-branch)"
+          if [ -z "$BRANCH" ]; then
+            echo "::error title=Lockfile refresh::Could not resolve the refresh branch name. Nothing was pushed."
+            echo "branch=" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
 
           # A PR opened by a fork cannot collide with a push to this repository.
+          # If this call fails there is no way to know who owns the branch, so
+          # fail closed: claim nothing and let the next run retry.
           prs="$(
             gh pr list --state open --head "$BRANCH" --json url,headRefName,author,headRepositoryOwner
           )"
+          list_rc=$?
+          if [ "$list_rc" -ne 0 ]; then
+            echo "::warning title=Lockfile refresh::Could not list pull requests for $BRANCH. Nothing was pushed. The next run will retry."
+            echo "branch=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           # Exits 3 when a pull request on this branch belongs to someone else,
           # and 2 when the pull request list could not be read at all. Both fail
           # closed: `branch` is never emitted, so the step below is skipped and
           # no push, adoption, or delete can happen. The reason differs, so the
           # two exit codes are reported separately instead of as one notice.
-          #
-          # `set +e` is required, not optional. This step declares no `shell:`,
-          # so Actions runs `bash -e`, where a bare assignment whose command
-          # substitution fails kills the step before anything below can read
-          # the status. Without this, a human pull request on the branch turns
-          # the scheduled master job red instead of emitting a green notice.
-          set +e
           plan="$(printf '%s' "$prs" | node .github/scripts/refresh-lockfile-branch.mjs)"
           claim_rc=$?
-          set -e
           if [ "$claim_rc" -ne 0 ]; then
             if [ "$claim_rc" -eq 3 ]; then
               echo "::notice title=Lockfile refresh::Branch $BRANCH has a non-bot pull request. Nothing was pushed."
@@ -100,7 +123,8 @@ jobs:
           # with no pull request open is invisible to the list above) makes the
           # push fail instead of overwriting it. Empty means the branch does not
           # exist yet, which leases the push to its creation.
-          echo "expected=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)" >> "$GITHUB_OUTPUT"
+          expected="$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)"
+          echo "expected=$expected" >> "$GITHUB_OUTPUT"
 
       - name: Create or update pull request
         id: upsert-pr

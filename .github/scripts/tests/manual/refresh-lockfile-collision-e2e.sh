@@ -249,6 +249,34 @@ check "an unreadable list is reported as a warning, not a false conflict" \
 check "an unreadable list does not claim a non-bot pull request exists" \
   "$(grep -c 'has a non-bot pull request' "$D/log" | tr -d ' ')" "0"
 
+echo "Case 7: gh pr list failing outright (rate limit, 502) fails closed, not red"
+D="$WORK/case7"; mkdir -p "$D"; make_remote "$D"
+# The likelier real failure: gh itself exits non-zero rather than returning junk.
+# This is the one that used to kill the step under `bash -e` and red the
+# scheduled master job, because `prs="$( gh pr list ... )"` sat above `set +e`.
+mkdir -p "$D/bin"
+cat > "$D/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+echo "gh: API rate limit exceeded" >&2
+exit 1
+EOF
+chmod +x "$D/bin/gh"
+export PATH="$D/bin:$PATH"
+
+(cd "$D/work" && GITHUB_OUTPUT="$D/out" REPO_OWNER="$OWNER" \
+  bash -euo pipefail "$WORK/claim.sh" < /dev/null >"$D/log" 2>"$D/err") >/dev/null
+rc=$?
+check "a failing gh exits 0, so the scheduled job stays green" "$rc" "0"
+check "a failing gh writes GITHUB_OUTPUT" "$([ -f "$D/out" ] && echo yes || echo no)" "yes"
+check "a failing gh claims no branch" \
+  "$(grep '^branch=' "$D/out" 2>/dev/null | cut -d= -f2- || true)" ""
+check "a failing gh is reported as a retryable warning" \
+  "$(grep -c '^::warning' "$D/log" | tr -d ' ')" "1"
+check "a failing gh does not claim a non-bot pull request exists" \
+  "$(grep -c 'has a non-bot pull request' "$D/log" | tr -d ' ')" "0"
+check "a failing gh creates no pull request" \
+  "$(grep -c 'pr create' "$D/err" | tr -d ' ')" "0"
+
 echo
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]
