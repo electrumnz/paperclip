@@ -1,6 +1,8 @@
 import { dismissAutomaticCompletionReviews, decisionHasRetiredAutomaticReview } from "./automatic-completion-reviews.js";
 import { logger } from "../../middleware/logger.js";
 import { createHash, randomUUID } from "node:crypto";
+import type { IssueUnblockDescriptor } from "@paperclipai/shared";
+import { boardDescriptorForBlock } from "../recovery/blocked-descriptor.js";
 import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, lte, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -467,9 +469,25 @@ export async function claimNativeSessionResumptions(input: {
         // both "running" and "failed") must not send a second Sentry event.
         terminalRunToEmit =
           updatedRun && updatedRun.status !== row.run.status ? updatedRun : null;
+        const unblockAction =
+          "Inspect the original provider failure and explicitly resolve recovery; do not open a duplicate provider session.";
+        // If the card is already blocked with a valid descriptor, that block is
+        // owned by someone else. Do not displace it with a board-owned
+        // descriptor, or the agent- or user-owned unblock path is lost.
+        const [blockedCard] = await tx
+          .select({ unblockDescriptor: issues.unblockDescriptor })
+          .from(issues)
+          .where(eq(issues.id, row.coordinator.issueId));
+        const unblockDescriptor = boardDescriptorForBlock({
+          existing: blockedCard?.unblockDescriptor,
+          action: unblockAction,
+        });
         await issueService(tx as unknown as Db).update(
           row.coordinator.issueId,
-          { status: "blocked" },
+          {
+            status: "blocked",
+            ...(unblockDescriptor ? { unblockDescriptor } : {}),
+          },
           tx,
         );
         await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
@@ -488,7 +506,7 @@ export async function claimNativeSessionResumptions(input: {
             providerEventsExist: providerEvent !== null,
             originalFailureCode,
           },
-          nextAction: "Inspect the original provider failure and explicitly resolve recovery; do not open a duplicate provider session.",
+          nextAction: unblockAction,
           wakePolicy: null,
           maxAttempts: 3,
           supersedeOnIdentityChange: true,

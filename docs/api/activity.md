@@ -18,6 +18,12 @@ Query parameters:
 | `agentId` | Filter by actor agent |
 | `entityType` | Filter by entity type (`issue`, `agent`, `approval`) |
 | `entityId` | Filter by specific entity |
+| `limit` | Page size, default 100, capped at 500 |
+| `before` | Opaque cursor from a prior response's `X-Next-Cursor` header; returns rows strictly older than it |
+
+Responses are capped at `limit` rows ordered newest first. When more rows exist, the response carries an
+`X-Next-Cursor` header — pass its value back as `before` to fetch the next (older) page. A response with
+no `X-Next-Cursor` header is the last page.
 
 ## Activity Record
 
