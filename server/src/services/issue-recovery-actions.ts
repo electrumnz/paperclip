@@ -30,6 +30,21 @@ function isRecoveryBudgetExhausted(evidence: Record<string, unknown>) {
   );
 }
 
+/**
+ * No expiry path in this codebase compares `issue_recovery_actions.timeout_at`.
+ * A deadline written without a live consumer is the same deadlock with a date
+ * printed on it, so refuse the write instead of persisting an unconsumable one.
+ */
+function assertTimeoutHasSettler(input: UpsertIssueRecoveryActionInput) {
+  if (input.timeoutAt && !input.timeoutSettler) {
+    throw new Error(
+      `Recovery action ${input.kind} (${input.cause}) sets timeoutAt without a timeoutSettler. ` +
+        "Nothing reads issue_recovery_actions.timeout_at, so the action would never expire. " +
+        "Name the live consumer that settles this action, or drop the deadline.",
+    );
+  }
+}
+
 export type UpsertIssueRecoveryActionInput = {
   companyId: string;
   sourceIssueId: string;
@@ -50,6 +65,18 @@ export type UpsertIssueRecoveryActionInput = {
   monitorPolicy?: Record<string, unknown> | null;
   maxAttempts?: number | null;
   timeoutAt?: Date | null;
+  /**
+   * Names the live consumer that will actually move this action when
+   * `timeoutAt` passes. A `timeoutAt` with no settler is a printed date on a
+   * deadlock: nothing in the expiry paths compares this column, so the action
+   * would stay `active` forever. Requiring a settler by name makes the missing
+   * consumer fail at authoring time instead of in production.
+   */
+  timeoutSettler?: string | null;
+  // Keep the deadline already recorded on the active action instead of
+  // replacing it. A deadline that slides forward on every write is a deadline
+  // that never expires.
+  preserveExistingTimeout?: boolean;
   lastAttemptAt?: Date | null;
   attemptCount?: number;
   // When true, a change of (cause, fingerprint) does not overwrite the active
@@ -286,6 +313,7 @@ export function issueRecoveryActionService(db: Db) {
     input: UpsertIssueRecoveryActionInput,
     retryCount = 0,
   ): Promise<IssueRecoveryAction> {
+    assertTimeoutHasSettler(input);
     const existing = await getActiveForIssue(input.companyId, input.sourceIssueId);
     const now = new Date();
     const ownerType = input.ownerType ?? (input.ownerAgentId ? "agent" : "board");
@@ -418,7 +446,7 @@ export function issueRecoveryActionService(db: Db) {
             : input.maxAttempts === undefined
               ? existing.maxAttempts
               : input.maxAttempts,
-          timeoutAt: input.preserveExistingOwner
+          timeoutAt: input.preserveExistingOwner || input.preserveExistingTimeout
             ? asDatabaseDate(existing.timeoutAt)
             : input.timeoutAt ?? null,
           lastAttemptAt: input.preserveExistingOwner

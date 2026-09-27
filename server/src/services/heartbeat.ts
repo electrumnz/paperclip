@@ -19722,6 +19722,19 @@ export function heartbeatService(
     return recovery.reconcileResolvedDependencyWakeBackstop(opts);
   }
 
+  /**
+   * Settle recovery actions whose reconciliation deadline has passed. Wired to
+   * the periodic scheduler so a `timeout_at` written on a recovery action has a
+   * live consumer; without this the column is never read and the action stays
+   * `active` indefinitely.
+   */
+  async function settleExpiredRecoveryActionDeadlines(opts?: {
+    companyId?: string | null;
+    now?: Date;
+  }) {
+    return recovery.settleExpiredRecoveryActionDeadlines(opts);
+  }
+
   async function updateRuntimeState(
     agent: typeof agents.$inferSelect,
     run: typeof heartbeatRuns.$inferSelect,
@@ -29610,6 +29623,8 @@ export function heartbeatService(
     sweepStaleIssueLocks,
 
     reconcileResolvedDependencyWakes,
+
+    settleExpiredRecoveryActionDeadlines,
 
     scanSilentActiveRuns,
 

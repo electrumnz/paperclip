@@ -2750,4 +2750,193 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
   });
+
+  /**
+   * The gate must not over-reach. A board session is the board, so a genuine
+   * durable change from the board still settles the record exactly as before.
+   * A gate that refused everyone would be a different outage, and this is what
+   * distinguishes a real gate from a blanket block.
+   */
+  it("still lets the board settle a board-owned action on a durable change", async () => {
+    const { companyId, managerId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "active_run_watchdog",
+      ownerType: "board",
+      cause: "legacy_execution_requires_reconciliation",
+      fingerprint: "board-watchdog:board-settle",
+      evidence: { runId: "run-1" },
+      nextAction: "Reconcile the stopped run.",
+    });
+    // Default actor is a board session.
+    const app = createApp();
+
+    // A real durable change through the API: reassigning the card away from
+    // its agent is a property-of-the-work change, and the agent-assigned
+    // branch of classification applies.
+    await request(app)
+      .patch(`/api/issues/${sourceIssueId}`)
+      .send({ assigneeAgentId: managerId })
+      .expect(200);
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "cancelled",
+      outcome: "cancelled",
+      resolutionNote: "Recovery action became stale because the source issue is in_progress with an agent owner.",
+    });
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    expect(
+      activityRows.find((row) => row.action === "issue.recovery_action_resolved"),
+    ).toBeDefined();
+  });
+
+  /**
+   * The load-bearing test for the ownership gate, and the one the first draft
+   * of this suite was missing.
+   *
+   * Both fixes below independently stop the KEE-1044 cancellation:
+   *   - dropping `resumeRequested` from `durableSourceChange`, and
+   *   - gating the disposition on ownership.
+   * A `resume: true` comment therefore passes under either mutation, which is
+   * why that test proved nothing on its own. This one uses a *document* write:
+   * a genuine durable change that never sets `resumeRequested`, so it clears
+   * `durableSourceChange` on its own. Only the ownership gate stands between
+   * the agent and the disposition, so removing the gate must turn this red.
+   */
+  it("does not let a non-owning agent resolve a board-owned action on a real durable change", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "active_run_watchdog",
+      ownerType: "board",
+      cause: "legacy_execution_requires_reconciliation",
+      fingerprint: "board-watchdog:document-write",
+      evidence: { runId: "run-1" },
+      nextAction: "Reconcile the stopped run.",
+    });
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId });
+    const app = createApp({
+      type: "agent",
+      agentId: coderId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+
+    // A genuine durable change. `documentChanged: true` reaches
+    // revalidation on its own, with no `resumeRequested` involved.
+    // 201 on first write, 200 on update; either is fine here.
+    const docRes = await request(app)
+      .put(`/api/issues/${sourceIssueId}/documents/notes`)
+      .send({ body: "Some durable notes.", title: "Notes", format: "markdown" });
+    expect([200, 201]).toContain(docRes.status);
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    // The board still owns this. An agent writing a document does not get to
+    // decide that a reconciliation hold has gone stale.
+    expect(actionRow).toMatchObject({
+      status: "active",
+      outcome: null,
+      resolvedAt: null,
+    });
+
+    // And the refusal is recorded, not silent.
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    const declined = activityRows.find(
+      (row) => row.action === "issue.recovery_action_revalidation_declined",
+    );
+    expect(declined?.details).toMatchObject({
+      recoveryActionId: action.id,
+      recoveryActionOwnerType: "board",
+      reason: "actor is not the owner of this recovery action",
+    });
+  });
+
+  /**
+   * The load-bearing test for the classification fix, and the other one the
+   * first draft was missing.
+   *
+   * The ownership gate would also block this, so on its own it proves nothing.
+   * What it isolates is whether the disposition is *reached* at all: a bare
+   * `resume: true` comment carries no durable property change, so with
+   * `resumeRequested` counted in `durableSourceChange` the request arrives at
+   * the disposition and is refused there by the gate, filing a declined record.
+   * With the classification fix the request returns before any ownership
+   * question is asked, and nothing is filed.
+   *
+   * So the assertion is on the *absence* of any recovery-action activity row.
+   * Restoring `resumeRequested` to `durableSourceChange` must turn this red.
+   */
+  it("does not treat a bare resume comment as a durable source change", async () => {
+    const { companyId, coderId, sourceIssueId } = await seedCompany();
+    const recoveryActionSvc = issueRecoveryActionService(db);
+    const action = await recoveryActionSvc.upsertSourceScoped({
+      companyId,
+      sourceIssueId,
+      kind: "active_run_watchdog",
+      ownerType: "board",
+      cause: "legacy_execution_requires_reconciliation",
+      fingerprint: "board-watchdog:classification-only",
+      evidence: { runId: "run-1" },
+      nextAction: "Reconcile the stopped run.",
+    });
+    const runId = randomUUID();
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId, issueId: sourceIssueId });
+    const app = createApp({
+      type: "agent",
+      agentId: coderId,
+      companyId,
+      runId,
+      source: "agent_jwt",
+    });
+
+    await request(app)
+      .post(`/api/issues/${sourceIssueId}/comments`)
+      .send({ body: "Just noting this.", resume: true })
+      .expect(201);
+
+    const [actionRow] = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(eq(issueRecoveryActions.id, action.id));
+    expect(actionRow).toMatchObject({
+      status: "active",
+      outcome: null,
+      resolvedAt: null,
+    });
+
+    // The disposition was never reached, so nothing was decided and nothing
+    // was filed. With `resumeRequested` counted as durable, this request would
+    // instead arrive at the disposition and file a declined-refusal record,
+    // which is the behaviour this asserts against.
+    const activityRows = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.entityId, sourceIssueId));
+    expect(
+      activityRows.some(
+        (row) =>
+          row.action === "issue.recovery_action_resolved" ||
+          row.action === "issue.recovery_action_revalidation_declined",
+      ),
+    ).toBe(false);
+  });
 });

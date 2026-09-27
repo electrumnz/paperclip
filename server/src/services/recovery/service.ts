@@ -17,6 +17,7 @@ import {
   gte,
   inArray,
   isNull,
+  lte,
   not,
   notInArray,
   or,
@@ -35,6 +36,7 @@ import {
   requiresExecutionReconciliation,
   type IssueCommentMetadata,
   type IssueCommentPresentation,
+  type IssueRecoveryActionStatus,
 } from "@paperclipai/shared";
 import {
   agents,
@@ -87,6 +89,7 @@ import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import {
   legacyExecutionNeedsReconciliation,
   terminalizeLegacyExecution,
+  LEGACY_WATCHDOG_TIMEOUT_SETTLER,
 } from "../legacy-execution-recovery.js";
 import { issueTreeControlService } from "../issue-tree-control.js";
 import { isExternalChatPresentationContext } from "../heartbeat-run-summary.js";
@@ -805,6 +808,12 @@ function agentUiLink(
 ) {
   if (!agent) return "unknown";
   return `[${agent.name ?? agent.id}](/${prefix}/agents/${agent.id})`;
+}
+
+/** The stopped run a watchdog points at, if its evidence still names one. */
+function runIdFromWatchdogEvidence(evidence: Record<string, unknown> | null) {
+  const runId = evidence?.runId;
+  return typeof runId === "string" && runId.length > 0 ? `\`${runId}\`` : "unknown";
 }
 
 function formatIssueLinksForComment(
@@ -2249,6 +2258,171 @@ export function recoveryService(
     criticalThresholdMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS,
     continueRearmMs: ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS,
   });
+
+  /**
+   * The live consumer of `issue_recovery_actions.timeout_at`.
+   *
+   * No other path compares that column, so without this sweep a deadline is
+   * decoration. This settles an expired board-owned watchdog to `escalated`
+   * and leaves an honest issue comment, which:
+   *
+   * - removes the silent "looks like a slow reviewer" shape (the KEE-1044 defect),
+   * - leaves the issue in a describable state instead of `in_progress` forever,
+   * - does NOT decide the reconciliation. Whether earlier external actions
+   *   landed is a board judgement; this only surfaces that the window closed.
+   *
+   * It settles to `escalated` rather than `resolved` on purpose. `escalated`
+   * keeps the action inside ACTIVE_RECOVERY_ACTION_STATUSES, so the board still
+   * owns it and can resolve it, while `attemptCount`/`timeoutAt` stop being
+   * rewritten. Resolving here would assert an outcome nobody recorded.
+   */
+  async function settleExpiredRecoveryActionDeadlines(opts?: {
+    now?: Date;
+    companyId?: string | null;
+  }) {
+    const now = opts?.now ?? new Date();
+    const result = { expired: 0, issueIds: [] as string[], actionIds: [] as string[] };
+
+    const expired = await db
+      .select()
+      .from(issueRecoveryActions)
+      .where(
+        and(
+          inArray(issueRecoveryActions.status, [
+            "active",
+            "escalated",
+          ] satisfies readonly IssueRecoveryActionStatus[]),
+          isNull(issueRecoveryActions.resolvedAt),
+          lte(issueRecoveryActions.timeoutAt, now),
+          // Only settle deadlines that a settler actually claims. A row with a
+          // bare timeout_at predates this contract and stays board-owned rather
+          // than being silently reinterpreted by a consumer it never named.
+          sql`${issueRecoveryActions.evidence} -> 'watchdogDeadline' ->> 'settler' = ${LEGACY_WATCHDOG_TIMEOUT_SETTLER}`,
+          opts?.companyId
+            ? eq(issueRecoveryActions.companyId, opts.companyId)
+            : undefined,
+        ),
+      )
+      .orderBy(asc(issueRecoveryActions.timeoutAt))
+      .limit(100);
+
+    for (const action of expired) {
+      // Claim the row before writing, so two concurrent sweeps cannot both
+      // comment on the same expiry. `deadlineSettledAt` is the claim token:
+      // it is null for every action this settler has not already handled.
+      const [claimed] = await db
+        .update(issueRecoveryActions)
+        .set({
+          status: "escalated",
+          ownerType: "board",
+          ownerAgentId: null,
+          ownerUserId: null,
+          nextAction:
+            "The reconciliation window for this stopped run has closed. Inspect the recorded run and its " +
+            "action outcomes, then explicitly resolve this recovery action. Paperclip did not infer whether " +
+            "earlier external actions landed.",
+          wakePolicy: null,
+          monitorPolicy: null,
+          evidence: {
+            ...(action.evidence ?? {}),
+            deadlineSettledAt: now.toISOString(),
+            deadlineOutcome: "escalated",
+            deadlineSettler: LEGACY_WATCHDOG_TIMEOUT_SETTLER,
+          },
+          resolutionNote: null,
+          updatedAt: now,
+        })
+        .where(
+          and(
+            eq(issueRecoveryActions.id, action.id),
+            inArray(issueRecoveryActions.status, [
+              "active",
+              "escalated",
+            ] satisfies readonly IssueRecoveryActionStatus[]),
+            isNull(issueRecoveryActions.resolvedAt),
+            // The claim token lives at the top level of evidence, where the
+            // update above writes it. Reading it from `watchdogDeadline` would
+            // never match and every sweep would re-comment on the same expiry.
+            sql`${issueRecoveryActions.evidence} ->> 'deadlineSettledAt' is null`,
+          ),
+        )
+        .returning({ id: issueRecoveryActions.id });
+      if (!claimed) continue;
+
+      result.expired += 1;
+      result.actionIds.push(claimed.id);
+      result.issueIds.push(action.sourceIssueId);
+
+      const [task] = await db
+        .select()
+        .from(issues)
+        .where(
+          and(
+            eq(issues.id, action.sourceIssueId),
+            eq(issues.companyId, action.companyId),
+          ),
+        );
+      if (!task) continue;
+      const prefix = await getCompanyIssuePrefix(action.companyId);
+      const overdueMinutes = Math.max(
+        1,
+        Math.round(
+          (now.getTime() - new Date(action.timeoutAt!).getTime()) / 60_000,
+        ),
+      );
+      await issuesSvc.addComment(
+        task.id,
+        [
+          "Paperclip escalated a recovery action whose reconciliation deadline passed.",
+          "",
+          `- Recovery action: \`${action.kind}\` (\`${action.cause}\`)`,
+          `- Stopped run: ${runIdFromWatchdogEvidence(action.evidence)}`,
+          `- Deadline: ${new Date(action.timeoutAt!).toISOString()} (${overdueMinutes}m ago)`,
+          "",
+          "This stopped execution was never reconciled. Paperclip has **not** decided whether the work the",
+          "run had already performed landed, because that judgement needs the run log and the recorded action",
+          "outcomes. The card stayed assigned and looked like slow review for that whole window, which is the",
+          "failure this deadline exists to end.",
+          "",
+          "Next action: the board owns this reconciliation. Inspect the stopped run, record the outcomes that",
+          "actually happened, then resolve this recovery action with a truthful note.",
+        ].join("\n"),
+        { runId: null },
+        { authorType: "system" },
+      );
+      await logActivity(db, {
+        companyId: action.companyId,
+        actorType: "system",
+        actorId: "system",
+        agentId: null,
+        runId: null,
+        action: "issue.recovery_deadline_escalated",
+        entityType: "issue",
+        entityId: task.id,
+        details: {
+          source: "recovery.settleExpiredRecoveryActionDeadlines",
+          recoveryActionId: action.id,
+          kind: action.kind,
+          cause: action.cause,
+          deadlineAt: new Date(action.timeoutAt!).toISOString(),
+          settler: LEGACY_WATCHDOG_TIMEOUT_SETTLER,
+        },
+      });
+    }
+
+    if (result.expired > 0) {
+      logger.warn(
+        {
+          expired: result.expired,
+          actionIds: result.actionIds,
+          issueIds: result.issueIds,
+        },
+        "settled recovery actions whose reconciliation deadline passed",
+      );
+    }
+
+    return result;
+  }
 
   async function buildRunOutputSilence(
     run: Pick<
@@ -6224,6 +6398,7 @@ export function recoveryService(
     reconcileLegacyContinuation,
     legacyRepairDispatchBlock,
     sweepStaleIssueLocks,
+    settleExpiredRecoveryActionDeadlines,
     reconcileResolvedDependencyWakeBackstop,
     readRecoveryTimerIntervalMs,
   };

@@ -4262,6 +4262,38 @@ export function issueRoutes(
     }
   }
 
+  /**
+   * Who may let an automatic `source_revalidation` resolve a recovery action.
+   *
+   * The disposition is filed as automatic staleness, so it must only fire when
+   * the actor is entitled to make it. A board-owned action belongs to the board:
+   * no agent owns it, so an agent's annotation must never clear it. This is the
+   * discipline `heartbeat.ts` already applies to execution reconciliation via
+   * `returnOwnerAgentId`, extended to cover the board as an owner.
+   *
+   * An absent actor is a system-initiated revalidation (periodic sweep, read
+   * projection), which keeps the existing automatic behaviour.
+   */
+  function actorMayResolveRecoveryAction(
+    action: {
+      ownerType: string;
+      ownerAgentId?: string | null;
+      returnOwnerAgentId?: string | null;
+    },
+    actor: ReturnType<typeof getActorInfo> | null | undefined,
+  ): boolean {
+    if (!actor) return true;
+    // A board session is the board: it may settle board-owned records.
+    if (actor.actorType !== "agent") return true;
+    const agentId = actor.agentId ?? actor.actorId;
+    if (action.ownerType === "board") return false;
+    if (action.ownerAgentId && action.ownerAgentId === agentId) return true;
+    // An action handed back to a specific agent is that agent's to settle.
+    if (action.returnOwnerAgentId && action.returnOwnerAgentId === agentId)
+      return true;
+    return false;
+  }
+
   async function classifySourceRecoveryRevalidation(input: {
     issue: IssueRouteSnapshot;
     trigger: RecoveryRevalidationTrigger;
@@ -4294,6 +4326,13 @@ export function issueRoutes(
       return null;
     }
 
+    // `resumeRequested` is deliberately NOT in this list. It is a comment
+    // re-scoping flag that reopens a closed card so a follow-up can be
+    // attached; it is not a property of the work changing. Counting it here
+    // meant any agent annotating any in-progress agent-owned card cancelled
+    // that card's active recovery action, including a board-owned one it did
+    // not own (the KEE-1044 incident). A comment that also changes a real
+    // durable property still revalidates through that property's own flag.
     const durableSourceChange =
       input.statusChanged === true ||
       input.assigneeChanged === true ||
@@ -4302,7 +4341,6 @@ export function issueRoutes(
       input.monitorChanged === true ||
       input.documentChanged === true ||
       input.workProductChanged === true ||
-      input.resumeRequested === true ||
       input.reopened === true;
     if (!durableSourceChange) return null;
 
@@ -4404,6 +4442,43 @@ export function issueRoutes(
 
     const resolutionNote = await classifySourceRecoveryRevalidation(input);
     if (!resolutionNote) return activeRecoveryAction;
+
+    // Authority, not staleness. An automatic `source_revalidation` disposition
+    // is a decision about someone else's recovery record, so the acting agent
+    // must own the action it is about to resolve. Without this gate any agent
+    // annotating any card with an active recovery action cancelled it, and the
+    // resulting activity row read as automatic staleness rather than as a
+    // decision by an agent that had disclaimed that authority.
+    //
+    // Precedent: heartbeat.ts refuses an execution reconciliation from anyone
+    // other than the action's `returnOwnerAgentId`.
+    //
+    // A board-owned action is the strictest case: nobody acting as an agent owns
+    // it, so no agent-triggered revalidation may cancel it. Surface the staleness
+    // as a notice and leave the disposition to the board.
+    if (!actorMayResolveRecoveryAction(activeRecoveryAction, input.actor)) {
+      await logActivity(db, {
+        companyId: input.issue.companyId,
+        actorType: input.actor?.actorType === "user" ? "user" : "agent",
+        actorId: input.actor?.actorId ?? "unknown",
+        agentId: input.actor?.agentId ?? null,
+        runId: input.actor?.runId ?? null,
+        action: "issue.recovery_action_revalidation_declined",
+        entityType: "issue",
+        entityId: input.issue.id,
+        details: {
+          identifier: input.issue.identifier,
+          recoveryActionId: activeRecoveryAction.id,
+          recoveryActionOwnerType: activeRecoveryAction.ownerType,
+          recoveryActionOwnerAgentId: activeRecoveryAction.ownerAgentId,
+          wouldHaveResolvedWith: resolutionNote,
+          source: "source_revalidation",
+          trigger: input.trigger,
+          reason: "actor is not the owner of this recovery action",
+        },
+      });
+      return activeRecoveryAction;
+    }
 
     const resolved = await recoveryActionsSvc.resolveActiveForIssue({
       companyId: input.issue.companyId,
