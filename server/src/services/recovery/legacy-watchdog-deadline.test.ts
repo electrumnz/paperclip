@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agents,
   companies,
@@ -91,6 +91,16 @@ const support = externalDatabaseUrl
       return run!;
     }
 
+    /**
+     * `recoveryService` requires a wakeup dependency. The settler never
+     * enqueues one (it settles, it does not reschedule), so a stub is enough —
+     * but the argument is required, and omitting it is a type error that only
+     * CI catches, because vitest transpiles without checking types.
+     */
+    function createSettler() {
+      return recoveryService(db, { enqueueWakeup: vi.fn() });
+    }
+
     async function readAction() {
       const [row] = await db
         .select()
@@ -177,14 +187,14 @@ const support = externalDatabaseUrl
       await terminalizeLegacyExecution({ db, run, status: "failed" });
 
       // Before the deadline the settler must not touch it.
-      const early = await recoveryService(db).settleExpiredRecoveryActionDeadlines({
+      const early = await createSettler().settleExpiredRecoveryActionDeadlines({
         now: new Date(Date.now() - 1_000),
       });
       expect(early.expired).toBe(0);
       expect((await readAction())!.status).toBe("active");
 
       const afterDeadline = new Date(Date.now() + LEGACY_WATCHDOG_DEADLINE_MS + 60_000);
-      const settled = await recoveryService(db).settleExpiredRecoveryActionDeadlines({
+      const settled = await createSettler().settleExpiredRecoveryActionDeadlines({
         now: afterDeadline,
       });
 
@@ -205,7 +215,7 @@ const support = externalDatabaseUrl
     it("leaves the issue honestly describable after expiry", async () => {
       const run = await seedTerminalLegacyRun();
       await terminalizeLegacyExecution({ db, run, status: "failed" });
-      await recoveryService(db).settleExpiredRecoveryActionDeadlines({
+      await createSettler().settleExpiredRecoveryActionDeadlines({
         now: new Date(Date.now() + LEGACY_WATCHDOG_DEADLINE_MS + 60_000),
       });
 
@@ -224,7 +234,7 @@ const support = externalDatabaseUrl
       const run = await seedTerminalLegacyRun();
       await terminalizeLegacyExecution({ db, run, status: "failed" });
       const past = new Date(Date.now() + LEGACY_WATCHDOG_DEADLINE_MS + 60_000);
-      const recovery = recoveryService(db);
+      const recovery = createSettler();
       await recovery.settleExpiredRecoveryActionDeadlines({ now: past });
       const second = await recovery.settleExpiredRecoveryActionDeadlines({ now: past });
 
@@ -257,7 +267,7 @@ const support = externalDatabaseUrl
         timeoutAt: new Date(Date.now() - 60_000),
       });
 
-      const settled = await recoveryService(db).settleExpiredRecoveryActionDeadlines({
+      const settled = await createSettler().settleExpiredRecoveryActionDeadlines({
         now: new Date(),
       });
       expect(settled.expired).toBe(0);
@@ -343,7 +353,7 @@ const support = externalDatabaseUrl
     it("does not settle before the deadline passes", async () => {
       const run = await seedTerminalLegacyRun();
       await terminalizeLegacyExecution({ db, run, status: "failed" });
-      const settled = await recoveryService(db).settleExpiredRecoveryActionDeadlines({
+      const settled = await createSettler().settleExpiredRecoveryActionDeadlines({
         now: new Date(),
       });
       expect(settled.expired).toBe(0);
