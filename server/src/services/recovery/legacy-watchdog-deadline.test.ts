@@ -359,5 +359,93 @@ const support = externalDatabaseUrl
       expect(settled.expired).toBe(0);
       expect((await readAction())!.status).toBe("active");
     });
+
+    /**
+     * Regression for the starvation defect found in independent review
+     * (KEE-1080): the settle page is `limit(100)`, and a settled row still
+     * satisfied every SELECT term — it is `escalated`, `resolved_at` is null,
+     * and `timeout_at` is left in the past. So the same oldest 100 rows refilled
+     * the window on every sweep and anything past row 100 never settled. The
+     * claim UPDATE already guarded on the token; the SELECT did not, so the
+     * guard was doing half the job.
+     *
+     * The single-row idempotency test above cannot catch this: with one row
+     * there is no truncation. Only a population larger than the page size
+     * distinguishes "guarded" from "paged".
+     */
+    it("settles past the 100-row page limit, not just the first hundred", async () => {
+      const run = await seedTerminalLegacyRun();
+      await terminalizeLegacyExecution({ db, run, status: "failed" });
+      const one = await readAction();
+
+      // Replicate the settled watchdog until the population exceeds one page.
+      //
+      // Each sibling gets its OWN deadline. `orderBy(asc(timeout_at))` is what
+      // makes the page window deterministic: with one shared deadline the
+      // ordering is a tie, and Postgres can return a different 100 rows on each
+      // scan as the heap moves, which quietly lets the starved rows through and
+      // hides the defect. Distinct, ascending deadlines reproduce the real
+      // ordering: the 100 oldest settle first, and the rest are unreachable.
+      const population = 120;
+      const baseDeadline = one!.timeoutAt!.getTime();
+      const siblingIssues = Array.from({ length: population - 1 }, () => randomUUID());
+      for (let i = 0; i < population - 1; i += 1) {
+        await db.insert(issues).values({
+          id: siblingIssues[i]!,
+          companyId: one!.companyId,
+          title: `Sibling watchdog ${i}`,
+          status: "in_progress",
+        });
+        await db.insert(issueRecoveryActions).values({
+          companyId: one!.companyId,
+          sourceIssueId: siblingIssues[i]!,
+          kind: one!.kind,
+          status: "active" as const,
+          ownerType: "board" as const,
+          cause: one!.cause,
+          fingerprint: randomUUID(),
+          nextAction: "n/a",
+          // Newer than the original by one minute each, so ordering is total.
+          timeoutAt: new Date(baseDeadline + (i + 1) * 60_000),
+          evidence: one!.evidence,
+        });
+      }
+
+      const recovery = createSettler();
+      // A single sweep is one page (`limit(100)`), by design: the periodic chain
+      // must do bounded work per tick. The contract is that repeated sweeps
+      // *drain* the backlog. With the claim token missing from the SELECT, the
+      // already-settled rows refill the window and every later sweep settles 0,
+      // so the 20 remain active forever. That permanent stall is the defect —
+      // not the page size.
+      //
+      // `past` must clear the newest sibling deadline, not just the original
+      // one, or the tail rows are not expired and "unreached" and "not yet due"
+      // are indistinguishable.
+      const past = new Date(baseDeadline + (population + 5) * 60_000);
+      let settled = 0;
+      const perSweep: number[] = [];
+      for (let sweep = 0; sweep < 5; sweep += 1) {
+        const result = await recovery.settleExpiredRecoveryActionDeadlines({ now: past });
+        perSweep.push(result.expired);
+        settled += result.expired;
+      }
+
+      expect(settled).toBe(population);
+      // The backlog must actually be drained, not merely partially claimed:
+      // once the page stops filling up, later sweeps find nothing to do.
+      expect(perSweep[perSweep.length - 1]).toBe(0);
+
+      const stillActive = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(
+          and(
+            eq(issueRecoveryActions.companyId, one!.companyId),
+            eq(issueRecoveryActions.status, "active"),
+          ),
+        );
+      expect(stillActive).toHaveLength(0);
+    }, 120_000);
   },
 );

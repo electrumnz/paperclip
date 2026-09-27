@@ -2298,6 +2298,14 @@ export function recoveryService(
           // bare timeout_at predates this contract and stays board-owned rather
           // than being silently reinterpreted by a consumer it never named.
           sql`${issueRecoveryActions.evidence} -> 'watchdogDeadline' ->> 'settler' = ${LEGACY_WATCHDOG_TIMEOUT_SETTLER}`,
+          // The read side needs the claim token as much as the write side does.
+          // A settled row keeps `status = escalated`, `resolved_at IS NULL` and a
+          // `timeout_at` still in the past (the settler never clears it), so
+          // without this term the same oldest 100 rows refill the window on every
+          // sweep and everything past row 100 starves forever. The guard on the
+          // claim UPDATE below is what makes a claim atomic; this term is what
+          // makes the page advance.
+          sql`${issueRecoveryActions.evidence} ->> 'deadlineSettledAt' is null`,
           opts?.companyId
             ? eq(issueRecoveryActions.companyId, opts.companyId)
             : undefined,
