@@ -4,6 +4,7 @@
 
 ### Patch Changes
 
+- Reserved frontier models for the senior leadership team. Catalog team installs now read each agent's org-chart depth and keep only the top two layers on the safe frontier adapter; everyone below installs on OpenCode against the OpenRouter DeepSeek Flash latest router. The built-in Summarizer moved to the OpenRouter Free Models Router, and the OpenCode adapter and Paperclip Runner OpenCode provider now default to DeepSeek Flash latest. The OpenRouter Pareto Router is offered in the model pickers but is never a default, because a bare model string lands on its high coding tier.
 - Bound full-tree workspace Git scans with process-wide concurrency, queue, timeout, cancellation, coalescing, and short-lived changed-file caching. Saturated or timed-out changed-file requests now return a retryable degraded response, and hidden file-browser panels no longer initiate scans.
 
 ## 0.3.1

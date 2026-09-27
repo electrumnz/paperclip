@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "packageName": "@paperclipai/teams-catalog",
   "packageVersion": "0.1.0",
-  "generatedAt": "2026-06-04T18:03:41.262Z",
+  "generatedAt": "2026-09-16T14:50:23.508Z",
   "teams": [
     {
       "id": "paperclipai:bundled:company-defaults:core-exec-team",
@@ -44,6 +44,11 @@
         "cto",
         "qa"
       ],
+      "agentOrgDepths": {
+        "ceo": 1,
+        "cto": 2,
+        "qa": 3
+      },
       "projectSlugs": [
         "first-project"
       ],
@@ -171,6 +176,9 @@
       "agentSlugs": [
         "ux-designer"
       ],
+      "agentOrgDepths": {
+        "ux-designer": 1
+      },
       "projectSlugs": [
         "product-design"
       ],
@@ -278,6 +286,11 @@
         "qa",
         "senior-coder"
       ],
+      "agentOrgDepths": {
+        "cto": 1,
+        "qa": 2,
+        "senior-coder": 2
+      },
       "projectSlugs": [
         "product-engineering"
       ],
@@ -411,6 +424,9 @@
       "agentSlugs": [
         "content-lead"
       ],
+      "agentOrgDepths": {
+        "content-lead": 1
+      },
       "projectSlugs": [
         "content-operations"
       ],

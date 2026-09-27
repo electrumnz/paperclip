@@ -7,6 +7,12 @@ import type {
 } from "./workflow-contracts.js";
 import { RUNNER_WORKFLOW_CATALOG } from "./workflow-catalog.js";
 
+// The runner package stays free of workspace dependencies, so the two
+// non-leadership lane models are repeated here rather than imported from
+// `@paperclipai/adapter-utils`. Keep them in step with `leadership-models.ts`.
+const OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL = "openrouter/~deepseek/deepseek-flash-latest";
+const OPENCODE_FREE_ROUTER_MODEL = "openrouter/openrouter/free";
+
 export const RUNNER_LIVE_CANDIDATE_SCHEMA =
   "paperclip.runner.live-eval-candidate.v1" as const;
 export const RUNNER_LIVE_SCHEDULE_SCHEMA =
@@ -134,11 +140,11 @@ export const RUNNER_LIVE_CANDIDATE_SLOTS: readonly RunnerLiveCandidateSlot[] =
       id: "opencode-inexpensive",
       candidates: [
         candidate({
-          id: "opencode-gpt-oss",
+          id: "opencode-deepseek-flash",
           slotId: "opencode-inexpensive",
           adapter: "opencode_server",
           provider: "opencode",
-          model: "openrouter/openai/gpt-oss-20b",
+          model: OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL,
           tier: "inexpensive",
           qualification: {
             requiredEnvironment: ["OPENROUTER_API_KEY"],
@@ -152,11 +158,11 @@ export const RUNNER_LIVE_CANDIDATE_SLOTS: readonly RunnerLiveCandidateSlot[] =
           },
         }),
         candidate({
-          id: "opencode-glm-flash",
+          id: "opencode-free-router",
           slotId: "opencode-inexpensive",
           adapter: "opencode_server",
           provider: "opencode",
-          model: "openrouter/z-ai/glm-4.5-air",
+          model: OPENCODE_FREE_ROUTER_MODEL,
           tier: "inexpensive",
           qualification: {
             requiredEnvironment: ["OPENROUTER_API_KEY"],

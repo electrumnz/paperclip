@@ -1,3 +1,9 @@
+import {
+  OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL,
+  OPENCODE_FREE_ROUTER_MODEL,
+  OPENCODE_PARETO_CODE_MODEL,
+} from "@paperclipai/adapter-utils";
+
 export const type = "opencode_local";
 export const label = "OpenCode";
 
@@ -42,7 +48,12 @@ export const SANDBOX_INSTALL_COMMAND =
   'fi; ' +
   'fi';
 
-export const DEFAULT_OPENCODE_LOCAL_MODEL = "openai/gpt-5.2-codex";
+/**
+ * OpenCode is the adapter the non-leadership lane runs on, because it is the
+ * only local adapter that routes through OpenRouter. Its default is the cheap
+ * lane; frontier models stay available in the picker for leadership agents.
+ */
+export const DEFAULT_OPENCODE_LOCAL_MODEL = OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL;
 
 export function isValidOpenCodeModelId(value: unknown): value is string {
   if (typeof value !== "string") return false;
@@ -52,7 +63,10 @@ export function isValidOpenCodeModelId(value: unknown): value is string {
 }
 
 export const models: Array<{ id: string; label: string }> = [
-  { id: DEFAULT_OPENCODE_LOCAL_MODEL, label: DEFAULT_OPENCODE_LOCAL_MODEL },
+  { id: DEFAULT_OPENCODE_LOCAL_MODEL, label: "OpenRouter · DeepSeek Flash (latest)" },
+  { id: OPENCODE_FREE_ROUTER_MODEL, label: "OpenRouter · Free Models Router" },
+  { id: OPENCODE_PARETO_CODE_MODEL, label: "OpenRouter · Pareto Router (coding, high tier)" },
+  { id: "openai/gpt-5.2-codex", label: "openai/gpt-5.2-codex" },
   { id: "openai/gpt-5.5", label: "openai/gpt-5.5" },
   { id: "openai/gpt-5.4", label: "openai/gpt-5.4" },
   { id: "openai/gpt-5.4-mini", label: "openai/gpt-5.4-mini" },
@@ -78,7 +92,7 @@ Don't use when:
 Core fields:
 - cwd (string, optional): default absolute working directory fallback for the agent process (created if missing when possible)
 - instructionsFilePath (string, optional): absolute path to a markdown instructions file prepended to the run prompt
-- model (string, required): OpenCode model id in provider/model format (for example anthropic/claude-sonnet-4-5)
+- model (string, required): OpenCode model id in provider/model format (for example anthropic/claude-sonnet-4-5). Defaults to openrouter/~deepseek/deepseek-flash-latest, the low-cost lane for agents below the top two org-chart layers. openrouter/openrouter/pareto-code is also offered, but Paperclip sends only a model string, so it lands on the Pareto Router's default high coding tier unless a lower min_coding_score is set under OpenRouter Settings > Plugins.
 - variant (string, optional): provider-specific reasoning/profile variant passed as --variant (for example minimal|low|medium|high|xhigh|max)
 - dangerouslySkipPermissions (boolean, optional): inject a runtime OpenCode config that allows \`external_directory\` access without interactive prompts; defaults to true for unattended Paperclip runs
 - promptTemplate (string, optional): run prompt template

@@ -98,6 +98,12 @@ export interface CatalogTeam {
   };
   rootAgentSlugs: string[];
   agentSlugs: string[];
+  /**
+   * 1-based org-chart depth per agent slug, measured from the team's own
+   * manager. Optional so a manifest published before depths existed still
+   * validates; the installer falls back to a flat team when it is absent.
+   */
+  agentOrgDepths?: Record<string, number | undefined>;
   projectSlugs: string[];
   requiredSkills: CatalogTeamSkillRequirement[];
   envInputs: CatalogTeamEnvInputSummary[];

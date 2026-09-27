@@ -54,7 +54,7 @@ const CHAT_HISTORY_KEY = "paperclip-runner.capability.chat.history.v1";
 const CHAT_HARNESS_KEY = "paperclip-runner.capability.chat.harness.v1";
 const MODEL_PRESETS = {
   codex: ["gpt-5.4-mini", "gpt-5.4"],
-  opencode: ["openrouter/deepseek/deepseek-v4-flash-0731"],
+  opencode: ["openrouter/~deepseek/deepseek-flash-latest", "openrouter/openrouter/free", "openrouter/openrouter/pareto-code", "openrouter/deepseek/deepseek-v4-flash-0731"],
   acpx: ["openrouter/deepseek/deepseek-v4-flash-0731", "claude-sonnet-5", "gpt-5.6-sol"],
 } as const;
 const ACPX_AGENT_MODELS = {

@@ -1,5 +1,6 @@
 import {
   isPaperclipRunnerProvider,
+  OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL,
   PAPERCLIP_RUNNER_PERMISSION_CAPABILITIES,
   resolvePaperclipRunnerPermissionMode,
   type PaperclipRunnerProvider,
@@ -11,7 +12,7 @@ import {
 
 export const QUALIFIED_OPENCODE_RUNNER_VERSION = "1.18.29" as const;
 export const DEFAULT_OPENCODE_RUNNER_MODEL =
-  "openrouter/deepseek/deepseek-v4-flash-0731" as const;
+  OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL;
 export const CLAUDE_MANAGED_BETA_VERSION = "managed-agents-2026-04-01" as const;
 
 export const QUALIFIED_ACPX_RUNNER_MODELS = {

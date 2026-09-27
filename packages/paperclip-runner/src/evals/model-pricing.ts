@@ -25,6 +25,11 @@ const RATES: Readonly<Record<string, TokenRatesUsdPerMillion>> = Object.freeze({
   "openrouter/google/gemini-3.8-flash": { input: 0.75, cachedInput: 0.075, output: 3.75 },
   "openrouter/z-ai/glm-5.3": { input: 1.4, cachedInput: 0.14, output: 4.4 },
   "openrouter/deepseek/deepseek-v4-flash-0731": { input: 0.14, cachedInput: 0.028, output: 0.28 },
+  // Non-leadership lane. DeepSeek Flash latest is a moving alias, so its rate is
+  // the current Flash list price; the provider-reported cost remains authoritative.
+  "openrouter/~deepseek/deepseek-flash-latest": { input: 0.14, cachedInput: 0.028, output: 0.28 },
+  // The Free Models Router only ever routes to free models.
+  "openrouter/openrouter/free": { input: 0, cachedInput: 0, output: 0 },
   "openrouter/openai/gpt-6-astra": { input: 10, cachedInput: 1, output: 50 },
 });
 

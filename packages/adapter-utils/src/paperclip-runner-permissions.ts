@@ -1,3 +1,5 @@
+import { OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL } from "./leadership-models.js";
+
 export type PaperclipRunnerProvider =
   "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
 
@@ -13,7 +15,7 @@ export const PAPERCLIP_RUNNER_IDLE_TIMEOUT_MAX_MS = 86_400_000;
 export const PAPERCLIP_RUNNER_DEFAULT_MODELS = {
   codex: "gpt-5.6-sol",
   acpx: "claude-sonnet-5",
-  opencode: "openrouter/deepseek/deepseek-v4-flash-0731",
+  opencode: OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL,
 } as const;
 
 export interface PaperclipRunnerPermissionOption<

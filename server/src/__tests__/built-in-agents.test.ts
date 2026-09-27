@@ -172,8 +172,8 @@ describeEmbeddedPostgres("built-in agents", () => {
     expect(definitions.map((definition) => definition.key).sort()).toEqual(["briefs", "learning", "reflection-coach", "summarizer"]);
     const summarizer = definitions.find((definition) => definition.key === "summarizer");
     expect(summarizer).toMatchObject({
-      defaultAdapterType: "claude_local",
-      defaultAdapterConfig: { model: "claude-haiku-4-5" },
+      defaultAdapterType: "opencode_local",
+      defaultAdapterConfig: { model: "openrouter/openrouter/free" },
     });
     expect(summarizer?.defaultRuntimeConfig).toBeUndefined();
     expect(() => validateBuiltInAgentDefinitions([
@@ -1198,8 +1198,8 @@ describeEmbeddedPostgres("built-in agents", () => {
       icon: "sparkles",
       role: "general",
       reportsTo: root.id,
-      adapterType: "claude_local",
-      adapterConfig: { model: "claude-haiku-4-5" },
+      adapterType: "opencode_local",
+      adapterConfig: { model: "openrouter/openrouter/free" },
       budgetMonthlyCents: 0,
     });
     expect(state.status).toBe("paused");

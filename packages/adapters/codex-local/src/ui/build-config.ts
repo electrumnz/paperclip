@@ -1,6 +1,7 @@
 import {
   buildAdapterEnvConfig,
   isPaperclipRunnerProvider,
+  OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL,
   normalizeLegacyRunnerProvider,
   resolvePaperclipRunnerModel,
   resolvePaperclipRunnerIdleTimeoutMs,
@@ -228,7 +229,7 @@ export function buildPaperclipRunnerConfig(v: CreateConfigValues): Record<string
       ? {
           model: schemaModel
             || configuredModel
-            || "openrouter/deepseek/deepseek-v4-flash-0731",
+            || OPENCODE_DEEPSEEK_FLASH_LATEST_MODEL,
         }
       : {}),
     ...(provider === "acpx"
