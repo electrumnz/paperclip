@@ -353,8 +353,11 @@ const MAX_ISSUE_COMMENT_LIMIT = 500;
 // unknown field. Strictness is applied here, at the route, rather than on the
 // shared `updateIssueSchema`, so the create route and the other consumers of
 // that schema keep their existing lenient shape and this stays a scoped fix.
-// `.strict()` is deliberately the last call in the chain: it has to sit after
-// `.partial()` and `.extend()` or the added fields would not be recognised.
+// KEE-1038: an earlier revision of this comment claimed `.strict()` had to be
+// the last call in the chain. That is false in Zod 4.4.3 — `.strict().extend()`
+// and `.extend().strict()` behave identically — so the claim is gone. The test
+// "still recognises the route-only `interrupt` field" still guards that
+// `interrupt` is a known key; it just no longer rests on an ordering rule.
 const updateIssueRouteSchema = updateIssueSchema
   .extend({
     interrupt: z.boolean().optional(),

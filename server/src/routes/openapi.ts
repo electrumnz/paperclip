@@ -3854,7 +3854,7 @@ registry.registerPath({
   tags: ["issues"],
   summary: "Update an issue",
   description:
-    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. The body is validated strictly: an unrecognised key is rejected with 400 and named in the error details rather than being silently ignored, so a misspelled field (for example assigneeId, which does not exist; use assigneeAgentId or assigneeUserId) cannot return a success that wrote nothing.",
+    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. The body is validated strictly: an unrecognised key is rejected with 400 and named in the error details rather than being silently ignored, so a misspelled field (for example assigneeId, which does not exist; use assigneeAgentId or assigneeUserId) cannot return a success that wrote no data.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(updateIssueSchema.partial().strict()),
