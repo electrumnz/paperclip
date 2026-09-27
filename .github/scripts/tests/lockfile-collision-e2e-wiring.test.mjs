@@ -35,15 +35,18 @@ test('the collision e2e is referenced by CI, so it cannot go dark again', () => 
 });
 
 test('a fork-local CI lane actually runs the e2e in this fork', () => {
-  // The fork's pr.yml pins `paperclipai/paperclip/.github/workflows/
-  // pr-trusted.yml@<sha>`, and GitHub resolves `uses: owner/repo/path@ref`
+  // The fork's pr.yml calls `uses: paperclipai/paperclip/.github/workflows/
+  // pr-trusted.yml@<ref>`, and GitHub resolves `uses: owner/repo/path@ref`
   // inside the *named* repository. A step added to the fork's own copy of
-  // pr-trusted.yml therefore never runs here. That is the same dead-coverage
-  // trap KEE-999 hit, so the e2e needs a lane the fork actually executes.
-  assert.match(
-    prYaml,
-    /uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@[0-9a-f]{7,40}/,
-    'the fork pins pr-trusted.yml to an upstream commit, so a fork-local lane is required',
+  // pr-trusted.yml therefore never runs here, whether the ref is a SHA or a
+  // branch name. That is the same dead-coverage trap KEE-999 hit, so the e2e
+  // needs a lane the fork actually executes.
+  const upstreamPin = prYaml.match(
+    /uses: paperclipai\/paperclip\/\.github\/workflows\/pr-trusted\.yml@(\S+)/,
+  );
+  assert.ok(
+    upstreamPin,
+    'pr.yml must still call pr-trusted.yml from upstream, so a fork-local lane is required',
   );
   assert.match(
     forkLane,
