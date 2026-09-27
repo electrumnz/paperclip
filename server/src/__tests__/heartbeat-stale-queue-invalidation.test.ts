@@ -89,6 +89,17 @@ async function waitForCondition(fn: () => Promise<boolean>, timeoutMs = 3_000) {
   return fn();
 }
 
+function errorHasPostgresCode(error: unknown, code: string): boolean {
+  let current: unknown = error;
+  for (let depth = 0; depth < 4; depth += 1) {
+    if (!current || typeof current !== "object") return false;
+    const record = current as { code?: unknown; cause?: unknown };
+    if (record.code === code) return true;
+    current = record.cause;
+  }
+  return false;
+}
+
 async function cleanupHeartbeatInvalidationFixture(db: ReturnType<typeof createDb>) {
   for (let attempt = 0; attempt < 10; attempt += 1) {
     try {
@@ -117,13 +128,19 @@ async function cleanupHeartbeatInvalidationFixture(db: ReturnType<typeof createD
       const isLateCommentRace =
         error instanceof Error &&
         error.message.includes("issue_comments_issue_id_issues_id_fk");
-      if (!isLateCommentRace || attempt === 9) {
+      // A heartbeat that is still finishing can hold row locks that TRUNCATE
+      // needs, so Postgres picks this connection as a deadlock victim (40P01)
+      // and the whole truncate rolls back. The victim's transaction is already
+      // gone, so a bounded retry is safe and makes teardown deterministic.
+      const isDeadlockVictim = errorHasPostgresCode(error, "40P01");
+      if ((!isLateCommentRace && !isDeadlockVictim) || attempt === 9) {
         throw error;
       }
 
       // Heartbeat completion can write issue-thread comments shortly after the
-      // run leaves queued/running. Retry the dependent deletes once those land.
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // run leaves queued/running, and can still be holding locks. Retry the
+      // dependent deletes once those land and the locks clear.
+      await new Promise((resolve) => setTimeout(resolve, 100 * (isDeadlockVictim ? attempt + 1 : 1)));
     }
   }
 }
