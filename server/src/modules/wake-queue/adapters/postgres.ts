@@ -1,10 +1,10 @@
-import { isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
+import { isAcknowledgedNativeReassignmentStop, isAcknowledgedNativeStop } from "../../../services/acknowledged-native-stop.js";
 import { instanceSettingsService } from "../../../services/instance-settings.js";
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { extractIssueReferenceIdentifiers, type IssueUnblockDescriptor } from "@paperclipai/shared";
+import { extractIssueReferenceIdentifiers } from "@paperclipai/shared";
 import {
   activityLog,
   agentWakeupRequests,
@@ -28,7 +28,6 @@ import { HttpError } from "../../../errors.js";
 import { evaluateAgentInvokabilityFromDb } from "../../../services/agent-invokability.js";
 import { issueTreeControlService, isVerifiedIssueTreeControlInteractionWake } from "../../../services/issue-tree-control.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "../../../services/recovery/pause-hold-guard.js";
-import { boardDescriptorForBlock } from "../../../services/recovery/blocked-descriptor.js";
 import { classifyContinuationFailure } from "../../../services/recovery/service.js";
 import { issueService } from "../../../services/issues.js";
 import { issueRecoveryActionService } from "../../../services/issue-recovery-actions.js";
@@ -719,14 +718,10 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
     ["failed", "timed_out", "interrupted", "cancelled"].includes(run.status) &&
     issue.assigneeAgentId === run.agentId &&
     !["done", "cancelled"].includes(issue.status);
-  if (!applies || isAcknowledgedNativeStop(run)) return false;
+  if (!applies || isAcknowledgedNativeStop(run) || isAcknowledgedNativeReassignmentStop(run)) return false;
 
   const existing = await tx
-    .select({
-      id: issueRecoveryActions.id,
-      evidence: issueRecoveryActions.evidence,
-      nextAction: issueRecoveryActions.nextAction,
-    })
+    .select({ id: issueRecoveryActions.id, evidence: issueRecoveryActions.evidence })
     .from(issueRecoveryActions)
     .where(
       and(
@@ -741,33 +736,7 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
     .limit(1);
   let nativeFailureBlock: { runId: string; statusVersion: number } | undefined;
   if (issue.status !== "blocked") {
-    // Reuse a valid existing recovery action when one already names the next
-    // step. The native terminal check still owns this blocked projection.
-    //
-    // Only reuse an action that belongs to *this* run. The query above also
-    // admits any other active action on the issue, and putting that action's
-    // next step on this card would send the board to a different failure.
-    // Recovery evidence records the run in a few places depending on the
-    // writer, so accept any of them rather than trusting one shape.
-    const evidence = existing[0]?.evidence as
-      | { runId?: string; automaticRecovery?: { runId?: string } }
-      | undefined;
-    const ownerRunId = evidence?.automaticRecovery?.runId ?? evidence?.runId;
-    const runScopedAction = ownerRunId === run.id ? existing[0] : undefined;
-    const unblockAction = runScopedAction?.nextAction?.trim() ||
-      "Inspect the original failure and reconcile the previous execution before continuing. Automatic recovery cannot start another incident.";
-    const unblockDescriptor = boardDescriptorForBlock({
-      existing: issue.unblockDescriptor,
-      action: unblockAction,
-    });
-    const projected = await issueService(tx).update(
-      issue.id,
-      {
-        status: "blocked",
-        ...(unblockDescriptor ? { unblockDescriptor } : {}),
-      },
-      tx,
-    );
+    const projected = await issueService(tx).update(issue.id, { status: "blocked" }, tx);
     if (projected) {
       nativeFailureBlock = { runId: run.id, statusVersion: projected.statusVersion };
       await tx.insert(activityLog).values({
@@ -787,8 +756,6 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
     }
   }
   if (!existing.length) {
-    const unblockAction =
-      "Inspect the original failure and reconcile the previous execution before continuing. Automatic recovery cannot start another incident.";
     await tx
       .update(nativeRunFinalizations)
       .set({
@@ -816,7 +783,8 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
       cause: "native_continuation_requires_reconciliation",
       fingerprint: `native-continuation:${run.id}`,
       evidence: { runId: run.id, originalFailureCode: run.errorCode, ...(nativeFailureBlock ? { nativeFailureBlock } : {}) },
-      nextAction: unblockAction,
+      nextAction:
+        "Inspect the original failure and reconcile the previous execution before continuing. Automatic recovery cannot start another incident.",
       maxAttempts: 3,
       wakePolicy: null,
       supersedeOnIdentityChange: true,
@@ -1136,9 +1104,10 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           // next explicit wake adopts those messages atomically when it
           // queues a run.
           executionCancellationAcknowledged:
-            run.status === "cancelled" &&
+            isAcknowledgedNativeReassignmentStop(run) ||
+            (run.status === "cancelled" &&
             (parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
-            !interruptedQueue,
+            !interruptedQueue),
         };
         const preDrain = decidePreDrain(preDrainFacts);
 

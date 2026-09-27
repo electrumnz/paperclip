@@ -318,6 +318,30 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     });
   }
 
+  it("releases an acknowledged native handoff without blocking or restarting the old owner", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId, status: "in_progress" });
+    const runId = await seedRun({ companyId, agentId, status: "cancelled", contextSnapshot: { issueId } });
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: issueId, resultJson: {
+      reassignmentStopRequested: true,
+      nativeCancellation: { schema: "paperclip.native-cancellation.v1", runId, companyId, issueId,
+        scope: "run", reasonCode: "cancellation_run_only", dispatchState: "acknowledged", dispatched: true,
+        intentAuditId: randomUUID(), acknowledgementAuditId: randomUUID() },
+    } }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ executionRunId: runId, checkoutRunId: runId }).where(eq(issues.id, issueId));
+    const before = (await db.select().from(issues).where(eq(issues.id, issueId)))[0];
+    const wakeId = await seedDeferredWake({ companyId, agentId, issueId });
+    const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
+    const result = await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async () => { throw new Error("must not restart the outgoing owner"); });
+    expect(result).toMatchObject({ outcome: { kind: "released" }, postCommitEffects: [] });
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]).toMatchObject({
+      status: "in_progress", statusVersion: before.statusVersion, assigneeAgentId: agentId, executionRunId: null, checkoutRunId: null,
+    });
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)))[0].status).toBe("deferred_issue_execution");
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+  });
+
   it.each(["in_progress", "blocked"])("preserves recovery ownership and queued messages when a native task fails from %s", async (status) => {
     const companyId = await seedCompany();
     const agentId = await seedAgent({ companyId });
@@ -332,16 +356,8 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     const entries = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId));
     if (status === "in_progress") {
       expect(blockedIssue.blockedTransitionAt).not.toBeNull();
-      expect(blockedIssue.unblockDescriptor).toEqual({
-        owner: "board",
-        action:
-          "Inspect the original failure and reconcile the previous execution before continuing. Automatic recovery cannot start another incident.",
-      });
       expect(entries[0]).toMatchObject({ action: "issue.updated", details: { status: "blocked", previousStatus: "in_progress" } });
-    } else {
-      expect(blockedIssue.unblockDescriptor).toBeNull();
-      expect(entries).toHaveLength(0);
-    }
+    } else expect(entries).toHaveLength(0);
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)))[0].status).toBe("deferred_issue_execution");
     const action = (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))[0];
     expect(action).toMatchObject({ ownerType: "board", cause: "native_continuation_requires_reconciliation" });
@@ -370,10 +386,6 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     await release();
     const [blocked] = await db.select().from(issues).where(eq(issues.id, issueId));
     expect(blocked.status).toBe("blocked");
-    expect(blocked.unblockDescriptor).toEqual({
-      owner: "board",
-      action: existing!.nextAction,
-    });
     const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
     expect(actions).toHaveLength(1);
     expect(actions[0]).toMatchObject({ id: existing.id, status, cause: existing.cause,
@@ -384,55 +396,6 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     await release();
     expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0].statusVersion).toBe(blocked.statusVersion);
     expect(await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))).toHaveLength(1);
-  });
-
-  it("does not put another run's recovery action on the card it blocks", async () => {
-    const companyId = await seedCompany();
-    const agentId = await seedAgent({ companyId });
-    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId, status: "in_progress" });
-    const runId = await seedRun({ companyId, agentId, status: "failed", contextSnapshot: { issueId } });
-    const otherRunId = await seedRun({ companyId, agentId, status: "failed", contextSnapshot: { issueId } });
-    await db.update(heartbeatRuns).set({ runtimeMode: "native", errorCode: "runner_lost" }).where(eq(heartbeatRuns.id, runId));
-    await seedDeferredWake({ companyId, agentId, issueId });
-    // An active action for a *different* run, which the lookup also admits.
-    await db.insert(issueRecoveryActions).values({
-      companyId, sourceIssueId: issueId, status: "active", kind: "active_run_watchdog",
-      ownerType: "board", cause: "native_runner_restart_unverified", fingerprint: `restart:${otherRunId}`,
-      evidence: { runId: otherRunId, automaticRecovery: { attempts: 1 } },
-      nextAction: "Verify the previous execution stopped", attemptCount: 1, maxAttempts: 3,
-    });
-    const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
-    await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async () => { throw new Error("must not replay"); });
-    const [blocked] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(blocked.status).toBe("blocked");
-    // The card must not inherit the other run's next step.
-    expect(blocked.unblockDescriptor).toEqual({
-      owner: "board",
-      action:
-        "Inspect the original failure and reconcile the previous execution before continuing. Automatic recovery cannot start another incident.",
-    });
-  });
-
-  it("keeps an existing agent-owned unblock descriptor instead of downgrading it to the board", async () => {
-    const companyId = await seedCompany();
-    const agentId = await seedAgent({ companyId });
-    const issueId = await seedIssue({ companyId, assigneeAgentId: agentId, status: "in_progress" });
-    const runId = await seedRun({ companyId, agentId, status: "failed", contextSnapshot: { issueId } });
-    await db.update(heartbeatRuns).set({ runtimeMode: "native", errorCode: "runner_lost" }).where(eq(heartbeatRuns.id, runId));
-    await db.update(issues).set({
-      unblockDescriptor: { owner: { agentId }, action: "The assignee must resolve the checkout conflict." },
-    }).where(eq(issues.id, issueId));
-    await seedDeferredWake({ companyId, agentId, issueId });
-    const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
-    await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async () => { throw new Error("must not replay"); });
-    const [blocked] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(blocked.status).toBe("blocked");
-    // Board-owned descriptors do not wake agents, so the existing agent-owned
-    // unblock path must survive.
-    expect(blocked.unblockDescriptor).toEqual({
-      owner: { agentId },
-      action: "The assignee must resolve the checkout conflict.",
-    });
   });
 
   it.each(["queued", "running", "scheduled_retry"])("does not promote another turn behind a %s successor without an execution lock", async (status) => {

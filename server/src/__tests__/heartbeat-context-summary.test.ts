@@ -7,6 +7,27 @@ import {
 } from "../services/heartbeat.js";
 
 describe("buildPaperclipTaskMarkdown", () => {
+  it.each(["standard", "planning", "ask"])("selects directives only from explicit %s mode, even when a plan is requested", (workMode) => {
+    for (const prose of [
+      { title: "Prepare rollout steps", description: "Describe the steps." },
+      { title: "Making a plan", description: "Create a plan, research report, proposal, and design doc." },
+      { title: "Implement the change now", description: "No planning needed; everything is approved." },
+    ]) {
+      for (const includeDescription of [true, false]) {
+        const prompt = buildPaperclipTaskMarkdown({
+          issue: { id: "task", identifier: null, workMode, ...prose },
+          includeDescription,
+        })!;
+        expect(prompt.includes("Planning mode directive:")).toBe(workMode === "planning");
+        expect(prompt.includes("Ask mode directive:")).toBe(workMode === "ask");
+        expect(prompt).not.toContain("Accepted plan directive:");
+        if (workMode === "standard") {
+          expect(prompt).not.toContain("Do not produce an implementation plan");
+          expect(prompt).not.toContain("Do not write code or perform implementation work");
+        }
+      }
+    }
+  });
   it("keeps a durable task plan in full and resumed context without granting execution approval", () => {
     const taskPlan = {
       documentId: "document", revisionId: "revision", revisionNumber: 1,
@@ -76,7 +97,7 @@ describe("buildPaperclipTaskMarkdown", () => {
     });
 
     expect(markdown).toContain(
-      "Address every comment in order. You may answer them together, but do not silently omit any comment.",
+      "Address every comment without repeating completed work.",
     );
     expect(markdown).toContain("Pending wake comments (oldest to newest):");
     expect(markdown).not.toContain("Latest wake comment:");
@@ -419,8 +440,10 @@ describe("buildPaperclipTaskMarkdown", () => {
       },
     });
 
-    expect(commentWake).toContain("The latest wake comment is the immediate request for this run.");
-    expect(commentWake).toContain("Do not repeat an earlier requested output from the issue description");
+    expect(commentWake).toContain("Apply the latest wake comment to the current task.");
+    expect(commentWake).toContain("Later direction replaces conflicting scope");
+    expect(commentWake).toContain("preserve other requirements and approval gates");
+    expect(commentWake).not.toContain("unless the latest comment asks you to");
     expect(commentWake).toContain("Reply with the new answer instead.");
   });
 
