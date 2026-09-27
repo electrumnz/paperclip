@@ -1004,6 +1004,115 @@ test("--check reports a shim that is not this revision, the way --install does",
   }
 });
 
+// The regression for KEE-1018, and the first test here that runs a mode of
+// this script from a worktree OTHER than the one that installed the hook.
+//
+// The shim is one file shared by every worktree of a repository, and this
+// script is run from whichever worktree an operator is standing in. So it
+// regenerates that shim and compares it byte for byte against the one on
+// disk -- and any part of the generated text that is specific to the worktree
+// it was generated from makes that comparison fail everywhere else. It did,
+// because `installedFrom` was the installing checkout's path while every other
+// path in the shim came from the common git dir, which is identical from every
+// worktree by construction. Measured on fork/master 68dbec165, installed from
+// the primary and then checked from a linked worktree:
+//
+//   --check rc=1  ".../hooks/pre-commit is not the revision this script
+//                   would write"
+//
+// against a shim that was byte-for-byte current, and with the hook enforcing
+// correctly the whole time (a real cross-seat commit was refused, HEAD
+// unmoved). So --check was reporting a problem that did not exist, on the one
+// command whose whole job is saying what will actually run.
+//
+// The cost is not the false alarm. It is that --install from that lane refuses
+// to replace the shim without --force, so a fixed shim cannot reach a host
+// from any worktree but the installing one -- the same "the code that runs is
+// not the code I fixed" defect the installer already carries a re-install path
+// for. Both halves are asserted here, because a fix that silenced --check
+// without making --install work would leave the real problem in place.
+test("--check and --install agree with each other from a worktree that did not install", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+
+    const worktrees = path.join(root, "keece-issue-worktrees");
+    mkdirSync(worktrees, { recursive: true });
+    const other = path.join(worktrees, "paperclip-kee-1018-4a323d0d");
+    git(["worktree", "add", "-q", other, "-b", "keece/kee-1018-4a323d0d"], main);
+
+    // The installer is run as scripts/<name>.mjs from a cwd, exactly the way
+    // an operator in that lane runs it.
+    const runThere = (cwd, args) =>
+      spawnSync(process.execPath, [path.join(cwd, "scripts", "install-worktree-isolation-hook.mjs"), ...args], {
+        cwd,
+        encoding: "utf8",
+        env: gitEnv,
+      });
+
+    // The control: the installing worktree agrees with itself, so a failure in
+    // the assertions below cannot be a fixture that was never installed.
+    assert.equal(
+      installHook(main, ["--check"]).status,
+      0,
+      `control: --check disagrees even in the worktree that installed: ${installHook(main, ["--check"]).stderr}`,
+    );
+
+    const check = runThere(other, ["--check"]);
+    assert.equal(
+      check.status,
+      0,
+      `--check called a current hook outdated from another worktree of the same repository:\n${check.stderr}`,
+    );
+    assert.doesNotMatch(
+      check.stderr,
+      /not the revision this script would write/,
+      "the revision complaint from another worktree is the defect this test pins",
+    );
+
+    // The half that actually matters operationally: a fixed shim has to be
+    // able to reach a host from any worktree, not only from the installing one.
+    const install = runThere(other, ["--install"]);
+    assert.equal(
+      install.status,
+      0,
+      `--install from another worktree needed --force to leave the shim alone:\n${install.stderr}`,
+    );
+    assert.doesNotMatch(
+      install.stderr,
+      /--force/,
+      "--install from a linked worktree is still reaching for the deliberate override",
+    );
+
+    // And the two commands must not drift apart again. --check compares the
+    // shim, --install rewrites it, and the whole finding was that they
+    // disagreed about the same file.
+    assert.equal(
+      runThere(other, ["--check"]).status,
+      0,
+      "--check and --install disagree after an install from a linked worktree",
+    );
+
+    // The point of the change is that the shim no longer names one worktree.
+    // Installing from the lane and from the primary must produce the same file,
+    // so read the two back rather than trusting an exit code.
+    const hookPath = path.join(main, ".git", "hooks", "pre-commit");
+    const afterInstallFromLane = readFileSync(hookPath, "utf8");
+    assert.equal(
+      runThere(main, ["--install", "--force"]).status,
+      0,
+      "fixture is wrong: the primary could not re-install its own hook",
+    );
+    assert.equal(
+      readFileSync(hookPath, "utf8"),
+      afterInstallFromLane,
+      "the shim still differs depending on which worktree installed it, so --check will read as outdated again",
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 // --force is the one place this script destroys content it cannot reconstruct,
 // and it used to do so silently: the operator was told an edit was being
 // discarded, was not shown it, and no copy was left. This host already carries

@@ -78,7 +78,29 @@ const guardPath = path.join(repoRoot, "scripts", "check-worktree-isolation.mjs")
 // worktree HEADs on this host have no scripts/install-worktree-isolation-hook.mjs
 // at all, so "run scripts/install-worktree-isolation-hook.mjs" is advice the
 // blocked seat cannot follow. See the shim's refusal message.
-const installedFrom = repoRoot;
+//
+// It is derived from the COMMON DIR, not from repoRoot, and that is the whole
+// point of it. The shim is a single file shared by every worktree of this
+// repository, so it is regenerated from whichever worktree an operator happens
+// to run this script in and compared byte for byte against the one on disk.
+// Anything worktree-specific in it makes that comparison fail for every
+// worktree except the one that installed it. Measured on fork/master
+// 68dbec165, installed from the primary and then run with --check from a
+// LINKED worktree:
+//
+//   --check rc=1  ".../hooks/pre-commit is not the revision this script
+//                   would write"
+//
+// on a shim that is byte-for-byte current, because the two runs disagreed
+// about this one string and nothing else. The hook was healthy and enforcing
+// throughout -- a real cross-seat commit was refused with HEAD unmoved -- so
+// what was broken was the self-check, not the guard. The cost is the second
+// half of the same failure: --install from that lane refuses to replace the
+// shim without --force, so a fixed shim cannot reach the host from there.
+//
+// The stored-guard path above is already derived this way, and the shim embeds
+// it too, which is why only this one line diverged.
+const installedFrom = path.resolve(path.join(commonDir, "..")).split(path.sep).join("/");
 
 const MARKER = "# installed by scripts/install-worktree-isolation-hook.mjs";
 
@@ -213,12 +235,12 @@ if [ -z "$GUARD" ]; then
       echo "  cross-seat commit to catch here. The commit is allowed. Seat isolation is NOT" >&2
       echo "  being enforced in this repository; a seat committing into an issue worktree will" >&2
       echo "  be refused until the guard is installed. From a checkout that carries the installer:" >&2
-      echo "    cd \${installedFrom} && node scripts/install-worktree-isolation-hook.mjs" >&2
+      echo "    cd ${installedFrom} && node scripts/install-worktree-isolation-hook.mjs" >&2
     else
       echo "  No seat identity is set either, so this is not a seat commit. The commit is" >&2
       echo "  allowed. Every seat commit in an issue worktree will be refused until the guard" >&2
       echo "  is installed. From a checkout that carries the installer:" >&2
-      echo "    cd \${installedFrom} && node scripts/install-worktree-isolation-hook.mjs" >&2
+      echo "    cd ${installedFrom} && node scripts/install-worktree-isolation-hook.mjs" >&2
     fi
     exit 0
   fi
@@ -238,8 +260,9 @@ if [ -z "$GUARD" ]; then
     echo "    node scripts/install-worktree-isolation-hook.mjs" >&2
     echo "" >&2
     echo "  That writes the shared guard once and every worktree of this repository is covered," >&2
-    echo "  including this one. If ${installedFrom} is gone, install from whichever lane currently" >&2
-    echo "  has scripts/install-worktree-isolation-hook.mjs." >&2
+    echo "  including this one. If ${installedFrom} is gone, or does not itself carry" >&2
+    echo "  scripts/install-worktree-isolation-hook.mjs, install from whichever lane currently" >&2
+    echo "  does. A path that exists is not the same as a path that has the installer in it." >&2
     exit 2
   fi
   echo "check-worktree-isolation: NO GUARD FOUND, seat isolation is NOT being enforced." >&2
