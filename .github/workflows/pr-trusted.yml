@@ -266,9 +266,14 @@ jobs:
           fetch-depth: 0
 
       - name: Block manual lockfile edits
+        # The bot is exempt wherever it appears; a human is exempt only on the
+        # plain manual-exemption name, never on the bot's own branch. Keying the
+        # bot's exemption to its author is what stops a human PR from inheriting
+        # it, and vice versa.
         if: >-
-          github.head_ref != 'chore/refresh-lockfile' &&
-          github.event.pull_request.user.login != 'dependabot[bot]'
+          github.event.pull_request.user.login != 'github-actions[bot]' &&
+          (github.event.pull_request.user.login == 'dependabot[bot]' ||
+           github.head_ref != 'chore/refresh-lockfile')
         run: |
           # Diff the PR branch against its merge base so recent base-branch commits
           # do not masquerade as changes made by the PR itself.
