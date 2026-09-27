@@ -312,7 +312,18 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       if (!fs.existsSync(skillsSource) || fs.existsSync(skillsTarget)) continue;
       fs.cpSync(skillsSource, skillsTarget, { recursive: true });
     }
-    const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
+    // scripts/release.sh does this in "Step 3/7: Rewriting workspace versions",
+    // after the build and before packaging, and a git install had no equivalent.
+    // prepare-bundled-package.mjs expands `workspace:*` to the *containing*
+    // package's version, so with the repo's real versions the staged server
+    // declared @paperclipai/plugin-sdk@<server version> while the staged
+    // plugin-sdk tarball carried its own version, and the payload install died
+    // with `npm error code ETARGET No matching version found`. Pinning the
+    // checkout to the CLI's own version makes every staged package agree.
+    const cliPackageJsonPath = path.join(checkoutPath, "cli", "package.json");
+    const checkoutVersion = (JSON.parse(fs.readFileSync(cliPackageJsonPath, "utf8")) as { version: string }).version;
+    await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "release-package-map.mjs"), "set-version", checkoutVersion], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 4 * 1024 * 1024 });
+    const metadata = JSON.parse(fs.readFileSync(cliPackageJsonPath, "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
     for (const [index, workspacePackage] of workspacePackages.entries()) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
