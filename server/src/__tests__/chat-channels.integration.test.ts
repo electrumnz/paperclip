@@ -16167,7 +16167,16 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           openWakes: openWakes.length,
         }).toEqual({ openDeliveries: 0, openWakes: 0 });
       },
-      { timeout: 15_000, interval: 25 },
+      // Must stay well inside the project-wide testTimeout (15s, see
+      // server/vitest.config.ts). A barrier budget equal to the test budget can
+      // never win its own race: the test would be killed by the global timeout
+      // and report only "Test timed out in 15000ms", hiding the openDeliveries /
+      // openWakes counts that actually explain the stall. Leaving headroom means
+      // a genuine failure surfaces as the state diff above instead. The 25ms
+      // poll of an earlier attempt is also deliberately relaxed to 50ms: the
+      // drain needs ~1.5s total, so 50ms is still responsive while halving the
+      // query pressure this barrier puts on the embedded Postgres.
+      { timeout: 10_000, interval: 50 },
     );
     // With the drain provably quiescent, the counts and the order are stable
     // and can be asserted directly. The ordering assertion is the point of this
@@ -16208,8 +16217,28 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
           comments.map((comment) => comment.id),
         );
       },
-      { timeout: 15_000, interval: 25 },
+      // Same headroom rule as the barrier above: inside the 15s testTimeout so a
+      // stalled wake reports the call count rather than a bare global timeout.
+      { timeout: 10_000, interval: 50 },
     );
+    // The last comment and wakeup commit inside the lease. Under full-suite
+    // load the assertions above can observe those effects one microtask before
+    // the deferred owner's `finally` deletes its lease. Require prompt eventual
+    // release; a real leak would remain for the much longer lease TTL.
+    //
+    // This stays a waitFor rather than a plain assertion on purpose: the drain
+    // is quiescent, but the lease row is dropped in the owner's `finally`,
+    // which is not ordered before the quiescence commits. A lease-absent check
+    // is useless as the *entry* barrier above (the lease is absent before the
+    // drain even starts) while remaining correct as this trailing check.
+    await vi.waitFor(async () => {
+      expect(
+        await db
+          .select()
+          .from(chatEndpointLeases)
+          .where(eq(chatEndpointLeases.endpointId, endpoint.id)),
+      ).toHaveLength(0);
+    });
     await competingService.shutdown();
     await service.shutdown();
   });
