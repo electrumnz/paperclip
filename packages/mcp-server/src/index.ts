@@ -13,7 +13,18 @@ export function createPaperclipMcpServer(config: PaperclipMcpConfig = readConfig
   const client = new PaperclipApiClient(config);
   const tools = createToolDefinitions(client);
   for (const tool of tools) {
-    server.tool(tool.name, tool.description, tool.schema.shape, tool.execute);
+    // KEE-1003: register the schema *instance*, not `tool.schema.shape`. The
+    // SDK's `getZodSchemaObject()` turns a raw shape back into a fresh
+    // `z.object(shape)`, which is never strict, so `.strict()` on the tool
+    // schema was discarded before argument validation. A schema instance is
+    // passed through untouched, so a strict tool stays strict. A lenient tool
+    // is unaffected: `normalizeObjectSchema()` hands an object instance
+    // straight to `safeParseAsync()`.
+    server.registerTool(
+      tool.name,
+      { description: tool.description, inputSchema: tool.schema },
+      tool.execute,
+    );
   }
 
   return {
