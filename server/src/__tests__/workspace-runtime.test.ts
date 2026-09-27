@@ -1918,94 +1918,94 @@ describe("realizeExecutionWorkspace", () => {
     "provisions worktree-local pnpm node_modules instead of reusing base-repo links",
     async () => {
     return await withIsolatedProvisionCliPath(async () => {
-    const repoRoot = await createTempRepo();
-    await writeRegisteredSourceConfig(repoRoot);
-    await fs.mkdir(path.join(repoRoot, "scripts"), { recursive: true });
-    await fs.mkdir(path.join(repoRoot, "packages", "shared"), { recursive: true });
-    await fs.mkdir(path.join(repoRoot, "server"), { recursive: true });
-    await fs.writeFile(
-      path.join(repoRoot, "package.json"),
-      JSON.stringify(
-        {
-          name: "workspace-root",
-          private: true,
-          packageManager: "pnpm@9.15.4",
+      const repoRoot = await createTempRepo();
+      await writeRegisteredSourceConfig(repoRoot);
+      await fs.mkdir(path.join(repoRoot, "scripts"), { recursive: true });
+      await fs.mkdir(path.join(repoRoot, "packages", "shared"), { recursive: true });
+      await fs.mkdir(path.join(repoRoot, "server"), { recursive: true });
+      await fs.writeFile(
+        path.join(repoRoot, "package.json"),
+        JSON.stringify(
+          {
+            name: "workspace-root",
+            private: true,
+            packageManager: "pnpm@9.15.4",
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(repoRoot, "pnpm-workspace.yaml"),
+        ["packages:", "  - packages/*", "  - server", ""].join("\n"),
+        "utf8",
+      );
+      await fs.writeFile(
+        path.join(repoRoot, "packages", "shared", "package.json"),
+        JSON.stringify(
+          {
+            name: "@repo/shared",
+            version: "1.0.0",
+            private: true,
+            type: "module",
+            exports: "./index.js",
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+      await fs.writeFile(path.join(repoRoot, "packages", "shared", "index.js"), "export const value = 'shared';\n", "utf8");
+      await fs.writeFile(
+        path.join(repoRoot, "server", "package.json"),
+        JSON.stringify(
+          {
+            name: "server",
+            private: true,
+            type: "module",
+            dependencies: {
+              "@repo/shared": "workspace:*",
+            },
+          },
+          null,
+          2,
+        ),
+        "utf8",
+      );
+      await fs.writeFile(path.join(repoRoot, "server", "index.js"), "export {};\n", "utf8");
+      await fs.copyFile(provisionWorktreeScriptPath, path.join(repoRoot, "scripts", "provision-worktree.sh"));
+      await fs.chmod(path.join(repoRoot, "scripts", "provision-worktree.sh"), 0o755);
+      await runPnpm(repoRoot, ["install"]);
+      await runGit(repoRoot, ["add", "."]);
+      await runGit(repoRoot, ["commit", "-m", "Add pnpm workspace fixture"]);
+
+      const workspace = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
         },
-        null,
-        2,
-      ),
-      "utf8",
-    );
-    await fs.writeFile(
-      path.join(repoRoot, "pnpm-workspace.yaml"),
-      ["packages:", "  - packages/*", "  - server", ""].join("\n"),
-      "utf8",
-    );
-    await fs.writeFile(
-      path.join(repoRoot, "packages", "shared", "package.json"),
-      JSON.stringify(
-        {
-          name: "@repo/shared",
-          version: "1.0.0",
-          private: true,
-          type: "module",
-          exports: "./index.js",
-        },
-        null,
-        2,
-      ),
-      "utf8",
-    );
-    await fs.writeFile(path.join(repoRoot, "packages", "shared", "index.js"), "export const value = 'shared';\n", "utf8");
-    await fs.writeFile(
-      path.join(repoRoot, "server", "package.json"),
-      JSON.stringify(
-        {
-          name: "server",
-          private: true,
-          type: "module",
-          dependencies: {
-            "@repo/shared": "workspace:*",
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+            provisionCommand: "bash ./scripts/provision-worktree.sh",
           },
         },
-        null,
-        2,
-      ),
-      "utf8",
-    );
-    await fs.writeFile(path.join(repoRoot, "server", "index.js"), "export {};\n", "utf8");
-    await fs.copyFile(provisionWorktreeScriptPath, path.join(repoRoot, "scripts", "provision-worktree.sh"));
-    await fs.chmod(path.join(repoRoot, "scripts", "provision-worktree.sh"), 0o755);
-    await runPnpm(repoRoot, ["install"]);
-    await runGit(repoRoot, ["add", "."]);
-    await runGit(repoRoot, ["commit", "-m", "Add pnpm workspace fixture"]);
-
-    const workspace = await realizeExecutionWorkspace({
-      base: {
-        baseCwd: repoRoot,
-        source: "project_primary",
-        projectId: "project-1",
-        workspaceId: "workspace-1",
-        repoUrl: null,
-        repoRef: "HEAD",
-      },
-      config: {
-        workspaceStrategy: {
-          type: "git_worktree",
-          branchTemplate: "{{issue.identifier}}-{{slug}}",
-          provisionCommand: "bash ./scripts/provision-worktree.sh",
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-551",
+          title: "Provision local workspace dependencies",
         },
-      },
-      issue: {
-        id: "issue-1",
-        identifier: "PAP-551",
-        title: "Provision local workspace dependencies",
-      },
-      agent: {
-        id: "agent-1",
-        name: "Codex Coder",
-        companyId: "company-1",
-      },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
     });
 
     expect((await fs.lstat(path.join(workspace.cwd, "node_modules"))).isSymbolicLink()).toBe(false);
@@ -2023,100 +2023,11 @@ describe("realizeExecutionWorkspace", () => {
 
   it("provisions successfully when install is needed but there are no symlinked node_modules to move", async () => {
     return await withIsolatedProvisionCliPath(async () => {
-    const repoRoot = await createTempRepo();
-    await writeRegisteredSourceConfig(repoRoot);
-    await fs.mkdir(path.join(repoRoot, "scripts"), { recursive: true });
-    await fs.writeFile(
-      path.join(repoRoot, "package.json"),
-      JSON.stringify(
-        {
-          name: "workspace-root",
-          private: true,
-          packageManager: "pnpm@9.15.4",
-        },
-        null,
-        2,
-      ),
-      "utf8",
-    );
-    await fs.writeFile(
-      path.join(repoRoot, "pnpm-lock.yaml"),
-      [
-        "lockfileVersion: '9.0'",
-        "",
-        "settings:",
-        "  autoInstallPeers: true",
-        "  excludeLinksFromLockfile: false",
-        "",
-        "importers:",
-        "  .: {}",
-        "",
-      ].join("\n"),
-      "utf8",
-    );
-    await fs.copyFile(provisionWorktreeScriptPath, path.join(repoRoot, "scripts", "provision-worktree.sh"));
-    await fs.chmod(path.join(repoRoot, "scripts", "provision-worktree.sh"), 0o755);
-
-    await fs.mkdir(path.join(repoRoot, "node_modules"), { recursive: true });
-    await fs.writeFile(path.join(repoRoot, "node_modules", ".keep"), "", "utf8");
-
-    await runGit(repoRoot, ["add", "package.json", "pnpm-lock.yaml", "scripts/provision-worktree.sh"]);
-    await runGit(repoRoot, ["commit", "-m", "Add minimal provision fixture"]);
-
-    const workspace = await realizeExecutionWorkspace({
-      base: {
-        baseCwd: repoRoot,
-        source: "project_primary",
-        projectId: "project-1",
-        workspaceId: "workspace-1",
-        repoUrl: null,
-        repoRef: "HEAD",
-      },
-      config: {
-        workspaceStrategy: {
-          type: "git_worktree",
-          branchTemplate: "{{issue.identifier}}-{{slug}}",
-          provisionCommand: "bash ./scripts/provision-worktree.sh",
-        },
-      },
-      issue: {
-        id: "issue-1",
-        identifier: "PAP-552",
-        title: "Install without moved symlinks",
-      },
-      agent: {
-        id: "agent-1",
-        name: "Codex Coder",
-        companyId: "company-1",
-      },
-    });
-
-    await expect(fs.readFile(path.join(workspace.cwd, ".paperclip", "config.json"), "utf8")).resolves.toContain(
-      "\"database\"",
-    );
-    });
-  }, 30_000);
-
-  it("reinstalls worktree-local pnpm dependencies when package metadata changes", async () => {
-    return await withIsolatedProvisionCliPath(async () => {
-    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-stale-deps-"));
-    const baseRoot = path.join(tempRoot, "base");
-    const worktreeRoot = path.join(tempRoot, "worktree");
-    const fakeBin = path.join(tempRoot, "bin");
-    const fakePnpmPath = path.join(fakeBin, "pnpm");
-    const scriptPath = path.join(worktreeRoot, "provision-worktree.sh");
-    const installLogPath = path.join(tempRoot, "install.log");
-
-    try {
-      await fs.mkdir(path.join(baseRoot, "node_modules"), { recursive: true });
-      await writeRegisteredSourceConfig(baseRoot);
-      await fs.mkdir(path.join(worktreeRoot, "node_modules"), { recursive: true });
-      await fs.mkdir(path.join(worktreeRoot, "ui"), { recursive: true });
-      await fs.mkdir(fakeBin, { recursive: true });
-      await fs.copyFile(provisionWorktreeScriptPath, scriptPath);
-      await fs.chmod(scriptPath, 0o755);
+      const repoRoot = await createTempRepo();
+      await writeRegisteredSourceConfig(repoRoot);
+      await fs.mkdir(path.join(repoRoot, "scripts"), { recursive: true });
       await fs.writeFile(
-        path.join(worktreeRoot, "package.json"),
+        path.join(repoRoot, "package.json"),
         JSON.stringify(
           {
             name: "workspace-root",
@@ -2129,67 +2040,156 @@ describe("realizeExecutionWorkspace", () => {
         "utf8",
       );
       await fs.writeFile(
-        path.join(worktreeRoot, "pnpm-lock.yaml"),
-        ["lockfileVersion: '9.0'", "", "importers:", "  .: {}", ""].join("\n"),
-        "utf8",
-      );
-      await fs.writeFile(
-        path.join(worktreeRoot, "ui", "package.json"),
-        JSON.stringify({ name: "ui", private: true, dependencies: {} }, null, 2),
-        "utf8",
-      );
-      await fs.writeFile(
-        fakePnpmPath,
+        path.join(repoRoot, "pnpm-lock.yaml"),
         [
-          "#!/bin/sh",
-          "if [ \"$1\" = \"paperclipai\" ] && [ \"$2\" = \"--help\" ]; then",
-          "  exit 1",
-          "fi",
-          "if [ \"$1\" = \"install\" ] && [ \"$2\" = \"--prod=false\" ] && [ \"$3\" = \"--frozen-lockfile\" ]; then",
-          "  mkdir -p \"$PWD/node_modules\"",
-          `  echo "install:$*" >> ${JSON.stringify(installLogPath)}`,
-          "  exit 0",
-          "fi",
-          "exit 1",
+          "lockfileVersion: '9.0'",
+          "",
+          "settings:",
+          "  autoInstallPeers: true",
+          "  excludeLinksFromLockfile: false",
+          "",
+          "importers:",
+          "  .: {}",
           "",
         ].join("\n"),
         "utf8",
       );
-      await fs.chmod(fakePnpmPath, 0o755);
+      await fs.copyFile(provisionWorktreeScriptPath, path.join(repoRoot, "scripts", "provision-worktree.sh"));
+      await fs.chmod(path.join(repoRoot, "scripts", "provision-worktree.sh"), 0o755);
 
-      const runScript = () => execFileAsync(scriptPath, [], {
-        cwd: worktreeRoot,
-        env: {
-          ...process.env,
-          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
-          PAPERCLIP_WORKSPACE_BASE_CWD: baseRoot,
-          PAPERCLIP_WORKSPACE_CWD: worktreeRoot,
+      await fs.mkdir(path.join(repoRoot, "node_modules"), { recursive: true });
+      await fs.writeFile(path.join(repoRoot, "node_modules", ".keep"), "", "utf8");
+
+      await runGit(repoRoot, ["add", "package.json", "pnpm-lock.yaml", "scripts/provision-worktree.sh"]);
+      await runGit(repoRoot, ["commit", "-m", "Add minimal provision fixture"]);
+
+      const workspace = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
         },
-      });
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+            provisionCommand: "bash ./scripts/provision-worktree.sh",
+          },
+        },
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-552",
+          title: "Install without moved symlinks",
+        },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
+    });
 
-      await runScript();
-      await runScript();
-      await expect(fs.readFile(installLogPath, "utf8")).resolves.toBe(
-        "install:install --prod=false --frozen-lockfile\n",
-      );
+    await expect(fs.readFile(path.join(workspace.cwd, ".paperclip", "config.json"), "utf8")).resolves.toContain(
+      "\"database\"",
+    );
+    });
+  }, 30_000);
 
-      await fs.writeFile(
-        path.join(worktreeRoot, "ui", "package.json"),
-        JSON.stringify(
-          { name: "ui", private: true, dependencies: { "@xterm/addon-fit": "^0.11.0" } },
-          null,
-          2,
-        ),
-        "utf8",
-      );
+  it("reinstalls worktree-local pnpm dependencies when package metadata changes", async () => {
+    return await withIsolatedProvisionCliPath(async () => {
+      const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-stale-deps-"));
+      const baseRoot = path.join(tempRoot, "base");
+      const worktreeRoot = path.join(tempRoot, "worktree");
+      const fakeBin = path.join(tempRoot, "bin");
+      const fakePnpmPath = path.join(fakeBin, "pnpm");
+      const scriptPath = path.join(worktreeRoot, "provision-worktree.sh");
+      const installLogPath = path.join(tempRoot, "install.log");
 
-      await runScript();
-      await expect(fs.readFile(installLogPath, "utf8")).resolves.toBe(
-        "install:install --prod=false --frozen-lockfile\ninstall:install --prod=false --frozen-lockfile\n",
-      );
-    } finally {
-      await fs.rm(tempRoot, { recursive: true, force: true });
-    }
+      try {
+        await fs.mkdir(path.join(baseRoot, "node_modules"), { recursive: true });
+        await writeRegisteredSourceConfig(baseRoot);
+        await fs.mkdir(path.join(worktreeRoot, "node_modules"), { recursive: true });
+        await fs.mkdir(path.join(worktreeRoot, "ui"), { recursive: true });
+        await fs.mkdir(fakeBin, { recursive: true });
+        await fs.copyFile(provisionWorktreeScriptPath, scriptPath);
+        await fs.chmod(scriptPath, 0o755);
+        await fs.writeFile(
+          path.join(worktreeRoot, "package.json"),
+          JSON.stringify(
+            {
+              name: "workspace-root",
+              private: true,
+              packageManager: "pnpm@9.15.4",
+            },
+            null,
+            2,
+          ),
+          "utf8",
+        );
+        await fs.writeFile(
+          path.join(worktreeRoot, "pnpm-lock.yaml"),
+          ["lockfileVersion: '9.0'", "", "importers:", "  .: {}", ""].join("\n"),
+          "utf8",
+        );
+        await fs.writeFile(
+          path.join(worktreeRoot, "ui", "package.json"),
+          JSON.stringify({ name: "ui", private: true, dependencies: {} }, null, 2),
+          "utf8",
+        );
+        await fs.writeFile(
+          fakePnpmPath,
+          [
+            "#!/bin/sh",
+            "if [ \"$1\" = \"paperclipai\" ] && [ \"$2\" = \"--help\" ]; then",
+            "  exit 1",
+            "fi",
+            "if [ \"$1\" = \"install\" ] && [ \"$2\" = \"--prod=false\" ] && [ \"$3\" = \"--frozen-lockfile\" ]; then",
+            "  mkdir -p \"$PWD/node_modules\"",
+            `  echo "install:$*" >> ${JSON.stringify(installLogPath)}`,
+            "  exit 0",
+            "fi",
+            "exit 1",
+            "",
+          ].join("\n"),
+          "utf8",
+        );
+        await fs.chmod(fakePnpmPath, 0o755);
+
+        const runScript = () => execFileAsync(scriptPath, [], {
+          cwd: worktreeRoot,
+          env: {
+            ...process.env,
+            PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+            PAPERCLIP_WORKSPACE_BASE_CWD: baseRoot,
+            PAPERCLIP_WORKSPACE_CWD: worktreeRoot,
+          },
+        });
+
+        await runScript();
+        await runScript();
+        await expect(fs.readFile(installLogPath, "utf8")).resolves.toBe(
+          "install:install --prod=false --frozen-lockfile\n",
+        );
+
+        await fs.writeFile(
+          path.join(worktreeRoot, "ui", "package.json"),
+          JSON.stringify(
+            { name: "ui", private: true, dependencies: { "@xterm/addon-fit": "^0.11.0" } },
+            null,
+            2,
+          ),
+          "utf8",
+        );
+
+        await runScript();
+        await expect(fs.readFile(installLogPath, "utf8")).resolves.toBe(
+          "install:install --prod=false --frozen-lockfile\ninstall:install --prod=false --frozen-lockfile\n",
+        );
+      } finally {
+        await fs.rm(tempRoot, { recursive: true, force: true });
+      }
     });
   }, 30_000);
 
@@ -2344,22 +2344,93 @@ describe("realizeExecutionWorkspace", () => {
 
   it("retries worktree-local pnpm install without a frozen lockfile when the lockfile is outdated", async () => {
     return await withIsolatedProvisionCliPath(async () => {
-    const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-outdated-lockfile-"));
-    const baseRoot = path.join(tempRoot, "base");
-    const worktreeRoot = path.join(tempRoot, "worktree");
-    const fakeBin = path.join(tempRoot, "bin");
-    const fakePnpmPath = path.join(fakeBin, "pnpm");
-    const scriptPath = path.join(worktreeRoot, "provision-worktree.sh");
+      const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-outdated-lockfile-"));
+      const baseRoot = path.join(tempRoot, "base");
+      const worktreeRoot = path.join(tempRoot, "worktree");
+      const fakeBin = path.join(tempRoot, "bin");
+      const fakePnpmPath = path.join(fakeBin, "pnpm");
+      const scriptPath = path.join(worktreeRoot, "provision-worktree.sh");
 
-    try {
-      await fs.mkdir(path.join(baseRoot, "node_modules"), { recursive: true });
-      await writeRegisteredSourceConfig(baseRoot);
-      await fs.mkdir(worktreeRoot, { recursive: true });
-      await fs.mkdir(fakeBin, { recursive: true });
-      await fs.copyFile(provisionWorktreeScriptPath, scriptPath);
-      await fs.chmod(scriptPath, 0o755);
+      try {
+        await fs.mkdir(path.join(baseRoot, "node_modules"), { recursive: true });
+        await writeRegisteredSourceConfig(baseRoot);
+        await fs.mkdir(worktreeRoot, { recursive: true });
+        await fs.mkdir(fakeBin, { recursive: true });
+        await fs.copyFile(provisionWorktreeScriptPath, scriptPath);
+        await fs.chmod(scriptPath, 0o755);
+        await fs.writeFile(
+          path.join(worktreeRoot, "package.json"),
+          JSON.stringify(
+            {
+              name: "workspace-root",
+              private: true,
+              packageManager: "pnpm@9.15.4",
+            },
+            null,
+            2,
+          ),
+          "utf8",
+        );
+        await fs.writeFile(
+          path.join(worktreeRoot, "pnpm-lock.yaml"),
+          ["lockfileVersion: '9.0'", "", "importers:", "  .: {}", ""].join("\n"),
+          "utf8",
+        );
+        await fs.writeFile(
+          fakePnpmPath,
+          [
+            "#!/bin/sh",
+            "if [ \"$1\" = \"paperclipai\" ] && [ \"$2\" = \"--help\" ]; then",
+            "  exit 1",
+            "fi",
+            "if [ \"$1\" = \"install\" ] && [ \"$2\" = \"--prod=false\" ] && [ \"$3\" = \"--frozen-lockfile\" ]; then",
+            "  echo \"ERR_PNPM_OUTDATED_LOCKFILE\" >&2",
+            "  exit 1",
+            "fi",
+            "if [ \"$1\" = \"install\" ] && [ \"$2\" = \"--prod=false\" ] && [ \"$3\" = \"--no-frozen-lockfile\" ]; then",
+            "  mkdir -p \"$PWD/node_modules\"",
+            "  : > \"$PWD/node_modules/.retry-success\"",
+            "  exit 0",
+            "fi",
+            "exit 0",
+            "",
+          ].join("\n"),
+          "utf8",
+        );
+        await fs.chmod(fakePnpmPath, 0o755);
+
+        const result = await execFileAsync(scriptPath, [], {
+          cwd: worktreeRoot,
+          env: {
+            ...process.env,
+            PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+            PAPERCLIP_WORKSPACE_BASE_CWD: baseRoot,
+            PAPERCLIP_WORKSPACE_CWD: worktreeRoot,
+          },
+        });
+
+        expect(result.stderr).toContain("retrying install without --frozen-lockfile");
+        await expect(fs.readFile(path.join(worktreeRoot, "node_modules", ".retry-success"), "utf8")).resolves.toBe("");
+        await expect(fs.readFile(path.join(worktreeRoot, ".paperclip", "config.json"), "utf8")).resolves.toContain(
+          "\"database\"",
+        );
+      } finally {
+        await fs.rm(tempRoot, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it(
+    "provisions worktree-local pnpm node_modules instead of reusing base-repo links",
+    async () => {
+    return await withIsolatedProvisionCliPath(async () => {
+      const repoRoot = await createTempRepo();
+      await writeRegisteredSourceConfig(repoRoot);
+      await fs.mkdir(path.join(repoRoot, "scripts"), { recursive: true });
+      await fs.mkdir(path.join(repoRoot, "packages", "shared"), { recursive: true });
+      await fs.mkdir(path.join(repoRoot, "server"), { recursive: true });
       await fs.writeFile(
-        path.join(worktreeRoot, "package.json"),
+        path.join(repoRoot, "package.json"),
         JSON.stringify(
           {
             name: "workspace-root",
@@ -2372,146 +2443,75 @@ describe("realizeExecutionWorkspace", () => {
         "utf8",
       );
       await fs.writeFile(
-        path.join(worktreeRoot, "pnpm-lock.yaml"),
-        ["lockfileVersion: '9.0'", "", "importers:", "  .: {}", ""].join("\n"),
+        path.join(repoRoot, "pnpm-workspace.yaml"),
+        ["packages:", "  - packages/*", "  - server", ""].join("\n"),
         "utf8",
       );
       await fs.writeFile(
-        fakePnpmPath,
-        [
-          "#!/bin/sh",
-          "if [ \"$1\" = \"paperclipai\" ] && [ \"$2\" = \"--help\" ]; then",
-          "  exit 1",
-          "fi",
-          "if [ \"$1\" = \"install\" ] && [ \"$2\" = \"--prod=false\" ] && [ \"$3\" = \"--frozen-lockfile\" ]; then",
-          "  echo \"ERR_PNPM_OUTDATED_LOCKFILE\" >&2",
-          "  exit 1",
-          "fi",
-          "if [ \"$1\" = \"install\" ] && [ \"$2\" = \"--prod=false\" ] && [ \"$3\" = \"--no-frozen-lockfile\" ]; then",
-          "  mkdir -p \"$PWD/node_modules\"",
-          "  : > \"$PWD/node_modules/.retry-success\"",
-          "  exit 0",
-          "fi",
-          "exit 0",
-          "",
-        ].join("\n"),
+        path.join(repoRoot, "packages", "shared", "package.json"),
+        JSON.stringify(
+          {
+            name: "@repo/shared",
+            version: "1.0.0",
+            private: true,
+            type: "module",
+            exports: "./index.js",
+          },
+          null,
+          2,
+        ),
         "utf8",
       );
-      await fs.chmod(fakePnpmPath, 0o755);
-
-      const result = await execFileAsync(scriptPath, [], {
-        cwd: worktreeRoot,
-        env: {
-          ...process.env,
-          PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
-          PAPERCLIP_WORKSPACE_BASE_CWD: baseRoot,
-          PAPERCLIP_WORKSPACE_CWD: worktreeRoot,
-        },
-      });
-
-      expect(result.stderr).toContain("retrying install without --frozen-lockfile");
-      await expect(fs.readFile(path.join(worktreeRoot, "node_modules", ".retry-success"), "utf8")).resolves.toBe("");
-      await expect(fs.readFile(path.join(worktreeRoot, ".paperclip", "config.json"), "utf8")).resolves.toContain(
-        "\"database\"",
+      await fs.writeFile(path.join(repoRoot, "packages", "shared", "index.js"), "export const value = 'shared';\n", "utf8");
+      await fs.writeFile(
+        path.join(repoRoot, "server", "package.json"),
+        JSON.stringify(
+          {
+            name: "server",
+            private: true,
+            type: "module",
+            dependencies: {
+              "@repo/shared": "workspace:*",
+            },
+          },
+          null,
+          2,
+        ),
+        "utf8",
       );
-    } finally {
-      await fs.rm(tempRoot, { recursive: true, force: true });
-    }
-    });
-  });
+      await fs.writeFile(path.join(repoRoot, "server", "index.js"), "export {};\n", "utf8");
+      await fs.copyFile(provisionWorktreeScriptPath, path.join(repoRoot, "scripts", "provision-worktree.sh"));
+      await fs.chmod(path.join(repoRoot, "scripts", "provision-worktree.sh"), 0o755);
+      await runPnpm(repoRoot, ["install"]);
+      await runGit(repoRoot, ["add", "."]);
+      await runGit(repoRoot, ["commit", "-m", "Add pnpm workspace fixture"]);
 
-  it(
-    "provisions worktree-local pnpm node_modules instead of reusing base-repo links",
-    async () => {
-    return await withIsolatedProvisionCliPath(async () => {
-    const repoRoot = await createTempRepo();
-    await writeRegisteredSourceConfig(repoRoot);
-    await fs.mkdir(path.join(repoRoot, "scripts"), { recursive: true });
-    await fs.mkdir(path.join(repoRoot, "packages", "shared"), { recursive: true });
-    await fs.mkdir(path.join(repoRoot, "server"), { recursive: true });
-    await fs.writeFile(
-      path.join(repoRoot, "package.json"),
-      JSON.stringify(
-        {
-          name: "workspace-root",
-          private: true,
-          packageManager: "pnpm@9.15.4",
+      const workspace = await realizeExecutionWorkspace({
+        base: {
+          baseCwd: repoRoot,
+          source: "project_primary",
+          projectId: "project-1",
+          workspaceId: "workspace-1",
+          repoUrl: null,
+          repoRef: "HEAD",
         },
-        null,
-        2,
-      ),
-      "utf8",
-    );
-    await fs.writeFile(
-      path.join(repoRoot, "pnpm-workspace.yaml"),
-      ["packages:", "  - packages/*", "  - server", ""].join("\n"),
-      "utf8",
-    );
-    await fs.writeFile(
-      path.join(repoRoot, "packages", "shared", "package.json"),
-      JSON.stringify(
-        {
-          name: "@repo/shared",
-          version: "1.0.0",
-          private: true,
-          type: "module",
-          exports: "./index.js",
-        },
-        null,
-        2,
-      ),
-      "utf8",
-    );
-    await fs.writeFile(path.join(repoRoot, "packages", "shared", "index.js"), "export const value = 'shared';\n", "utf8");
-    await fs.writeFile(
-      path.join(repoRoot, "server", "package.json"),
-      JSON.stringify(
-        {
-          name: "server",
-          private: true,
-          type: "module",
-          dependencies: {
-            "@repo/shared": "workspace:*",
+        config: {
+          workspaceStrategy: {
+            type: "git_worktree",
+            branchTemplate: "{{issue.identifier}}-{{slug}}",
+            provisionCommand: "bash ./scripts/provision-worktree.sh",
           },
         },
-        null,
-        2,
-      ),
-      "utf8",
-    );
-    await fs.writeFile(path.join(repoRoot, "server", "index.js"), "export {};\n", "utf8");
-    await fs.copyFile(provisionWorktreeScriptPath, path.join(repoRoot, "scripts", "provision-worktree.sh"));
-    await fs.chmod(path.join(repoRoot, "scripts", "provision-worktree.sh"), 0o755);
-    await runPnpm(repoRoot, ["install"]);
-    await runGit(repoRoot, ["add", "."]);
-    await runGit(repoRoot, ["commit", "-m", "Add pnpm workspace fixture"]);
-
-    const workspace = await realizeExecutionWorkspace({
-      base: {
-        baseCwd: repoRoot,
-        source: "project_primary",
-        projectId: "project-1",
-        workspaceId: "workspace-1",
-        repoUrl: null,
-        repoRef: "HEAD",
-      },
-      config: {
-        workspaceStrategy: {
-          type: "git_worktree",
-          branchTemplate: "{{issue.identifier}}-{{slug}}",
-          provisionCommand: "bash ./scripts/provision-worktree.sh",
+        issue: {
+          id: "issue-1",
+          identifier: "PAP-551",
+          title: "Provision local workspace dependencies",
         },
-      },
-      issue: {
-        id: "issue-1",
-        identifier: "PAP-551",
-        title: "Provision local workspace dependencies",
-      },
-      agent: {
-        id: "agent-1",
-        name: "Codex Coder",
-        companyId: "company-1",
-      },
+        agent: {
+          id: "agent-1",
+          name: "Codex Coder",
+          companyId: "company-1",
+        },
     });
 
     expect((await fs.lstat(path.join(workspace.cwd, "node_modules"))).isSymbolicLink()).toBe(false);
