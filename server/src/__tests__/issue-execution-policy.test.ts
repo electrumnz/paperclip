@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyIssueExecutionPolicyTransition, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
+import { applyIssueExecutionPolicyTransition, hasClearedIssueMonitor, normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../services/issue-execution-policy.ts";
 import type { IssueExecutionPolicy, IssueExecutionState } from "@paperclipai/shared";
 
 const coderAgentId = "11111111-1111-4111-8111-111111111111";
@@ -131,6 +131,103 @@ describe("normalizeIssueExecutionPolicy", () => {
         externalRef: "[redacted]",
       },
     });
+  });
+});
+
+describe("hasClearedIssueMonitor", () => {
+  const clearedState = {
+    status: "idle",
+    currentStageId: null,
+    currentStageIndex: null,
+    currentStageType: null,
+    currentParticipant: null,
+    returnAssignee: null,
+    reviewRequest: null,
+    completedStageIds: [],
+    lastDecisionId: null,
+    lastDecisionOutcome: null,
+    monitor: {
+      status: "cleared",
+      nextCheckAt: null,
+      lastTriggeredAt: "2026-04-11T12:30:00.000Z",
+      attemptCount: 1,
+      notes: null,
+      scheduledBy: "assignee",
+      kind: null,
+      serviceName: null,
+      externalRef: null,
+      timeoutAt: null,
+      maxAttempts: null,
+      recoveryPolicy: null,
+      clearedAt: "2026-04-11T12:31:00.000Z",
+      clearReason: "invalid_status",
+    },
+  } as const;
+
+  it("recognizes a deliberately cleared monitor with no next check", () => {
+    expect(
+      hasClearedIssueMonitor({
+        monitorNextCheckAt: null,
+        executionPolicy: null,
+        executionState: clearedState,
+      }),
+    ).toBe(true);
+  });
+
+  it("does not classify a scheduled monitor or conflicting policy as cleared", () => {
+    const nextCheckAt = new Date("2026-04-11T12:30:00.000Z");
+    expect(
+      hasClearedIssueMonitor({
+        monitorNextCheckAt: nextCheckAt,
+        executionPolicy: null,
+        executionState: clearedState,
+      }),
+    ).toBe(false);
+    expect(
+      hasClearedIssueMonitor({
+        monitorNextCheckAt: null,
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [],
+          monitor: {
+            nextCheckAt: nextCheckAt.toISOString(),
+            notes: null,
+            scheduledBy: "assignee",
+            kind: null,
+            serviceName: null,
+            externalRef: null,
+            timeoutAt: null,
+            maxAttempts: null,
+            recoveryPolicy: null,
+          },
+        },
+        executionState: clearedState,
+      }),
+    ).toBe(false);
+  });
+
+  it("does not classify missing, triggered, or malformed monitor state as deliberately cleared", () => {
+    expect(hasClearedIssueMonitor({})).toBe(false);
+    expect(
+      hasClearedIssueMonitor({
+        executionState: {
+          ...clearedState,
+          monitor: {
+            ...clearedState.monitor,
+            status: "triggered",
+          },
+        },
+      }),
+    ).toBe(false);
+    expect(
+      hasClearedIssueMonitor({
+        executionState: {
+          ...clearedState,
+          monitor: { status: "cleared" },
+        },
+      }),
+    ).toBe(false);
   });
 });
 

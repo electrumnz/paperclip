@@ -38,7 +38,7 @@ import { executionFailureRetryCount, executionRetryAttemptCount, accountingForSc
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { boardDescriptorForBlock } from "./recovery/blocked-descriptor.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
-import { buildExecutionContinuation } from "./execution-continuation.js";
+import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 import { PROJECT_REPOSITORIES_DIR, readGitWorkspaceSnapshot } from "@paperclipai/adapter-utils/git-workspace-sync";
 import { isWorkspaceGitScanError, WorkspaceGitScanError, WORKSPACE_GIT_SCAN_ERROR_CODES } from "./workspace-git-operation-scheduler.js";
@@ -408,6 +408,7 @@ import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
+  hasClearedIssueMonitor,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
@@ -16755,24 +16756,96 @@ export function heartbeatService(
     return cancelled;
   }
 
+  // A timer wake is worth its cost if ANY assigned candidate is actionable.
+  // Pulling every candidate's execution policy and execution state into one
+  // `jsonb_agg` scaled the result set with the company's whole backlog, on the
+  // hot path of every timer tick, for a yes/no answer. A bounded existence
+  // query answers the common case, and the keyset-paged scan below preserves
+  // correctness past the first page: if a candidate on a later page is
+  // actionable while the first page is entirely cleared monitors, this must
+  // still return true.
   async function hasActionableTimerWork(agent: typeof agents.$inferSelect) {
-    const row = await db
+    const timerCandidateCondition = () =>
+      and(
+        eq(issues.companyId, agent.companyId),
+        eq(issues.assigneeAgentId, agent.id),
+        isNull(issues.assigneeUserId),
+        isNull(issues.hiddenAt),
+        inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
+        isNull(issues.conversationAgentId),
+        nonIdleSlackIssueCondition(),
+      );
+
+    const todo = await db
       .select({ id: issues.id })
       .from(issues)
       .where(
         and(
-          eq(issues.companyId, agent.companyId),
-          eq(issues.assigneeAgentId, agent.id),
-          isNull(issues.assigneeUserId),
-          isNull(issues.hiddenAt),
-          inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
-          isNull(issues.conversationAgentId),
-          nonIdleSlackIssueCondition(),
+          timerCandidateCondition(),
+          eq(issues.status, "todo"),
         ),
       )
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    return Boolean(row);
+      .limit(1);
+    if (todo[0]) return true;
+
+    // A monitor that is still scheduled, or a policy that still declares a
+    // monitor, is the durable wait path. This mirrors `hasClearedIssueMonitor`
+    // clause for clause, and it must stay conservative in the one direction that
+    // matters: a row this query calls actionable is one the JS function would
+    // also call actionable, so the early return can never invent work. The
+    // residual disagreement (a `cleared` monitor that still carries a
+    // `nextCheckAt`, which the JS function treats as actionable) can only make
+    // this query miss a row, and the keyset scan below re-checks every
+    // candidate with the authoritative JS function. `jsonb_typeof` is what
+    // makes the policy clause exact: the JS accepts a monitor only when it is a
+    // non-array object, and `is not null` would also accept a scalar.
+    const actionableInProgress = and(
+      timerCandidateCondition(),
+      eq(issues.status, "in_progress"),
+      or(
+        isNotNull(issues.monitorNextCheckAt),
+        sql`jsonb_typeof(${issues.executionPolicy} -> 'monitor') = 'object'`,
+        sql`(${issues.executionState} -> 'monitor' ->> 'status') is distinct from 'cleared'`,
+      ),
+    );
+
+    const [actionableRow] = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(actionableInProgress)
+      .limit(1);
+    if (actionableRow) return true;
+
+    // Only now is the bounded answer inconclusive: either the page held no
+    // in_progress candidates at all, or every one of them is a cleared-monitor
+    // strand. Walk the remaining candidates in bounded keyset pages so a
+    // backlog larger than one page still cannot hide actionable work.
+    const PAGE_SIZE = 100;
+    let cursor: string | null = null;
+    for (;;) {
+      const page = await db
+        .select({
+          id: issues.id,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
+          executionPolicy: issues.executionPolicy,
+          executionState: issues.executionState,
+        })
+        .from(issues)
+        .where(
+          and(
+            timerCandidateCondition(),
+            eq(issues.status, "in_progress"),
+            cursor ? gt(issues.id, cursor) : undefined,
+          ),
+        )
+        .orderBy(asc(issues.id))
+        .limit(PAGE_SIZE);
+
+      const actionable = page.some((row) => !hasClearedIssueMonitor(row));
+      if (actionable) return true;
+      if (page.length < PAGE_SIZE) return false;
+      cursor = page[page.length - 1]!.id;
+    }
   }
 
   async function markTimerHeartbeatChecked(
@@ -22128,6 +22201,8 @@ export function heartbeatService(
           selectedEnvironmentId,
           localEnvironmentId: localEnvironment.id,
           adapterType: agent.adapterType,
+          adapterConfig: parseObject(agent.adapterConfig),
+          admittedLifecycleMode: persistedNativeExecutionInput?.session.lifecyclePolicy.mode,
           issueId: issueId ?? null,
           heartbeatRunId: run.id,
           agentId: agent.id,
@@ -23291,9 +23366,10 @@ export function heartbeatService(
           // Other managed harnesses still require per-turn credential cleanup.
           const supportsManagedWarmSession = agent.adapterType === "paperclip_runner" &&
             nativeRuntimeResolution.profile.backend === "codex_app_server";
-          const effectiveLifecyclePolicy = managedAiRuntime && !supportsManagedWarmSession
-            ? { mode: "per_turn" as const, idleTimeoutMs: null }
-            : environmentLifecyclePolicy ?? agentLifecyclePolicy;
+          const effectiveLifecyclePolicy = persistedNativeExecutionInput?.session.lifecyclePolicy ??
+            (managedAiRuntime && !supportsManagedWarmSession
+              ? { mode: "per_turn" as const, idleTimeoutMs: null }
+              : environmentLifecyclePolicy ?? agentLifecyclePolicy);
           if (
             effectiveLifecyclePolicy.mode === "warm" &&
             executionTarget?.kind === "remote" &&
@@ -25680,6 +25756,15 @@ export function heartbeatService(
                 ? outerErr.reason
                 : "adopted_runner_authentication_timeout",
           }).catch(() => undefined);
+      } else if (outerErr instanceof StaleExecutionContinuationError) {
+        // The queued continuation became obsolete before adapter dispatch.
+        // Use cancellation settlement so wakeup, issue ownership, agent state,
+        // and notifications agree; do not retry work for the previous owner.
+        await cancelRunInternal(run.id, outerErr.code, {
+          errorCode: outerErr.code,
+          eventMessage: "stale execution continuation cancelled before dispatch",
+          suppressImmediateRecovery: true,
+        });
       } else if (isWorkspaceBusyDeferral(outerErr)) {
         // Expected contention on a shared project workspace, not a
         // failure: park the run as a bounded scheduled retry and leave the
