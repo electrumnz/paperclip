@@ -41,7 +41,7 @@ import {
 import { issueService } from "../issues.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
-import { buildIssueBlockersResolvedWakeIdempotencyKey } from "../issue-dependency-wakeups.js";
+import { buildIssueBlockersResolvedResolutionEventKey } from "../issue-dependency-wakeups.js";
 import {
   persistActivity,
   publishActivity,
@@ -1854,6 +1854,36 @@ export async function commitNativeStatusDecision(input: {
       if (!updated) throw new NativeStatusRaceError();
     } else {
       failAt("status_projection", input.failpoint);
+      // A native status decision writes `unblockDescriptor` with a null actor,
+      // which skips every owner check in `assertValidUnblockDescriptorOwner`.
+      // Resolve the completing run's agent here and enforce descriptor
+      // ownership, so an in-flight run cannot clear or replace a hold that a
+      // board user or another agent placed.
+      const completingRun = await tx
+        .select({ agentId: heartbeatRuns.agentId })
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, input.runId))
+        .limit(1)
+        .then((rows) => rows[0] ?? null);
+      if (completingRun) {
+        const existingDescriptor = (
+          issue as typeof issues.$inferSelect | null
+        )?.unblockDescriptor;
+        if (existingDescriptor) {
+          const existingOwner = existingDescriptor.owner;
+          const ownedByCompletingRun =
+            typeof existingOwner === "object" &&
+            "agentId" in existingOwner &&
+            existingOwner.agentId === completingRun.agentId;
+          const changingDescriptor =
+            input.decision.unblockDescriptor !== undefined &&
+            JSON.stringify(input.decision.unblockDescriptor) !==
+              JSON.stringify(existingDescriptor);
+          if (!ownedByCompletingRun && changingDescriptor) {
+            throw new NativeStatusRaceError();
+          }
+        }
+      }
       const projected = await issueService(tx as unknown as Db).update(
         input.issueId,
         {
@@ -1915,9 +1945,10 @@ export async function commitNativeStatusDecision(input: {
         const isCompletedChildParent = parent?.id === dependent.id;
         const idempotencyKey = isCompletedChildParent
           ? `issue_children_completed:${dependent.id}:${input.issueId}`
-          : buildIssueBlockersResolvedWakeIdempotencyKey({
+          : buildIssueBlockersResolvedResolutionEventKey({
               dependentIssueId: dependent.id,
               resolvedBlockerIssueId: input.issueId,
+              blockerStatusVersion: updated.statusVersion,
             });
         const childCompletionContext =
           isCompletedChildParent && parent
