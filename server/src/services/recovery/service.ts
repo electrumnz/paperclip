@@ -1,4 +1,5 @@
 import { settleSlackConversation } from "../slack-conversation-lifecycle.js";
+import { nonCyclicRecoveryChildren } from "./non-cyclic-children.js";
 import { externalConversationStateSql } from "../slack-conversation-state.js";
 import { executionRetryAccounting } from "../execution-recovery-attempt.js";
 import {
@@ -485,6 +486,12 @@ const TRANSIENT_INFRA_CONTINUATION_ERROR_CODES = new Set<string>([
   "claude_transient_upstream",
   "provider_quota",
   "timeout",
+  // Emitted by the Hermes adapter for recoverable upstream failures (rate
+  // limit, busy router, 5xx). Registered here for the same reason the
+  // `codex_*`/`claude_*` codes are: without it a recoverable provider outage
+  // falls through to `default` (1 attempt, no backoff) instead of
+  // `transient_infra` (3 attempts, 60s base backoff).
+  "hermes_transient_upstream",
 ]);
 
 const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
@@ -2874,6 +2881,46 @@ export function recoveryService(
       );
   }
 
+  async function existingBlockingEdges(companyId: string) {
+    return db
+      .select({
+        issueId: issueRelations.issueId,
+        relatedIssueId: issueRelations.relatedIssueId,
+      })
+      .from(issueRelations)
+      .where(
+        and(
+          eq(issueRelations.companyId, companyId),
+          eq(issueRelations.type, "blocks"),
+        ),
+      );
+  }
+
+  async function nonCyclicChildren<T extends { id: string; identifier?: string | null }>(
+    issue: typeof issues.$inferSelect,
+    candidates: readonly T[],
+  ) {
+    if (candidates.length === 0) return candidates as T[];
+    const safe = nonCyclicRecoveryChildren(
+      issue.id,
+      candidates,
+      await existingBlockingEdges(issue.companyId),
+    );
+    if (safe.length !== candidates.length) {
+      logger.warn(
+        {
+          companyId: issue.companyId,
+          sourceIssueId: issue.id,
+          excludedChildIds: candidates
+            .filter((candidate) => !safe.includes(candidate))
+            .map((candidate) => candidate.id),
+        },
+        "Recovery retained existing blockers; refusing reverse dependency edges",
+      );
+    }
+    return safe;
+  }
+
   async function healthyOpenChildIssues(issue: typeof issues.$inferSelect, sameWorkspaceOnly = false) {
     if (sameWorkspaceOnly && !issue.projectWorkspaceId) return [];
     const childCandidates = await db
@@ -2900,7 +2947,7 @@ export function recoveryService(
         openChildren.push({ id: child.id, identifier: child.identifier });
       }
     }
-    return openChildren;
+    return nonCyclicChildren(issue, openChildren);
   }
 
   async function resolveContinuationWaitingOnReview(
@@ -2908,7 +2955,7 @@ export function recoveryService(
   ) {
     const [existingBlockers, openChildren] = await Promise.all([
       existingUnresolvedBlockerIssues(issue.companyId, issue.id),
-      openChildIssues(issue),
+      openChildIssues(issue).then((children) => nonCyclicChildren(issue, children)),
     ]);
     const blockedByIssueIds = [
       ...new Set([
