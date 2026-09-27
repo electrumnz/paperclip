@@ -24956,7 +24956,11 @@ export function heartbeatService(
             : null;
 
         const persistedResultJson = mergeHeartbeatRunResultJson(
-          mergeRunStopMetadataForAgent(agent, outcome, {
+          // The effective runtime config, not the stored agent config: a
+          // per-issue adapter override or a workspace-managed key can change
+          // `timeoutSec` for this run, and the recorded timeout is the one the
+          // run actually ran under.
+          mergeRunStopMetadataForAgent({ ...agent, adapterConfig: runtimeConfig }, outcome, {
             resultJson: mergeAdapterRecoveryMetadata({
               resultJson: {
                 ...(adapterResult.nativeFinalization || outcome === "cancelled"

@@ -17,6 +17,7 @@
  *   --yolo             bypass dangerous-command approval prompts (agents have no TTY)
  *   --source           session source tag for filtering
  */
+import { classifyHermesProviderFailure } from "./provider-failure.js";
 
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -590,6 +591,26 @@ export async function execute(
     executionResult.errorMessage = parsed.errorMessage;
   } else if (!result.timedOut && typeof result.exitCode === "number" && result.exitCode !== 0) {
     executionResult.errorMessage = `Hermes exited with code ${result.exitCode}`;
+  }
+
+  // Hermes reports provider failures as rendered text, so translate them into
+  // the same typed vocabulary the ACP adapters emit. Without this the heartbeat
+  // sees an opaque `adapter_failed` and retries terminal conditions forever.
+  // A timeout is excluded: the harness already classified it, and provider text
+  // quoted in a timed-out run is not evidence about the run's own failure.
+  if (executionResult.errorMessage && !result.timedOut) {
+    const failure = classifyHermesProviderFailure(
+      `${result.stderr || ""}\n${result.stdout || ""}`,
+    );
+    if (failure) {
+      executionResult.errorCode = failure.errorCode;
+      if (failure.errorFamily) executionResult.errorFamily = failure.errorFamily;
+      if (failure.retryDelaySec != null) {
+        executionResult.retryNotBefore = new Date(
+          Date.now() + failure.retryDelaySec * 1000,
+        ).toISOString();
+      }
+    }
   }
 
   if (parsed.usage) {

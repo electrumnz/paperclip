@@ -3,6 +3,14 @@
  */
 
 export { execute } from "./execute.js";
+// Exported so the server's recovery tests can pin this producer against the
+// codes recovery actually reads. Without a public entrypoint they would have
+// to reach into the package source by relative path, which breaks the server
+// tsconfig rootDir.
+export {
+  classifyHermesProviderFailure,
+  type HermesProviderFailureClassification,
+} from "./provider-failure.js";
 export { testEnvironment } from "./test.js";
 export { detectModel, parseModelFromConfig, resolveProvider, inferProviderFromModel } from "./detect-model.js";
 export { getConfigSchema } from "./config-schema.js";
