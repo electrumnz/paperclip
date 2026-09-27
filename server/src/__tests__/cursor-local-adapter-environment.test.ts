@@ -7,7 +7,11 @@ import { testEnvironment } from "@paperclipai/adapter-cursor-local/server";
 
 async function writeFakeAgentCommand(binDir: string, argsCapturePath: string): Promise<string> {
   const commandPath = path.join(binDir, "agent");
-  const script = `#!/usr/bin/env node
+  // Bind the interpreter to the node binary running this test. Remote sandbox
+  // children get a managed PATH built from `defaultPathForPlatform()`, which has
+  // no `node` on hosts that install node through a version manager shim, so an
+  // `#!/usr/bin/env node` fixture would exit 127 there and on CI alike.
+  const script = `#!${process.execPath}
 const fs = require("node:fs");
 const outPath = process.env.PAPERCLIP_TEST_ARGS_PATH;
 if (outPath) {
@@ -29,7 +33,9 @@ console.log(JSON.stringify({
 }
 
 async function writeFakeCursorAgentCommand(commandPath: string): Promise<void> {
-  const script = `#!/usr/bin/env node
+  // See writeFakeAgentCommand: bind the interpreter to the running node binary
+  // so the fixture does not depend on `env` resolving `node` via PATH.
+  const script = `#!${process.execPath}
 const fs = require("node:fs");
 const outPath = process.env.PAPERCLIP_TEST_ARGS_PATH;
 if (outPath) {
