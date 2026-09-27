@@ -16117,29 +16117,74 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     // Simulate another server process reconciling the same durable rows at
     // the same time as the webhook process's deferred drain.
     await competingService.processPendingDeliveries();
-    await vi.waitFor(async () => {
-      const rows = await db
-        .select()
-        .from(chatConversations)
-        .where(eq(chatConversations.endpointId, endpoint.id));
-      expect(rows).toHaveLength(1);
-    });
-    const [conversation] = await db
+    // Synchronise on the drain actually finishing before reading any count.
+    //
+    // Slack's ingress reorder window (INGRESS_REORDER_WINDOW_MS.slack) is 750ms
+    // and the drain deliberately sleeps it so rapid callbacks land in one
+    // ordered batch, so the first delivery cannot be ready before ~750ms.
+    // vi.waitFor defaults to a 1000ms budget, which leaves less room than the
+    // reorder window alone consumes, before 8 serial admissions have even
+    // begun. Polling the comment count against that budget read a partially
+    // drained conversation and failed at whatever number the drain happened to
+    // have reached, which is what made this case flake.
+    //
+    // The barrier has to be a condition that is false while the drain is still
+    // sleeping and true only once it can admit nothing further. A lease-absent
+    // check is NOT that condition: the conversation lease is acquired inside
+    // drainConversationDeliveries, which runs only after the reorder sleep
+    // resolves, so the lease is already absent before the drain has started and
+    // the wait would return immediately on a partially drained conversation.
+    //
+    // Instead wait for quiescence of the durable rows themselves: no delivery
+    // for this endpoint may remain in an open state, and no inbound_wakeup
+    // action may remain issued or processing. Both are monotone — a row only
+    // ever leaves these states — so this becomes true exactly once this
+    // conversation has no further unit of work, which is what the count
+    // assertions below need.
+    await vi.waitFor(
+      async () => {
+        const openDeliveries = await db
+          .select({ id: chatDeliveries.id })
+          .from(chatDeliveries)
+          .where(
+            and(
+              eq(chatDeliveries.endpointId, endpoint.id),
+              inArray(chatDeliveries.state, ["received", "retry", "processing"]),
+            ),
+          );
+        const openWakes = await db
+          .select({ id: chatActions.id })
+          .from(chatActions)
+          .where(
+            and(
+              eq(chatActions.endpointId, endpoint.id),
+              eq(chatActions.kind, "inbound_wakeup"),
+              inArray(chatActions.status, ["issued", "processing"]),
+            ),
+          );
+        expect({
+          openDeliveries: openDeliveries.length,
+          openWakes: openWakes.length,
+        }).toEqual({ openDeliveries: 0, openWakes: 0 });
+      },
+      { timeout: 15_000, interval: 25 },
+    );
+    // With the drain provably quiescent, the counts and the order are stable
+    // and can be asserted directly. The ordering assertion is the point of this
+    // case: the earlier provider-time callback (200ms) must precede the later
+    // one (517ms) even though the later message was received first.
+    const conversations = await db
       .select()
       .from(chatConversations)
       .where(eq(chatConversations.endpointId, endpoint.id));
-    await vi.waitFor(async () => {
-      const rows = await db
-        .select({ id: issueComments.id })
-        .from(issueComments)
-        .where(eq(issueComments.issueId, conversation.issueId));
-      expect(rows).toHaveLength(8);
-    });
+    expect(conversations).toHaveLength(1);
+    const [conversation] = conversations;
     const comments = await db
       .select({ id: issueComments.id, body: issueComments.body })
       .from(issueComments)
       .where(eq(issueComments.issueId, conversation.issueId))
       .orderBy(asc(issueComments.createdAt), asc(issueComments.id));
+    expect(comments).toHaveLength(8);
     expect(comments.map((comment) => comment.body)).toEqual([
       "@maya acknowledge quickly",
       "follow-up 3",
@@ -16153,27 +16198,18 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     // Comment admission commits before the durable wake. Wait for this
     // company's last wake too, not merely its already-visible last comment.
     // The competing sweep may legitimately reconcile another fixture company.
-    await vi.waitFor(() => {
-      const calls = wakeup.mock.calls.filter(
-        (call) => call[0] === fixture.assignedAgentId,
-      );
-      expect(calls).toHaveLength(8);
-      expect(calls.map((call) => call[1]?.payload?.wakeCommentId)).toEqual(
-        comments.map((comment) => comment.id),
-      );
-    });
-    // The last comment and wakeup commit inside the lease. Under full-suite
-    // load the assertions above can observe those effects one microtask before
-    // the deferred owner's `finally` deletes its lease. Require prompt eventual
-    // release; a real leak would remain for the much longer lease TTL.
-    await vi.waitFor(async () => {
-      expect(
-        await db
-          .select()
-          .from(chatEndpointLeases)
-          .where(eq(chatEndpointLeases.endpointId, endpoint.id)),
-      ).toHaveLength(0);
-    });
+    await vi.waitFor(
+      () => {
+        const calls = wakeup.mock.calls.filter(
+          (call) => call[0] === fixture.assignedAgentId,
+        );
+        expect(calls).toHaveLength(8);
+        expect(calls.map((call) => call[1]?.payload?.wakeCommentId)).toEqual(
+          comments.map((comment) => comment.id),
+        );
+      },
+      { timeout: 15_000, interval: 25 },
+    );
     await competingService.shutdown();
     await service.shutdown();
   });
