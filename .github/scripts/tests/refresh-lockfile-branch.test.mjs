@@ -95,14 +95,28 @@ test('the workflow resolves the branch from the script, not a literal', () => {
   );
 });
 
-test('the ownership check runs before the force push', () => {
+test('the ownership check runs before the push', () => {
   const claim = workflow.indexOf('refresh-lockfile-branch.mjs)"');
   const push = workflow.indexOf('git push --force');
   assert.ok(claim > 0 && push > 0);
   assert.ok(
     claim < push,
-    'a collision must be detected before the bot can force-push over someone',
+    'a collision must be detected before the bot can push over someone',
   );
+});
+
+test('the push is leased, so a commit that appeared after the claim cannot be lost', () => {
+  // `--force-with-lease=<ref>:<sha>` makes the push fail when the remote ref has
+  // moved since the claim step recorded `expected`. A human who pushed a commit
+  // with no pull request open is invisible to `gh pr list`, and the lease is
+  // what stops their commit from being overwritten.
+  assert.match(workflow, /git push --force-with-lease=/);
+  assert.doesNotMatch(
+    workflow,
+    /git push --force origin/,
+    'a bare --force can still destroy a commit that no pull request records',
+  );
+  assert.match(workflow, /git ls-remote origin "refs\/heads\/\$BRANCH"/);
 });
 
 test('a conflict leaves the branch output empty so the push step is skipped', () => {

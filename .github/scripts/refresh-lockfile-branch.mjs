@@ -49,12 +49,6 @@ export function planRefresh(prs, repoOwner) {
   return { prUrl: mine[0]?.url ?? '', conflicts };
 }
 
-export function leaseValue(remoteSha) {
-  // An empty expected SHA means "the ref must not exist remotely yet", which is
-  // the correct lease for the bot's first push of a new branch.
-  return remoteSha ?? '';
-}
-
 async function readStdin() {
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
@@ -84,15 +78,18 @@ async function main(argv) {
   const plan = planRefresh(prs, repoOwner);
   process.stdout.write(`${JSON.stringify(plan)}\n`);
 
-  for (const conflict of plan.conflicts) {
-    process.stderr.write(
-      `::error title=Lockfile refresh::Refusing to touch ${REFRESH_BRANCH}: pull request ` +
-        `${conflict.url} on that branch belongs to ${conflict.author}, not ${BOT_AUTHOR}. ` +
-        'The bot will not force-push over it, adopt it, or delete it. ' +
-        'Rename the pull request branch or close it, then re-run the workflow.\n'
-    );
+  if (plan.conflicts.length > 0) {
+    for (const conflict of plan.conflicts) {
+      process.stderr.write(
+        `::error title=Lockfile refresh::Refusing to touch ${REFRESH_BRANCH}: pull request ` +
+          `${conflict.url} on that branch belongs to ${conflict.author}, not ${BOT_AUTHOR}. ` +
+          'The bot will not force-push over it, adopt it, or delete it. ' +
+          'Rename the pull request branch or close it, then re-run the workflow.\n'
+      );
+    }
+    return 3;
   }
-  return plan.conflicts.length > 0 ? 3 : 0;
+  return 0;
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

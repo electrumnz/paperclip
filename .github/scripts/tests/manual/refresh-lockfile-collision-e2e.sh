@@ -10,7 +10,7 @@ set -uo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/../../../.." && pwd)"
 SCRIPT="$REPO_ROOT/.github/scripts/refresh-lockfile-branch.mjs"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+trap 'echo "$WORK" > /tmp/kee1025-wd' EXIT
 
 pass=0
 fail=0
@@ -44,6 +44,7 @@ block() {
     | sed -e 's/^          //' \
     | sed -e "s#\${{ steps.branch-claim.outputs.branch }}#\$BRANCH#g" \
           -e "s#\${{ steps.branch-claim.outputs.pr_url }}#\$PR_URL#g" \
+          -e "s#\${{ steps.branch-claim.outputs.expected }}#\$EXPECTED#g" \
           -e "s#\${{ steps.upsert-pr.outputs.pr_url }}#\$PR_URL#g"
 }
 
@@ -98,6 +99,17 @@ EOF
   export PATH
 }
 
+# A real run reaches the push step with `pnpm install --resolution-only` having
+# already rewritten the lockfile in the working tree, and nothing staged: the
+# step's own guard is `git diff --quiet -- pnpm-lock.yaml`, which compares the
+# worktree against the index. Staging here would make that guard see no delta
+# and the step would exit before the push.
+stage_lockfile_delta() {
+  local dir="$1"
+  echo "lockfileVersion: 9.0" > "$dir/work/pnpm-lock.yaml"
+  git -C "$dir/work" status --porcelain -- pnpm-lock.yaml
+}
+
 OWNER=OWNER
 
 echo "Case 1: a human PR holds the bot branch"
@@ -148,13 +160,60 @@ make_gh "$D" "[]"
   bash -euo pipefail "$WORK/claim.sh" < /dev/null 2>"$D/err") >/dev/null
 check "branch is claimed with no PR" "$(grep '^branch=' "$D/out" | cut -d= -f2-)" "$B"
 check "no PR to reuse yet" "$(grep '^pr_url=' "$D/out" | cut -d= -f2-)" ""
+check "the lease is empty because the branch does not exist yet" \
+  "$(grep '^expected=' "$D/out" | cut -d= -f2-)" ""
+
+# The branch does not exist yet, so an empty lease must let the push create it.
+stage_lockfile_delta "$D"
+(cd "$D/work" && GITHUB_OUTPUT="$D/out2" REPO_OWNER="$OWNER" \
+  BRANCH="$B" PR_URL="" EXPECTED="" \
+  bash -euo pipefail "$WORK/push.sh" < /dev/null >"$D/push.log" 2>&1)
+check "the push created the branch" \
+  "$(git -C "$D/remote.git" rev-parse "refs/heads/$B" 2>/dev/null || echo missing)" \
+  "$(git -C "$D/work" rev-parse HEAD)"
 
 echo "Case 4: a PR from another fork is ignored, not treated as a conflict"
 make_gh "$WORK/case3" "[{\"url\":\"https://github.com/someone/paperclip/pull/5\",\"headRefName\":\"$B\",\"author\":{\"login\":\"somehuman\"},\"headRepositoryOwner\":{\"login\":\"someone-else\"}}]"
-out="$(cd "$WORK/case3/work" && GITHUB_OUTPUT="$WORK/case3/out2" REPO_OWNER="$OWNER" \
+out="$(cd "$WORK/case3/work" && GITHUB_OUTPUT="$WORK/case3/fork-out" REPO_OWNER="$OWNER" \
   bash -euo pipefail "$WORK/claim.sh" < /dev/null 2>"$WORK/case3/err")"
-check "a fork PR does not block the run" "$(grep '^branch=' "$WORK/case3/out2" | cut -d= -f2-)" "$B"
-check "a fork PR is not adopted" "$(grep '^pr_url=' "$WORK/case3/out2" | cut -d= -f2-)" ""
+check "a fork PR does not block the run" "$(grep '^branch=' "$WORK/case3/fork-out" | cut -d= -f2-)" "$B"
+check "a fork PR is not adopted" "$(grep '^pr_url=' "$WORK/case3/fork-out" | cut -d= -f2-)" ""
+
+# A human commit that lands after the claim step is invisible to `gh pr list`,
+# so the claim already authorised the branch. The lease is the only thing left
+# between the bot and that commit. The reviewer reproduced the loss with a bare
+# --force; this case proves the lease refuses the push instead.
+echo "Case 5: a human commit that lands after the claim is protected by the lease"
+D="$WORK/case5"; mkdir -p "$D"; make_remote "$D"
+make_gh "$D" "[]"
+
+(cd "$D/work" && GITHUB_OUTPUT="$D/out" REPO_OWNER="$OWNER" \
+  bash -euo pipefail "$WORK/claim.sh" < /dev/null 2>"$D/err") >/dev/null
+LEASE="$(grep '^expected=' "$D/out" | cut -d= -f2-)"
+check "the branch does not exist at claim time" "$LEASE" ""
+
+# A human pushes to the same branch with no pull request open.
+git -C "$D/work" checkout -q -b "$B"
+echo human > "$D/work/human-file.txt"
+git -C "$D/work" add -A; git -C "$D/work" commit -qm "human work, no PR"
+git -C "$D/work" push -q origin "$B"
+HUMAN_SHA="$(git -C "$D/work" rev-parse HEAD)"
+
+# The bot's push still holds the stale lease, so it must be refused.
+stage_lockfile_delta "$D"
+(cd "$D/work" && GITHUB_OUTPUT="$D/out2" REPO_OWNER="$OWNER" \
+  BRANCH="$B" PR_URL="" EXPECTED="$LEASE" \
+  bash -euo pipefail "$WORK/push.sh" < /dev/null >"$D/push.log" 2>&1)
+push_rc=$?
+if [ "$push_rc" -ne 0 ]; then
+  echo "  ok   the push was refused (rc=$push_rc): $(grep -ioE "stale info|force-with-lease|rejected|non-fast-forward" "$D/push.log" | head -1)"
+  pass=$((pass + 1))
+else
+  echo "  FAIL the push was not refused; the human commit was overwritten"
+  fail=$((fail + 1))
+fi
+check "the human commit still exists on the remote" \
+  "$(git -C "$D/remote.git" rev-parse "refs/heads/$B" 2>/dev/null || echo missing)" "$HUMAN_SHA"
 
 echo
 echo "passed=$pass failed=$fail"

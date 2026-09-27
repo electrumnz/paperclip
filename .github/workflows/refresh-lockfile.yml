@@ -68,16 +68,31 @@ jobs:
           prs="$(
             gh pr list --state open --head "$BRANCH" --json url,headRefName,author,headRepositoryOwner
           )"
-          # Exits 3 when a pull request on this branch belongs to someone else.
-          # On that path `branch` is never emitted, so the step below is skipped
-          # entirely and no push, adoption, or delete can happen.
-          plan="$(printf '%s' "$prs" | node .github/scripts/refresh-lockfile-branch.mjs)" || {
-            echo "::notice title=Lockfile refresh::Branch $BRANCH has a non-bot pull request. Nothing was pushed."
+          # Exits 3 when a pull request on this branch belongs to someone else,
+          # and 2 when the pull request list could not be read at all. Both fail
+          # closed: `branch` is never emitted, so the step below is skipped and
+          # no push, adoption, or delete can happen. The reason differs, so the
+          # two exit codes are reported separately instead of as one notice.
+          plan="$(printf '%s' "$prs" | node .github/scripts/refresh-lockfile-branch.mjs)"
+          claim_rc=$?
+          if [ "$claim_rc" -ne 0 ]; then
+            if [ "$claim_rc" -eq 3 ]; then
+              echo "::notice title=Lockfile refresh::Branch $BRANCH has a non-bot pull request. Nothing was pushed."
+            else
+              echo "::warning title=Lockfile refresh::Could not read the pull request list for $BRANCH. Nothing was pushed."
+            fi
             echo "branch=" >> "$GITHUB_OUTPUT"
             exit 0
-          }
+          fi
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
           echo "pr_url=$(printf '%s' "$plan" | jq -r '.prUrl')" >> "$GITHUB_OUTPUT"
+
+          # Record where the branch is right now. The push below uses this as a
+          # lease, so a commit that appeared after this point (a human pushing
+          # with no pull request open is invisible to the list above) makes the
+          # push fail instead of overwriting it. Empty means the branch does not
+          # exist yet, which leases the push to its creation.
+          echo "expected=$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)" >> "$GITHUB_OUTPUT"
 
       - name: Create or update pull request
         id: upsert-pr
@@ -98,9 +113,12 @@ jobs:
           git checkout -B "$BRANCH"
           git add pnpm-lock.yaml
           git commit -m "chore(lockfile): refresh pnpm-lock.yaml"
-          # --force is safe only because the claim step above proved every open
-          # pull request on this branch belongs to the bot.
-          git push --force origin "$BRANCH"
+          # --force-with-lease, not --force. The claim step proved every open
+          # pull request on this branch belongs to the bot, and the lease stops
+          # the push if the ref moved since that step, so a commit that appeared
+          # in between is never overwritten. A stale lease fails the push loudly
+          # instead of losing work.
+          git push --force-with-lease="refs/heads/$BRANCH:${{ steps.branch-claim.outputs.expected }}" origin "$BRANCH"
 
           pr_url="${{ steps.branch-claim.outputs.pr_url }}"
           if [ -z "$pr_url" ]; then
