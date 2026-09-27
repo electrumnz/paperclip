@@ -1142,7 +1142,24 @@ async function startServerWithDatabaseTeardown(
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
     tracked = Promise.resolve(work)
-      .then(() => undefined, () => undefined)
+      // KEE-1095: log, do not re-throw. This handler is shared by every
+      // scheduled heartbeat work (~24 call sites), so it deliberately keeps its
+      // existing resolve semantics and gains observability only: a rejection
+      // that used to vanish silently is now recorded with its error. Re-throwing
+      // here would be an unhandled rejection and would change control flow for
+      // all 24, which is a much wider change than this one needs. The two
+      // callers that must react still see the failure, because
+      // `reconcileStrandedAssignedIssues` now contains per-issue failures and
+      // surfaces sweep-level ones through its own result and log.
+      .then(
+        () => undefined,
+        (error: unknown) => {
+          logger.error(
+            { err: error },
+            "scheduled heartbeat work rejected; the schedule continues on its next tick",
+          );
+        },
+      )
       .finally(() => {
         heartbeatSchedulerInFlight.delete(tracked);
       });
