@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockAgentService = vi.hoisted(() => ({
   create: vi.fn(),
@@ -195,6 +195,25 @@ function makeReflectionCoachAgent(overrides: Record<string, unknown> = {}) {
 }
 
 describe("agent instructions bundle routes", () => {
+  // Transform/import cost for src/routes/agents.ts (7455 lines) and its dependency
+  // graph is a one-time cost that vitest otherwise charges to whichever test runs
+  // first. On a loaded serial runner that cost can cross the 15s testTimeout and
+  // fail the first test, which also lets its fire-and-forget wake land inside the
+  // *next* test, after that test's beforeEach has cleared mocks, so the leaked call
+  // surfaces as a bogus assertion. Measured unloaded, the first test here took
+  // 10748/10684/12579ms of the 15000ms budget, and a --testTimeout sweep at
+  // 15000ms fails the first two tests with "Test timed out in 15000ms."
+  // Warming in beforeAll moves the cost onto the 30s hookTimeout budget
+  // instead. See KEE-1004 / KEE-1019.
+  //
+  // Unlike the two suites KEE-1019 had to leave alone, this file does not use
+  // __tests__/helpers/hoist-module-graph.ts. Its mocks are registered by hoisted
+  // vi.mock() blocks at file scope, so they are already in place when this hook
+  // runs and the import below evaluates the route module against the mocked graph.
+  beforeAll(async () => {
+    await import("../routes/agents.js");
+  });
+
   beforeEach(() => {
     vi.resetModules();
     vi.doUnmock("../routes/agents.js");
