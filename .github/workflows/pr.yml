@@ -11,4 +11,30 @@ permissions:
 jobs:
   ci:
     # Pin: #13457 merge — restore-only Rust dependency cache on the PR runner lane.
-    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@f97a3f886eb4baf19ea8eefaa53a44cb1c2d4636
+    #
+    # Call this fork's OWN pr-trusted.yml, not upstream's. Both files are
+    # `workflow_call`-only, so this line is the only thing that decides which
+    # definition actually runs on a pull request here.
+    #
+    # Delegating to paperclipai/paperclip@<sha> silently discarded the
+    # fork-local steps this repo added to pr-trusted.yml. Verified against the
+    # policy job log of runs 36285948524, 36287700226 and 36288032607: none of
+    # the three guard steps below appears, and the executed step list matches
+    # upstream's file exactly. So the fleet/worktree-isolation guards
+    # (check-worktree-isolation, install-worktree-isolation-hook and the
+    # KEE-962 downgrade cross-check) were present in the reviewed file and
+    # never executed. A guard that is checked in but not wired is worse than
+    # no guard, because review reads as enforcement.
+    #
+    # Calling the local path also makes the pin implicit and exact: the
+    # definition that runs is the definition in this tree, and the reviewed
+    # file cannot drift from the executed one. A cross-repo @master caller
+    # instead gave 47 jobs while a pinned SHA gave 25 — a PR could go green
+    # on roughly half the suite purely as a function of this one line.
+    #
+    # The trust gate itself is unchanged and still refuses the AWS self-hosted
+    # fleet here, by design: AWS_CI_ENABLED is unset on this fork, so
+    # fail_closed selects ubuntu-latest and the whole suite runs on
+    # GitHub-hosted runners with no repository variables and no secrets.
+    # Do not add AWS_CI_* to make the fleet route.
+    uses: ./.github/workflows/pr-trusted.yml
