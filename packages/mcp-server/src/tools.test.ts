@@ -121,13 +121,39 @@ describe("paperclip MCP tools", () => {
       "http://localhost:3100/api/companies/11111111-1111-1111-1111-111111111111/issues",
     );
     expect(init.method).toBe("POST");
-    expect(JSON.parse(String(init.body))).toEqual({
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    // `allowDuplicate` carries a zod `.default(false)`, so the shared input schema
+    // always materialises it. The server gates recent-title dedup on a strict
+    // `allowDuplicate === false`, so sending it explicitly is the intended
+    // duplicate-guard behaviour, not incidental payload noise.
+    expect(body).toEqual({
       title: "Assigned follow-up",
       workMode: "standard",
       priority: "medium",
       assigneeAgentId: "22222222-2222-2222-2222-222222222222",
       requestDepth: 0,
+      allowDuplicate: false,
     });
+    // The point of this test: the tool must NOT resolve the status default itself,
+    // so the server can apply the assignee-aware default (todo, not backlog).
+    expect(body).not.toHaveProperty("status");
+  });
+
+  it("forwards an explicit allowDuplicate override on create issue requests", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      mockJsonResponse({ id: "issue-2", status: "todo" }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const tool = getTool("paperclipCreateIssue");
+    await tool.execute({
+      title: "Deliberate repeat",
+      allowDuplicate: true,
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    expect(body.allowDuplicate).toBe(true);
   });
 
   it("defaults issue document format to markdown", async () => {
