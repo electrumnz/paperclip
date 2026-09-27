@@ -267,14 +267,22 @@ jobs:
 
       - name: Block manual lockfile edits
         # CI owns the lockfile, so a pull request that changes it is failed.
-        # Each actor is exempt exactly once: the refresh bot by its author
-        # login, dependabot because it must update the lockfile to match the
-        # manifest it bumps, and a human only on the plain manual-exemption
-        # name. Keying the bot's exemption to its author is what stops a human
-        # pull request from inheriting it, and vice versa.
+        # This step runs (the check runs) for everyone who is not exempt.
+        #
+        # Exemption rules, in the order they are checked:
+        #   - dependabot: it must update the lockfile to match the manifest it
+        #     bumps, so almost every dependabot pull request touches the lockfile
+        #   - the refresh bot, but only on the branch it owns. A human on that
+        #     branch is still checked. Keying the bot's exemption to its author
+        #     is what stops a human pull request from inheriting it
+        #   - a human, but only on the plain manual-exemption name
+        #
+        # The bot clauses are grouped so the branch test cannot leak to a human.
         if: >-
-          github.event.pull_request.user.login != 'github-actions[bot]' &&
           github.event.pull_request.user.login != 'dependabot[bot]' &&
+          (github.event.pull_request.user.login != 'github-actions[bot]' ||
+           (github.head_ref != 'chore/refresh-lockfile-bot' &&
+            github.head_ref != 'chore/refresh-lockfile')) &&
           github.head_ref != 'chore/refresh-lockfile'
         run: |
           # Diff the PR branch against its merge base so recent base-branch commits

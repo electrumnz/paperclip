@@ -123,11 +123,20 @@ HUMAN_SHA="$(git -C "$D/work" rev-parse HEAD)"
 make_gh "$D" "[{\"url\":\"https://github.com/OWNER/paperclip/pull/42\",\"headRefName\":\"$B\",\"author\":{\"login\":\"somehuman\"},\"headRepositoryOwner\":{\"login\":\"$OWNER\"}}]"
 
 out="$(cd "$D/work" && GITHUB_OUTPUT="$D/out" REPO_OWNER="$OWNER" GH_TEST_CREATE=0 \
-  bash -euo pipefail "$WORK/claim.sh" < /dev/null 2>"$D/err")"
+  bash -euo pipefail "$WORK/claim.sh" < /dev/null >"$D/log" 2>"$D/err")"
 rc=$?
 branch_out="$(grep '^branch=' "$D/out" 2>/dev/null | cut -d= -f2- || true)"
-check "claim step reports success but no branch" "$branch_out" ""
+
+# Assert the step's own outcome, not just the branch value. A step that dies
+# under `bash -e` also yields an empty branch, so the branch alone cannot tell
+# "reported success and claimed nothing" apart from "never ran to end".
+check "claim step exits 0, so the scheduled master job stays green" "$rc" "0"
+check "claim step wrote GITHUB_OUTPUT at all" "$([ -f "$D/out" ] && echo yes || echo no)" "yes"
+check "claim step claims no branch" "$branch_out" ""
 check "claim step warns about the human PR" "$(grep -c 'belongs to somehuman' "$D/err" | tr -d ' ')" "1"
+# The workflow's own notice goes to stdout; the script's ::error goes to stderr.
+check "claim step reports it as a notice, not an error" \
+  "$(grep -c '^::notice' "$D/log" | tr -d ' ')" "1"
 
 # The push step is gated on a non-empty branch, exactly as in the workflow.
 if [ -n "$branch_out" ]; then
@@ -214,6 +223,31 @@ else
 fi
 check "the human commit still exists on the remote" \
   "$(git -C "$D/remote.git" rev-parse "refs/heads/$B" 2>/dev/null || echo missing)" "$HUMAN_SHA"
+
+echo "Case 6: an unreadable pull request list fails closed, as a warning"
+D="$WORK/case6"; mkdir -p "$D"; make_remote "$D"
+# `gh` returns something that is not JSON, so the script exits 2, not 3.
+mkdir -p "$D/bin"
+cat > "$D/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+case "$1 $2" in
+  "pr list") echo "this is not json" ;;
+  *) exit 1 ;;
+esac
+EOF
+chmod +x "$D/bin/gh"
+export PATH="$D/bin:$PATH"
+
+(cd "$D/work" && GITHUB_OUTPUT="$D/out" REPO_OWNER="$OWNER" \
+  bash -euo pipefail "$WORK/claim.sh" < /dev/null >"$D/log" 2>"$D/err") >/dev/null
+rc=$?
+check "an unreadable list also exits 0" "$rc" "0"
+check "an unreadable list claims no branch" \
+  "$(grep '^branch=' "$D/out" 2>/dev/null | cut -d= -f2- || true)" ""
+check "an unreadable list is reported as a warning, not a false conflict" \
+  "$(grep -c '^::warning' "$D/log" | tr -d ' ')" "1"
+check "an unreadable list does not claim a non-bot pull request exists" \
+  "$(grep -c 'has a non-bot pull request' "$D/log" | tr -d ' ')" "0"
 
 echo
 echo "passed=$pass failed=$fail"

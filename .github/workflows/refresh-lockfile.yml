@@ -73,8 +73,16 @@ jobs:
           # closed: `branch` is never emitted, so the step below is skipped and
           # no push, adoption, or delete can happen. The reason differs, so the
           # two exit codes are reported separately instead of as one notice.
+          #
+          # `set +e` is required, not optional. This step declares no `shell:`,
+          # so Actions runs `bash -e`, where a bare assignment whose command
+          # substitution fails kills the step before anything below can read
+          # the status. Without this, a human pull request on the branch turns
+          # the scheduled master job red instead of emitting a green notice.
+          set +e
           plan="$(printf '%s' "$prs" | node .github/scripts/refresh-lockfile-branch.mjs)"
           claim_rc=$?
+          set -e
           if [ "$claim_rc" -ne 0 ]; then
             if [ "$claim_rc" -eq 3 ]; then
               echo "::notice title=Lockfile refresh::Branch $BRANCH has a non-bot pull request. Nothing was pushed."

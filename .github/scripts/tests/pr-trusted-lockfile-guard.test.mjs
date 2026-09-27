@@ -2,6 +2,8 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { REFRESH_BRANCH, MANUAL_EXEMPTION_BRANCH, BOT_AUTHOR } from '../refresh-lockfile-branch.mjs';
+import { checkLockfile } from '../check-pr-lockfile.mjs';
+import { runInNewContext } from 'node:vm';
 
 const DEPENDABOT = 'dependabot[bot]';
 const HUMAN = 'somehuman';
@@ -28,79 +30,17 @@ const expression = step
 assert.ok(expression, 'the guard must have an if: expression');
 
 /**
- * Evaluate a GitHub Actions expression restricted to the forms this guard
- * actually uses: `&&`, `||`, parentheses, `!=`, `==`, and dotted context paths.
- * GitHub coerces a bare value to a boolean: an unset or empty string is false.
+ * Evaluate a GitHub Actions expression restricted to the forms this guard uses:
+ * `&&`, `||`, parentheses, `==`, `!=`, and string literals.
+ *
+ * The expression is run through `node:vm`, the same way this repository's other
+ * workflow-expression tests do it. A hand-rolled precedence parser got this
+ * wrong twice, so the precedence rules now come from the engine instead of from
+ * me. GitHub string comparison treats an unset value as an empty string, which
+ * is what the loose `==` here gives us for the two comparisons that matter.
  */
 function evaluate(expr, context) {
-  const lookup = path =>
-    path
-      .split('.')
-      .reduce((acc, key) => (acc == null ? undefined : acc[key]), context);
-  const truthy = v => v !== undefined && v !== null && v !== '' && v !== false;
-
-  // Shunting-yard-free approach: this grammar is small, so split on the
-  // lowest-precedence operator outside parentheses, respecting `&&` over `||`.
-  const stripOuter = s => {
-    let t = s.trim();
-    while (t.startsWith('(') && t.endsWith(')')) {
-      let depth = 0;
-      let encloses = true;
-      for (let i = 0; i < t.length; i++) {
-        if (t[i] === '(') depth++;
-        else if (t[i] === ')') {
-          depth--;
-          if (depth === 0 && i < t.length - 1) { encloses = false; break; }
-        }
-      }
-      if (!encloses) break;
-      t = t.slice(1, -1).trim();
-    }
-    return t;
-  };
-
-  const splitTop = (s, op) => {
-    const parts = [];
-    let depth = 0, cur = '';
-    for (let i = 0; i < s.length; i++) {
-      const c = s[i];
-      if (c === '(') depth++;
-      if (c === ')') depth--;
-      if (depth === 0 && s.startsWith(op, i)) {
-        parts.push(cur);
-        cur = '';
-        i += op.length - 1;
-        continue;
-      }
-      cur += c;
-    }
-    parts.push(cur);
-    return parts.length > 1 ? parts : null;
-  };
-
-  const atom = s => {
-    const t = s.trim();
-    const cmp = t.match(/^(.*?)\s*(==|!=)\s*(.*)$/);
-    if (cmp) {
-      const val = cmp[1].trim().startsWith("'")
-        ? cmp[1].trim().slice(1, -1)
-        : lookup(cmp[1].trim());
-      const rhs = cmp[3].trim().startsWith("'")
-        ? cmp[3].trim().slice(1, -1)
-        : lookup(cmp[3].trim());
-      return cmp[2] === '==' ? val === rhs : val !== rhs;
-    }
-    const lit = t.match(/^'(.*)'$/);
-    if (lit) return lit[1];
-    return truthy(lookup(t));
-  };
-
-  const s = stripOuter(expr);
-  const orParts = splitTop(s, '||');
-  if (orParts) return orParts.some(p => evaluate(p, context));
-  const andParts = splitTop(s, '&&');
-  if (andParts) return andParts.every(p => evaluate(p, context));
-  return atom(s);
+  return runInNewContext(expr, context);
 }
 
 const ctx = (author, branch) => ({
@@ -193,15 +133,57 @@ test('the only author this PR newly exempts is the refresh bot', () => {
   const OLD =
     "(github.head_ref != 'chore/refresh-lockfile') && " +
     "(github.event.pull_request.user.login != 'dependabot[bot]')";
+
+  // Enumerate exhaustively rather than sampling CASES, so a wider change than
+  // intended cannot hide behind a list that happens not to include it.
+  const authors = [BOT_AUTHOR, DEPENDABOT, HUMAN, 'someother[bot]'];
+  const branches = [
+    REFRESH_BRANCH,
+    MANUAL_EXEMPTION_BRANCH,
+    'fix/some-bug',
+    'dependabot/npm_and_pnpm/vitest-4.0.0',
+  ];
   const changed = [];
-  for (const { author, branch } of CASES) {
-    const was = evaluate(OLD, ctx(author, branch));
-    const now = stepRuns(author, branch);
-    if (was !== now) changed.push(`${author} on ${branch}`);
+  for (const author of authors) {
+    for (const branch of branches) {
+      if (evaluate(OLD, ctx(author, branch)) !== stepRuns(author, branch)) {
+        changed.push(`${author} on ${branch}`);
+      }
+    }
   }
   assert.deepEqual(
     changed,
     [`${BOT_AUTHOR} on ${REFRESH_BRANCH}`],
-    'the guard must change behaviour for the refresh bot on its new branch, and nothing else',
+    'across every author/branch pair, only the refresh bot on its new branch changes behaviour',
+  );
+});
+
+test('the YAML guard and check-pr-lockfile.mjs agree on who is exempt from the bot', () => {
+  // Scope: the refresh bot. The bot's exemption is the one this pull request
+  // moves, so the two gates must agree about it exactly.
+  //
+  // The two gates are deliberately NOT identical overall, and were not before
+  // this change either: the workflow guard exempts dependabot and the plain
+  // manual-exemption name for any author, while check-pr-lockfile.mjs exempts
+  // only the bot. That gap is pre-existing and out of scope here. Asserting
+  // blanket equality would either fail on untouched behaviour or, worse, push
+  // me into quietly widening the script's gate.
+  const authors = [BOT_AUTHOR, HUMAN, 'someother[bot]'];
+  const branches = [REFRESH_BRANCH, MANUAL_EXEMPTION_BRANCH, 'fix/some-bug'];
+  const lockfileFiles = [{ filename: 'pnpm-lock.yaml', status: 'modified' }];
+  const disagree = [];
+  for (const author of authors) {
+    for (const branch of branches) {
+      // Only pairs where the script is not blanket-exempting on the branch name.
+      if (branch === MANUAL_EXEMPTION_BRANCH && author !== BOT_AUTHOR) continue;
+      const yamlChecks = stepRuns(author, branch);
+      const scriptExempts = checkLockfile(lockfileFiles, author, branch).passed;
+      if (yamlChecks === scriptExempts) disagree.push(`${author} on ${branch}`);
+    }
+  }
+  assert.deepEqual(
+    disagree,
+    [],
+    'the workflow guard and the script gate must agree about the bot exemption',
   );
 });
