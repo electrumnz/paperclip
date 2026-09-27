@@ -16117,6 +16117,39 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     // Simulate another server process reconciling the same durable rows at
     // the same time as the webhook process's deferred drain.
     await competingService.processPendingDeliveries();
+    // Real drain-completion barrier.
+    //
+    // These eight callbacks are durably *received* but undelivered, and the
+    // conversation drain is the only thing that turns them into comments.
+    // Asserting on the comment count therefore races the drain, and because the
+    // drain commits messages serially the count climbs 1..8, which is why this
+    // case has always reported a *varying* shortfall against a fixed 8.
+    //
+    // Instrumented drain progress (states -> comments) on this host:
+    //   received:8 -> received:6,processed:1 -> received:4,processed:3
+    //   -> processed:7,received:1 -> processed:8   (converges in ~6s)
+    //
+    // `drainConversationDeliveries` writes each message's comment *before* that
+    // delivery is marked terminal, so "all eight deliveries terminal" is a real
+    // post-condition of a completed drain rather than a timing guess. Awaiting
+    // that condition is the synchronisation point; the budget below only has to
+    // cover the drain's measured runtime, because vi.waitFor otherwise gives up
+    // after 1s and reports the partial count as a fixed-expectation failure.
+    await vi.waitFor(
+      async () => {
+        const settled = await db
+          .select({ state: chatDeliveries.state })
+          .from(chatDeliveries)
+          .where(eq(chatDeliveries.endpointId, endpoint.id));
+        expect(settled).toHaveLength(8);
+        expect(
+          settled.every((delivery) =>
+            ["processed", "filtered", "failed"].includes(delivery.state),
+          ),
+        ).toBe(true);
+      },
+      { timeout: 10_000, interval: 100 },
+    );
     await vi.waitFor(async () => {
       const rows = await db
         .select()
