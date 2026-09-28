@@ -95,6 +95,32 @@ function isHeartbeatCleanupFkError(error: unknown) {
   );
 }
 
+// `drainHeartbeatRunsToQuiescence` only returns early when NO row in
+// `heartbeat_runs` is queued or running. The runs `seedLowTrustFixture` seeds
+// are synthetic rows this test inserts directly: nothing registers them with
+// the heartbeat service, so no real execution can ever transition them out of
+// `running` and the drain's exit condition is unreachable. The drain then
+// silently burns its entire 50-attempt budget on every test, and whether the
+// afterEach lands inside vitest's 30s hookTimeout becomes a function of how
+// loaded the host is: comfortable on an idle workstation, over budget on the CI
+// shard runner that shares the box with four sibling shards.
+//
+// Settle this suite's OWN seed rows before the global drain, so the drain still
+// performs its real job (waiting for genuinely in-flight runs to flush) and
+// then reaches its exit condition on its first or second pass. This is scoped
+// to the ids this fixture inserted, so a real in-flight run is never
+// short-circuited, and it removes the ordering problem rather than raising a
+// budget.
+async function settleSeededHeartbeatRuns(db: Db, runIds: Set<string>) {
+  if (runIds.size === 0) return;
+  const ids = [...runIds];
+  runIds.clear();
+  await db
+    .update(heartbeatRuns)
+    .set({ status: "succeeded", finishedAt: new Date() })
+    .where(inArray(heartbeatRuns.id, ids));
+}
+
 async function deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(db: Db) {
   for (let attempt = 0; attempt < 10; attempt += 1) {
     await db.delete(heartbeatRunEvents);
@@ -408,7 +434,7 @@ async function createQuarantinedContinuationSummary(
   return document!;
 }
 
-async function seedLowTrustFixture(db: Db) {
+async function seedLowTrustFixture(db: Db, seededRunIds?: Set<string>) {
   const nonce = randomUUID().slice(0, 8);
   const canary = (label: string) => `LT_REDTEAM_${nonce}_${label}`;
   const canaries = {
@@ -634,6 +660,13 @@ async function seedLowTrustFixture(db: Db) {
       contextSnapshot: { issueId: standardChild!.id },
     })
     .returning();
+  // These three rows are synthetic: they model a run holding execution so the
+  // route guards have something to refuse. They are not registered with the
+  // heartbeat service, so nothing can ever finish them. Record their ids for
+  // settleSeededHeartbeatRuns to settle in afterEach.
+  for (const run of [lowTrustRun!, standardRun!, standardReportRun!]) {
+    seededRunIds?.add(run.id);
+  }
   await db
     .update(issues)
     .set({
@@ -851,6 +884,11 @@ describeEmbeddedPostgres(
     let tempDb: Awaited<
       ReturnType<typeof startEmbeddedPostgresTestDatabase>
     > | null = null;
+    // Ids of the synthetic `heartbeat_runs` rows `seedLowTrustFixture` inserts.
+    // Tracked so afterEach can settle exactly those before the global drain —
+    // see settleSeededHeartbeatRuns. Scoped per test so a run seeded by one
+    // test can never mask a real in-flight run in the next.
+    const seededRunIds = new Set<string>();
 
     beforeAll(async () => {
       tempDb = await startEmbeddedPostgresTestDatabase(
@@ -860,6 +898,15 @@ describeEmbeddedPostgres(
     }, 20_000);
 
     afterEach(async () => {
+      // Settle this suite's own synthetic seed runs first. They are inserted
+      // directly and no real execution owns them, so
+      // `drainHeartbeatRunsToQuiescence` below can never reach its "nothing is
+      // queued or running" exit condition while they sit at `running`; it
+      // would spin its full 50-attempt budget on every test and blow the 30s
+      // hookTimeout whenever the host is loaded. Settling them here keeps the
+      // drain's real purpose intact — it still awaits genuinely in-flight
+      // runs — and makes the hook's duration independent of machine load.
+      await settleSeededHeartbeatRuns(db, seededRunIds);
       // Await every in-flight background heartbeat run to quiescence before the
       // deletes below. A route dispatches a wakeup fire-and-forget, so a run can
       // still be writing issues, issue_comments, and heartbeat_runs rows when
@@ -898,7 +945,7 @@ describeEmbeddedPostgres(
     });
 
     it("allows bounded same-issue reads and writes while quarantining low-trust output", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       const app = createApp(db, agentActor(fixture));
 
       const issueRead = await request(app).get(
@@ -951,7 +998,7 @@ describeEmbeddedPostgres(
     });
 
     it("preserves direct-parent reporting while default-opening visible standard-trust writes", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       const standardApp = createApp(db, standardReportActor(fixture));
       const lowTrustApp = createApp(db, agentActor(fixture));
 
@@ -1052,7 +1099,7 @@ describeEmbeddedPostgres(
     });
 
     it("relays blocked and cancelled stops once without laundering child prose", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       const app = createApp(db, boardActor(fixture));
       const unblockDescriptor = {
         owner: "board",
@@ -1228,7 +1275,7 @@ describeEmbeddedPostgres(
     });
 
     it("allows mentioned low-trust agents to comment on out-of-bound assigned issues", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       const [targetIssue] = await db
         .insert(issues)
         .values({
@@ -1287,7 +1334,7 @@ describeEmbeddedPostgres(
     });
 
     it("propagates denied low-trust policy conflicts on control-plane guards", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       const conflictingExecutionPolicy = {
         authorizationPolicy: {
           trustBoundary: {
@@ -1318,7 +1365,7 @@ describeEmbeddedPostgres(
     });
 
     it("restricts low-trust self inspection without changing standard-agent visibility", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       await db.insert(companyMemberships).values({
         companyId: fixture.company.id,
         principalType: "agent",
@@ -1489,7 +1536,7 @@ describeEmbeddedPostgres(
     });
 
     it("denies out-of-bound and control-plane attempts without leaking canaries or creating durable side effects", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       const app = createApp(db, agentActor(fixture));
       const forbiddenMarkers = Object.values(fixture.canaries);
 
@@ -1713,7 +1760,7 @@ describeEmbeddedPostgres(
     });
 
     it("denies skill-test scoped tokens on foreign issue-adjacent reads", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       const app = createApp(db, skillTestActor(fixture));
       const forbiddenMarkers = Object.values(fixture.canaries);
 
@@ -1809,7 +1856,7 @@ describeEmbeddedPostgres(
     });
 
     it("counts blocked inbox issues with the low-trust boundary applied in the database", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       await db.insert(issues).values([
         {
           companyId: fixture.company.id,
@@ -1848,7 +1895,7 @@ describeEmbeddedPostgres(
     });
 
     it("redacts quarantined low-trust output from higher-trust wake and continuation contexts", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       const lowTrustApp = createApp(db, agentActor(fixture));
       const standardApp = createApp(
         db,
@@ -2085,7 +2132,7 @@ describeEmbeddedPostgres(
     }, 120_000);
 
     it("keeps board positive controls for issue-linked approvals and sanitized promotion", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       const app = createApp(db, boardActor(fixture));
 
       const approvalsRes = await request(app).get(
