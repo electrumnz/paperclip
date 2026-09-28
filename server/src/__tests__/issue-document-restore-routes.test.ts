@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const issueId = "11111111-1111-4111-8111-111111111111";
 const companyId = "22222222-2222-4222-8222-222222222222";
@@ -197,6 +197,16 @@ async function createApp(
 }
 
 describe("issue document revision routes", () => {
+  // Transform/import cost for src/routes/issues.js and its dependency graph is a
+  // one-time cost that vitest otherwise charges to whichever test runs first. On a
+  // loaded serial runner that cost can cross the 15s testTimeout, and a test that
+  // times out mid-request lets its fire-and-forget wake land inside the *next*
+  // test, which then reports a bogus call count. Warming in beforeAll moves the
+  // cost onto the 30s hookTimeout budget instead. See KEE-1004 / KEE-1019.
+  beforeAll(async () => {
+    await import("../routes/issues.js");
+  });
+
   beforeEach(() => {
     vi.resetModules();
     vi.doUnmock("../services/access.js");

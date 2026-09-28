@@ -64,6 +64,15 @@ describeEmbeddedPostgres("issue comment attribution and patch audit routes", () 
     db = createDb(tempDb.connectionString);
   }, 20_000);
 
+  // Separate hook from the database boot above, on purpose: the boot carries an
+  // explicit 20s budget that must not be widened, and the transform/import cost
+  // of src/routes/issues.js is unrelated to it. Warming here charges that one-time
+  // cost to the 30s hookTimeout instead of charging it to whichever test runs
+  // first inside its own 15s testTimeout. See KEE-1004 / KEE-1019.
+  beforeAll(async () => {
+    await import("../routes/issues.js");
+  });
+
   afterEach(async () => {
     await db.delete(activityLog);
     await db.delete(issueComments);
