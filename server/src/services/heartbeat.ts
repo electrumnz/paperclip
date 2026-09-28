@@ -261,7 +261,7 @@ import {
   providerTraceStore,
   PROVIDER_TRACE_MAX_BYTES,
 } from "./provider-trace-store.js";
-import { getServerAdapter, runningProcesses } from "../adapters/index.js";
+import { getServerAdapter, runningProcesses, sweepRunDescendantsByRunId } from "../adapters/index.js";
 import type {
   AdapterExecutionResult,
   AdapterInvocationMeta,
@@ -8891,7 +8891,31 @@ export async function persistHeartbeatRunProcessMetadata(
   });
 }
 
-async function terminateHeartbeatRunProcess(input: {
+// Cancellation of a run must reach the whole run, not just the processes still
+// in the run's process group.
+//
+// `runChildProcess` spawns detached, so the direct child leads a process group,
+// and signalling `-processGroupId` only reaches that group. Tool commands break
+// it: a `timeout`-wrapped command (`timeout 900 pnpm --filter server exec vitest
+// ...`) makes `timeout` place its payload in a NEW process group via
+// `setpgid(0, 0)` — same session, different group — so the payload and everything
+// it spawns (pnpm, tsc, vitest, embedded postgres fixtures) sit outside the run's
+// group and survive the group signal.
+//
+// The comment above the codex_local SIGINT special case below records the same
+// failure mode being worked around for one adapter only. This is the general
+// fix: `PAPERCLIP_RUN_ID` is assigned to the run's child and inherited by every
+// descendant regardless of which process group it ended up in, so sweeping by
+// run id reaches whatever the group signal missed.
+//
+// The run id is required rather than optional so no caller can silently take the
+// group-only path that leaves descendants behind.
+// Exported for the regression test that proves cancellation reaches descendants
+// outside the run's process group. Not part of the service surface: callers
+// inside this module use it directly, and `heartbeatService(...).cancelRun` is
+// the supported entry point.
+export async function terminateHeartbeatRunProcess(input: {
+  runId: string;
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
   graceMs?: number;
@@ -8916,6 +8940,21 @@ async function terminateHeartbeatRunProcess(input: {
     },
     { forceAfterMs: input.graceMs, signal: input.signal },
   );
+
+  // Companion to the group signal above: catch descendants that a `timeout`-wrapped
+  // tool command moved into a process group of its own. Best effort, and it runs
+  // after the group signal so a sweep failure can never turn a successful
+  // cancellation into a failure. The direct child is excluded because the group
+  // signal already owned it.
+  if (input.runId) {
+    try {
+      sweepRunDescendantsByRunId(input.runId, input.signal ?? "SIGKILL", {
+        excludePids: [typeof pid === "number" && pid > 0 ? pid : process.pid],
+      });
+    } catch {
+      // The group signal already ran.
+    }
+  }
 }
 
 function buildProcessLossMessage(
@@ -15118,6 +15157,7 @@ export function heartbeatService(
         }
         if (running) {
           await terminateHeartbeatRunProcess({
+            runId: run.id,
             pid: running.child.pid,
             processGroupId: running.processGroupId,
             graceMs: Math.max(1, running.graceSec) * 1000,
@@ -29029,6 +29069,7 @@ export function heartbeatService(
             });
             if (running) {
               await terminateHeartbeatRunProcess({
+                runId: run.id,
                 pid: running.child.pid,
                 processGroupId: running.processGroupId,
                 // Codex handles Ctrl-C by cancelling its tool sessions. SIGTERM
@@ -29242,6 +29283,7 @@ export function heartbeatService(
         const running = runningProcesses.get(run.id);
         if (running) {
           await terminateHeartbeatRunProcess({
+            runId: run.id,
             pid: running.child.pid,
             processGroupId: running.processGroupId,
             graceMs: Math.max(1, running.graceSec) * 1000,
