@@ -135,6 +135,81 @@ if (!embeddedPostgresSupport.supported) {
 }
 const provisionWorktreeScriptPath = new URL("../../../scripts/provision-worktree.sh", import.meta.url);
 
+/**
+ * The real provision-worktree.sh picks a config writer in this order: the base
+ * repo's CLI, then `pnpm paperclipai`, then a bare `paperclipai` on PATH, and
+ * only then its own fallback writer. The temp-repo fixtures below have no
+ * `cli/node_modules` and do not resolve `pnpm paperclipai`, so on a host that
+ * has a globally installed paperclipai (an agent workstation running this suite
+ * in-process inherits that PATH) the script binds to that unrelated binary
+ * instead of the fallback. A newer global CLI rejects the fixtures' minimal
+ * stub config and exits 1, and the suite reports 5 failures that exist on no
+ * clean CI runner.
+ *
+ * These tests assert about pnpm install behaviour, never about whichever
+ * paperclipai happens to be installed on the host, so the fixture must not
+ * inherit one. Restrict PATH to the toolchain dirs (node, pnpm, git, core
+ * utilities) and drop any directory that provides a `paperclipai` binary. This
+ * makes the suite deterministic on an agent workstation and in CI alike
+ * without weakening a single assertion.
+ */
+function hostToolchainPath() {
+  const separator = process.platform === "win32" ? ";" : ":";
+  const currentPath = process.env.PATH ?? "";
+  const retained = currentPath
+    .split(separator)
+    .filter((entry) => entry.length > 0)
+    .filter((entry) => {
+      try {
+        return !existsSync(path.join(entry, "paperclipai"));
+      } catch {
+        // An unreadable PATH entry cannot be proven to host a paperclipai
+        // binary, and the fixture still works when it holds only toolchain
+        // executables. Keep it.
+        return true;
+      }
+    });
+  return retained.join(separator);
+}
+
+const originalProcessPath = process.env.PATH;
+
+describe("hostToolchainPath", () => {
+  it("drops every PATH entry that provides a paperclipai binary", async () => {
+    // Guards KEE-980. A seat-global paperclipai on PATH makes the real
+    // provision-worktree.sh pick an unrelated CLI as its config writer, and a
+    // newer global CLI rejects these fixtures' stub config. The suite must stay
+    // green on an agent workstation exactly as it is in CI, so the isolation
+    // below has to hold for any install location, not just the one reported.
+    const separator = process.platform === "win32" ? ";" : ":";
+    const fakeBinDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-host-cli-"));
+    const toolchainDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-host-toolchain-"));
+    try {
+      await fs.writeFile(path.join(fakeBinDir, "paperclipai"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+      await fs.writeFile(path.join(toolchainDir, "git"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+      const previousPath = process.env.PATH;
+      process.env.PATH = [fakeBinDir, toolchainDir, ...(previousPath ?? "").split(separator)]
+        .filter((entry) => entry.length > 0)
+        .join(separator);
+      try {
+        const filtered = hostToolchainPath().split(separator);
+        expect(filtered).not.toContain(fakeBinDir);
+        expect(filtered).toContain(toolchainDir);
+      } finally {
+        if (previousPath === undefined) {
+          delete process.env.PATH;
+        } else {
+          process.env.PATH = previousPath;
+        }
+      }
+    } finally {
+      await fs.rm(fakeBinDir, { recursive: true, force: true });
+      await fs.rm(toolchainDir, { recursive: true, force: true });
+    }
+  });
+});
+
 async function runGit(cwd: string, args: string[]) {
   await execFileAsync("git", args, { cwd });
 }
@@ -766,6 +841,29 @@ describe("ensureServerWorkspaceLinksCurrent", () => {
 });
 
 describe("realizeExecutionWorkspace", () => {
+  // These cases copy the real scripts/provision-worktree.sh into a temp fixture
+  // repo and assert on pnpm install behaviour. The script resolves its config
+  // writer by probing the base repo, then `pnpm paperclipai`, then a bare
+  // `paperclipai` on PATH, and only then falls back to its own writer. A fixture
+  // repo has no CLI and no resolvable `pnpm paperclipai`, so a host-installed
+  // paperclipai wins that probe. An agent workstation running this suite
+  // in-process inherits its seat-global install on PATH; a newer global CLI then
+  // rejects the fixture's minimal stub config and the provision subprocess exits
+  // 1, which surfaces as 5 failures that reproduce on no clean CI runner.
+  //
+  // Run the whole block against a PATH that carries the toolchain but no
+  // paperclipai, so the fixture provably takes the script's own fallback writer
+  // and the result depends only on the checked-in code. Assertions are
+  // untouched: this isolates the setup, it does not accommodate the
+  // environment. See KEE-980.
+  beforeAll(() => {
+    process.env.PATH = hostToolchainPath();
+  });
+
+  afterAll(() => {
+    process.env.PATH = originalProcessPath;
+  });
+
   it("defaults new git worktrees to freshly fetched origin/master", async () => {
     const sourceRepo = await createTempRepo("master");
     const remoteDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-worktree-remote-"));
