@@ -31,16 +31,32 @@ function isRecoveryBudgetExhausted(evidence: Record<string, unknown>) {
 }
 
 /**
- * No expiry path in this codebase compares `issue_recovery_actions.timeout_at`.
- * A deadline written without a live consumer is the same deadlock with a date
- * printed on it, so refuse the write instead of persisting an unconsumable one.
+ * True once a deadline settler has already spent this action's expiry.
+ *
+ * The settler writes this token itself and is its only writer, but this service
+ * is a second writer of the same row: a same-identity re-write replaces
+ * `evidence` wholesale and resets `status` to "active". Without a short-circuit
+ * here, any later writer that does not preserve the evidence (the watchdog
+ * finalizer deliberately does not) would wipe the token, revert the escalation
+ * and hand the row back to the sweep — so one expiry would be reported to the
+ * board twice. Treat a settled deadline the way an exhausted budget is treated:
+ * the identity is spent, and only a genuinely new identity may supersede it.
+ */
+function isDeadlineSettled(evidence: Record<string, unknown>) {
+  return typeof evidence.deadlineSettledAt === "string" && evidence.deadlineSettledAt.length > 0;
+}
+
+/**
+ * A deadline with no live consumer is a deadlock with a date printed on it, so
+ * refuse the write at authoring time rather than persisting one that nothing
+ * will ever move. Name the consumer that actually settles the action.
  */
 function assertTimeoutHasSettler(input: UpsertIssueRecoveryActionInput) {
   if (input.timeoutAt && !input.timeoutSettler) {
     throw new Error(
       `Recovery action ${input.kind} (${input.cause}) sets timeoutAt without a timeoutSettler. ` +
-        "Nothing reads issue_recovery_actions.timeout_at, so the action would never expire. " +
-        "Name the live consumer that settles this action, or drop the deadline.",
+        "Name the live consumer that settles this action; a deadline that no settler reads " +
+        "never expires, which is the same deadlock with a date printed on it.",
     );
   }
 }
@@ -334,6 +350,12 @@ export function issueRecoveryActionService(db: Db) {
       // beyond the advertised cap. A distinct identity can still supersede the
       // exhausted action through the branch above.
       if (isRecoveryBudgetExhausted(existing.evidence ?? {})) {
+        return existing;
+      }
+      // A deadline the settler has already spent is the same kind of spent
+      // identity. Re-writing it would erase the claim token and the escalation,
+      // which hands the row back to the sweep and reports one expiry twice.
+      if (isDeadlineSettled(existing.evidence ?? {})) {
         return existing;
       }
       const nextAttemptCount =

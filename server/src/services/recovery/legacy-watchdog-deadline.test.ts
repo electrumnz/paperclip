@@ -350,6 +350,67 @@ const support = externalDatabaseUrl
       expect(settlerIndex).toBeGreaterThan(chainIndex);
     });
 
+    /**
+     * Regression for the blocking finding in independent review (2026-09-28):
+     * `deadlineSettledAt` is the token that makes the settler idempotent, and
+     * the settler is its only writer. But `upsertSourceScoped` replaces
+     * `evidence` wholesale and resets `status` to "active" on a same-identity
+     * re-write, so a repeated finalizer pass wiped the token and reverted the
+     * escalation.
+     *
+     * The two features interact badly. `preserveExistingTimeout` keeps
+     * `timeout_at` in the past, which is exactly what makes the rewritten row
+     * eligible for the next sweep — so the fix for "the deadline slides
+     * forever" is what opened the double-settlement path. The settler then
+     * commented about the same expiry a second time, which is the noisy,
+     * untrustworthy-escalation failure this change exists to remove.
+     *
+     * A repeated pass is in scope by design, not hypothetical: the watchdog
+     * sets `preserveExistingTimeout` and `attemptCount: 1` precisely so a
+     * repeated stranded-work sweep stays idempotent. The settlement has to
+     * survive the same repeat.
+     */
+    it("keeps a settled deadline escalated when the finalizer runs again", async () => {
+      const run = await seedTerminalLegacyRun();
+      await terminalizeLegacyExecution({ db, run, status: "failed" });
+      const past = new Date(Date.now() + LEGACY_WATCHDOG_DEADLINE_MS + 60_000);
+      const recovery = createSettler();
+
+      await recovery.settleExpiredRecoveryActionDeadlines({ now: past });
+      expect((await readAction())!.status).toBe("escalated");
+
+      // The repeated finalizer pass a stranded-work sweep makes over the same
+      // already-terminal run.
+      await terminalizeLegacyExecution({
+        db,
+        run: { ...run, status: "failed" },
+        status: "failed",
+      });
+
+      const rewritten = await readAction();
+      // The claim token must survive the rewrite: it is the only thing keeping
+      // this row out of the next sweep.
+      expect(
+        (rewritten!.evidence as Record<string, any>).deadlineSettledAt,
+      ).toBeTruthy();
+      // And an escalation the board owns must not silently revert to an
+      // unattended `active`, which would read as "still being worked on".
+      expect(rewritten!.status).toBe("escalated");
+
+      const again = await recovery.settleExpiredRecoveryActionDeadlines({ now: past });
+      expect(again.expired).toBe(0);
+
+      const comments = await db
+        .select()
+        .from(issueComments)
+        .where(eq(issueComments.issueId, issueId));
+      const expiryComments = comments.filter((c) =>
+        /reconciliation deadline passed/.test(c.body),
+      );
+      // One expiry, one comment. Not two.
+      expect(expiryComments.length).toBe(1);
+    });
+
     it("does not settle before the deadline passes", async () => {
       const run = await seedTerminalLegacyRun();
       await terminalizeLegacyExecution({ db, run, status: "failed" });
