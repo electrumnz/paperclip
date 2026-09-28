@@ -26,7 +26,7 @@ describeEmbeddedPostgres("agent config revision snapshots", () => {
     const started = await startEmbeddedPostgresTestDatabase("agent-config-revision-snapshots");
     stopDb = started.cleanup;
     db = createDb(started.connectionString);
-  }, 20_000);
+  }, 30_000);
 
   afterAll(async () => {
     await stopDb?.();

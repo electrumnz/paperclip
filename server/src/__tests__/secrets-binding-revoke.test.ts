@@ -51,7 +51,7 @@ describeEmbeddedPostgres("DELETE /secrets/:secretId/bindings/:bindingId", () => 
     stopDb = started.cleanup;
     lockDb = createDb(connectionString, { maxConnections: 1, applicationName: "secret-binding-revoke-lock" });
     db = createDb(connectionString);
-  }, 20_000);
+  }, 30_000);
 
   afterEach(async () => {
     await db.delete(activityLog);
