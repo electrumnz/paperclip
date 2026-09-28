@@ -43,8 +43,9 @@ type ReleasePackageEntry = { dir: string; name: string };
 // scripts/release.sh, and it had already drifted: cursor-local, gemini-local and
 // opencode-local all declare "skills" in files[] and were staged without one, and
 // `pnpm pack` omits a missing files[] entry without failing, so those adapters
-// shipped with no skills at all. Derive the set from the same release manifest
-// this function already reads, so it cannot drift again.
+// shipped with no skills at all. Derive the set from the same workspace closure
+// this function already reads, using each package's own files[], so it cannot
+// drift again.
 export function resolveGitInstallSkillPackageDirs(checkoutPath: string): string[] {
   return resolveGitInstallWorkspacePackages(checkoutPath)
     .filter((entry) => {
@@ -410,11 +411,13 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       throw new Error(`Git install packaging produced ${workspaceTarballs.length} workspace tarballs; expected ${workspacePackages.length}.`);
     }
     await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
-    // @paperclipai/server is the only package with bundleDependencies, so it is
-    // the only one that takes the prepare-bundled-package branch. Report that
-    // branch explicitly and refuse to publish a payload whose server package has
-    // no ui-dist: the install would succeed and then serve an API with no board,
-    // which is a worse failure than the crash this replaced.
+    // Three packages declare bundleDependencies (@paperclipai/server, packages/db,
+    // packages/adapter-utils), so all three take the prepare-bundled-package branch.
+    // @paperclipai/server is the only one of them whose files[] includes ui-dist,
+    // which is why the check below is scoped to it. Report that branch explicitly
+    // and refuse to publish a payload whose server package has no ui-dist: the
+    // install would succeed and then serve an API with no board, which is a worse
+    // failure than the crash this replaced.
     const serverEntries = describePackagedWorkspaceEntries(stagedPayload, "@paperclipai/server", ["ui-dist", "skills"]);
     console.log(
       `  -> @paperclipai/server staged via prepare-bundled-package (bundleDependencies): ui-dist=${serverEntries["ui-dist"] ? "present" : "MISSING"}, skills=${serverEntries.skills ? "present" : "MISSING"}`,
