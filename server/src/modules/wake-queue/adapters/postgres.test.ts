@@ -357,6 +357,11 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     if (status === "in_progress") {
       expect(blockedIssue.blockedTransitionAt).not.toBeNull();
       expect(entries[0]).toMatchObject({ action: "issue.updated", details: { status: "blocked", previousStatus: "in_progress" } });
+      // A `blocked` card with no first-class blocker and no unblockDescriptor is
+      // invisible to every view and owner queue. This path creates the block, so it
+      // must attach a board-owned descriptor in the same update.
+      expect(blockedIssue.unblockDescriptor).toMatchObject({ owner: "board" });
+      expect(typeof blockedIssue.unblockDescriptor?.action).toBe("string");
     } else expect(entries).toHaveLength(0);
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)))[0].status).toBe("deferred_issue_execution");
     const action = (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))[0];
