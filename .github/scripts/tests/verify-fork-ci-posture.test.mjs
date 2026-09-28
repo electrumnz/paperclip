@@ -157,12 +157,50 @@ test("active workflow with the secret missing fails", () => {
   assert.match(r.stdout, /RESULT: FAIL/);
 });
 
-test("a failed secret listing is unverified, not proof the secret is missing", () => {
+// The secret-list case carries three distinct outcomes, and conflating any two
+// of them sends the reader to the wrong action:
+//   listed + name present  -> OK
+//   listed + name absent   -> the secret really is unbound, advise a disable
+//   unreadable             -> an access failure, NOT evidence of absence, and
+//                             must print no disable advice at all
+test("a failed secret listing is unverified, and never advises a disable", () => {
   const r = runGuard({ forkWorkflow: "active", secretList: { fail: true } });
-  // Active + unreadable secrets is the dangerous state: it may be unbound.
-  // It must never read as a pass.
   assert.equal(r.status, 1);
   assert.match(r.stdout, /RESULT: FAIL/);
+  // The diagnosis: a read failure, not a claim about the secret.
+  assert.match(r.stdout, /UNVERIFIED the review workflow is ACTIVE but the secret list/);
+  assert.match(r.stdout, /access or read failure/);
+  assert.match(r.stdout, /NOT evidence\s+that COMMITPERCLIP_KEY is unbound/);
+  // And the remedy it must not offer. A caller who cannot read secrets is the
+  // one person least able to act on a disable instruction, and the instruction
+  // would be unfounded anyway.
+  assert.doesNotMatch(r.stdout, /is not bound/);
+  assert.doesNotMatch(r.stdout, /workflow disable/);
+  for (const call of calls(r)) assert.doesNotMatch(call, /workflow disable/);
+});
+
+// Distinguishes the two ways a listing can come back empty. gh exiting 0 with
+// no output is a real, readable "this repo has no secrets" and does justify a
+// FAIL; gh failing is an access error and must not.
+test("an empty but readable listing is evidence of absence, a failed one is not", () => {
+  const empty = runGuard({ forkWorkflow: "active", secrets: [] });
+  assert.equal(empty.status, 1);
+  assert.match(empty.stdout, /FAIL review workflow is ACTIVE but COMMITPERCLIP_KEY is not bound/);
+  assert.match(empty.stdout, /The secret list was read and does not contain COMMITPERCLIP_KEY/);
+  assert.match(empty.stdout, /workflow disable/);
+
+  const unreadable = runGuard({ forkWorkflow: "active", secretList: { fail: true } });
+  assert.equal(unreadable.status, 1);
+  assert.doesNotMatch(unreadable.stdout, /is not bound/);
+  assert.doesNotMatch(unreadable.stdout, /workflow disable/);
+});
+
+// A secret list that fails only on the structured form still falls back to the
+// plain listing, and a failure on both is what "unreadable" means.
+test("the unreadable verdict needs both attempts to fail", () => {
+  const structuredOnly = runGuard({ forkWorkflow: "active", secrets: [SECRET_NAME], secretList: { structured: false } });
+  assert.equal(structuredOnly.status, 0, structuredOnly.stdout);
+  assert.doesNotMatch(structuredOnly.stdout, /UNVERIFIED/);
 });
 
 test("disabled workflow needs no credential and passes", () => {

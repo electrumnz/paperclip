@@ -68,16 +68,30 @@ lookup_state() {
 # "NAME<TAB>UPDATED". Both are cut at the tab so matching stays exact-name
 # whichever shape comes back: `grep -qx` against a tabbed line can never
 # match, which would read a bound secret as missing.
+#
+# A non-empty listing on stdout is the only thing counted as evidence that the
+# repo has no secrets. An empty listing is ambiguous: gh can exit 0 having
+# printed nothing because the caller cannot read secrets. So the result is
+# reported separately from the names, and the caller must not treat "could not
+# read" as "the secret is absent" — those lead to opposite actions.
+#
+# SECRETS_STATUS: listed | unreadable
+# SECRETS_NAMES:  the names, one per line, only when SECRETS_STATUS=listed
 secret_names() {
   local raw
   if raw=$(gh secret list --repo "$REPO" --json name --jq '.[].name' 2>/dev/null); then
-    printf '%s\n' "$raw" | cut -f1
+    SECRETS_NAMES=$(printf '%s\n' "$raw" | cut -f1)
+    SECRETS_STATUS="listed"
     return 0
   fi
   if raw=$(gh secret list --repo "$REPO" 2>/dev/null); then
-    printf '%s\n' "$raw" | cut -f1
+    SECRETS_NAMES=$(printf '%s\n' "$raw" | cut -f1)
+    SECRETS_STATUS="listed"
     return 0
   fi
+  # Both attempts failed: a read or access failure, not an empty secret store.
+  SECRETS_NAMES=""
+  SECRETS_STATUS="unreadable"
   return 1
 }
 
@@ -100,10 +114,23 @@ echo
 case "$WF_LOOKUP" in
   ok)
     if [[ "$WF_STATE" == "active" ]]; then
-      if secret_names | grep -Fxq -- "$SECRET_NAME"; then
+      # The three outcomes are kept apart. "Could not read the secret list" is
+      # an access failure; "the list was read and the name is not in it" is
+      # evidence of absence. Only the second justifies advising a disable, and
+      # the first must never print that advice, because a caller who cannot
+      # read secrets is the one person least able to act on it.
+      secret_names
+      if [[ "$SECRETS_STATUS" != "listed" ]]; then
+        fail "UNVERIFIED the review workflow is ACTIVE but the secret list on $REPO"
+        echo "          could not be read (gh failed on both --json name and the plain"
+        echo "          listing). This is an access or read failure. It is NOT evidence"
+        echo "          that $SECRET_NAME is unbound, so no disable is advised."
+        echo "          Re-run with a token that can read secrets on $REPO."
+      elif grep -Fxq -- "$SECRET_NAME" <<<"$SECRETS_NAMES"; then
         echo "OK   review workflow active AND $SECRET_NAME bound"
       else
         fail "FAIL review workflow is ACTIVE but $SECRET_NAME is not bound."
+        echo "     The secret list was read and does not contain $SECRET_NAME."
         echo "     Every pull_request_target will fail at 'Generate commitperclip token'."
         echo "     Disable it:  gh workflow disable $WF_PATH --repo $REPO"
       fi
