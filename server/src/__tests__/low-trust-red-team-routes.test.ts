@@ -139,7 +139,12 @@ async function settleSeededHeartbeatRuns(db: Db, runIds: Set<string>) {
 // `fixture.runs.standardReport`, which belongs to the same `standard` agent and
 // is the very run the 409 assertion further down depends on, silently
 // weakening the guard this suite exists to prove.
-async function settleStrayRunsForIssue(
+//
+// This variant returns the settled count, so a caller that needs to know
+// whether anything was still running does not have to repeat the select. Same
+// scoping (agent AND contextSnapshot.issueId), same 3-pass bound, same single
+// drain per pass; this only surfaces the result.
+async function settleStrayRunsForIssueReturningCount(
   db: Db,
   heartbeat: ReturnType<typeof heartbeatService>,
   agentId: string,
@@ -165,12 +170,22 @@ async function settleStrayRunsForIssue(
     const matching = running
       .filter((run) => run.contextSnapshot?.issueId === issueId)
       .map((run) => run.id);
-    if (matching.length === 0) return;
+    if (matching.length === 0) return 0;
     await db
       .update(heartbeatRuns)
       .set({ status: "succeeded", finishedAt: new Date() })
       .where(inArray(heartbeatRuns.id, matching));
   }
+  return 1;
+}
+
+async function settleStrayRunsForIssue(
+  db: Db,
+  heartbeat: ReturnType<typeof heartbeatService>,
+  agentId: string,
+  issueId: string,
+) {
+  await settleStrayRunsForIssueReturningCount(db, heartbeat, agentId, issueId);
 }
 
 // Each `PATCH /api/issues/:id` dispatches its wakeup fire-and-forget
@@ -223,25 +238,22 @@ async function quiesceAssignedReviewForWrite(
   // drain+settle until the issue is clear or the pass bound is reached. The
   // bound is a backstop; a loaded runner that cannot converge in this many
   // passes fails the write loudly below rather than passing quietly.
+  //
+  // The check is the one `settleStrayRunsForIssue` already performs internally:
+  // it selects the agent's running runs, filters them to this issue, and only
+  // writes when the match is non-empty. Re-querying here duplicated that
+  // select on every pass of every one of the six writes, and each extra query
+  // is contention-bound on a loaded host — which is what pushed the
+  // `afterEach` teardown past 30s in one measured run. One check per pass is
+  // enough: if the helper found nothing to settle, the issue is clear.
   for (let pass = 0; pass < 5; pass += 1) {
-    await settleStrayRunsForIssue(db, heartbeat, agentId, issueId);
-    const stillRunning = await db
-      .select({
-        id: heartbeatRuns.id,
-        contextSnapshot: heartbeatRuns.contextSnapshot,
-      })
-      .from(heartbeatRuns)
-      .where(
-        and(
-          eq(heartbeatRuns.agentId, agentId),
-          eq(heartbeatRuns.status, "running"),
-        ),
-      );
-    const matching = stillRunning.filter(
-      (run) =>
-        (run.contextSnapshot as { issueId?: unknown } | null)?.issueId === issueId,
+    const settled = await settleStrayRunsForIssueReturningCount(
+      db,
+      heartbeat,
+      agentId,
+      issueId,
     );
-    if (matching.length === 0) break;
+    if (settled === 0) break;
   }
   // Release the execution lock a re-checkout may have re-taken. The block under
   // test exercises the stop relay, not run ownership, and the seeded lock was
