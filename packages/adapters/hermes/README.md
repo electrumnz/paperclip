@@ -340,3 +340,7 @@ MIT — see [LICENSE](LICENSE)
 - [Paperclip](https://github.com/paperclipai/paperclip) — The orchestration platform
 - [Nous Research](https://nousresearch.com) — The team behind Hermes
 - [Paperclip Docs](https://docs.paperclip.ing) — Paperclip documentation
+
+### Large local prompts
+
+The local adapter sends prompts of 128 KiB or more through `hermes chat --query-file -` on stdin. The CLI must advertise `--query-file` in its help output. Smaller prompts retain the `-q` transport. The full prompt is preserved; no task history is truncated.

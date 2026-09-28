@@ -63,6 +63,12 @@ export interface RunProcessResult {
   // duplex control channel died before a clean completion.
   errorCode?: string | null;
   terminalResultCleanup?: TerminalResultCleanupEvidence | null;
+  // The message of a stdin write that the child refused (EPIPE when the child
+  // exits before draining its input), or absent when stdin was never written or
+  // the write completed. Additive-optional for the same reason as the fields
+  // above: the run's exit status already reports the child's own failure, and
+  // this names the side-channel failure that went with it.
+  stdinWriteError?: string | null;
 }
 
 export interface TerminalResultCleanupOptions {
@@ -4688,6 +4694,7 @@ export async function runChildProcess(
         let terminalCleanupKillTimer: NodeJS.Timeout | null = null;
         let terminalResultStdoutScanOffset = 0;
         let terminalResultStderrScanOffset = 0;
+        let stdinWriteError: Error | null = null;
 
         const clearTerminalCleanupTimers = () => {
           if (terminalCleanupTimer) clearTimeout(terminalCleanupTimer);
@@ -4807,10 +4814,32 @@ export async function runChildProcess(
 
         const stdin = child.stdin;
         if (opts.stdin != null && stdin) {
+          // A child that exits before it drains stdin (bad flag, early crash,
+          // a fast nonzero exit) closes the pipe and the pending write fails
+          // with EPIPE. `child.stdin` is an EventEmitter with no default error
+          // handling: an unhandled 'error' event takes down the whole Paperclip
+          // server, not just this run. The run's own result already reports the
+          // child's exit status, so record the write failure as a log line and
+          // let the child close the promise.
+          stdin.on("error", (err: Error) => {
+            stdinWriteError = err;
+            void opts.onLog(
+              "stderr",
+              `[runChildProcess] stdin write failed after the child closed its input: ${err.message}\n`,
+            );
+          });
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
-            stdin.write(opts.stdin as string);
-            stdin.end();
+            try {
+              stdin.write(opts.stdin as string);
+              stdin.end();
+            } catch (err) {
+              stdinWriteError = err instanceof Error ? err : new Error(String(err));
+              void opts.onLog(
+                "stderr",
+                `[runChildProcess] stdin write failed synchronously: ${stdinWriteError.message}\n`,
+              );
+            }
           });
         }
 
@@ -4850,6 +4879,7 @@ export async function runChildProcess(
                     stderr,
                     pid: child.pid ?? null,
                     startedAt,
+                    stdinWriteError: stdinWriteError ? stdinWriteError.message : null,
                     terminalResultCleanup: terminalCleanupStarted
                       ? {
                           kind: "terminal_result_cleanup",
