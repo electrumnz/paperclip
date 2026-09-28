@@ -84,6 +84,13 @@ export type RunProcessCleanupOutcome =
       adapterType: string;
       pid?: number | null;
       processGroupId?: number | null;
+      /**
+       * Present when the run's own process was already gone but attributed
+       * descendants were still alive and were signalled. In that case
+       * `attempted` is `true` and `outcome` is `terminated`, so this field only
+       * appears on branches that already attempt termination.
+       */
+      escapedDescendantsSignaled?: number;
     }
   | {
       attempted: true;
@@ -92,9 +99,9 @@ export type RunProcessCleanupOutcome =
       pid: number | null;
       processGroupId: number | null;
       // Present only when the run-id sweep found and signalled descendants that
-      // had escaped the run's process group (a `set +m` login shell puts each
-      // backgrounded job in a new group). Absent when there were none, so an
-      // existing consumer that does not know about it is unaffected.
+      // had escaped the run's process group (a `timeout`-wrapped command puts its
+      // payload in a new group). Absent when there were none, so an existing
+      // consumer that does not know about it is unaffected.
       escapedDescendantsSignaled?: number;
     }
   | {

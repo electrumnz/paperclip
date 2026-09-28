@@ -215,20 +215,62 @@ function isLivePid(pid: number): boolean {
   }
 }
 
+// Re-read the run id immediately before signalling, so a pid recycled between the
+// scan and the kill is not signalled on the strength of a stale attribution.
+//
+// Without this, a `timeout`-wrapped run that exits during the sweep frees its pid
+// for an unrelated process, and we would send a signal to a process that has
+// nothing to do with the run. Linux reuses pids freely under memory pressure,
+// which is exactly the condition under which this sweep runs. The cost is a
+// second /proc read per candidate; the candidates are few.
+//
+// The reader is passed in rather than imported so the scan and the recheck
+// necessarily use the same attribution source. A recheck that silently fell back
+// to /proc while the scan used an injected reader would be a different check from
+// the one the caller asked for.
+function stillAttributedToRun(
+  pid: number,
+  runId: string,
+  readRunId: (pid: number) => string | null,
+): boolean {
+  return readRunId(pid) === runId;
+}
+
 export interface RunDescendantSweepOptions {
-  /** Pids to never signal, regardless of run id. Defaults to this process. */
+  /**
+   * Extra pids to never signal. These are UNIONed with this process, never
+   * substituted for it: a caller must not be able to make the server itself
+   * sweepable by omitting its own pid from the exclusion set.
+   */
   excludePids?: Iterable<number>;
   /** Injectable pid source; defaults to a /proc scan. Test seam only. */
   listPids?: () => number[];
+  /**
+   * Injectable attribution reader. Test seam only; defaults to /proc.
+   * Production must not override it, or the pid-reuse guard is meaningless.
+   */
+  readRunId?: (pid: number) => string | null;
+  /**
+   * Skip the pre-signal attribution recheck. Test seam only: setting this
+   * bypasses the PID-reuse guard, so it exists purely to exercise the failure
+   * branch deterministically.
+   */
+  skipIdentityRecheck?: boolean;
 }
 
 export interface RunDescendantSweepResult {
   /** Ids swept, i.e. processes matching the run id other than the excluded set. */
   matchedRunIds: string[];
-  /** Pids that were alive and signalled, grouped by process group. */
+  /** Pids that were alive, still attributed to the run, and were signalled. */
   signaledPids: number[];
   /** Pids that matched but had already exited by the time we signalled. */
   alreadyExited: number[];
+  /**
+   * Pids whose run id no longer matched at the moment before signalling. These
+   * are almost always pid reuse: the pid existed when we scanned it and belongs
+   * to something else by the time we act. Deliberately NOT signalled.
+   */
+  attributionLost: number[];
   /** Ids deliberately skipped because they were in the exclusion set. */
   excludedPids: number[];
 }
@@ -241,24 +283,34 @@ function defaultListPids(): number[] {
 
 /**
  * Signal every live process that carries `runId` in its environment, excluding
- * the run's own child and `excludePids`.
+ * this process and `excludePids`.
  *
  * This is a companion to the process-group signal, not a replacement: the group
- * signal stays the fast path, and this catches descendants that `set +m`
- * detached into a group of their own. Both are needed because neither alone
- * reaches the whole run.
+ * signal stays the fast path, and this catches descendants that a
+ * `timeout`-wrapped command placed in a process group of their own. Both are
+ * needed because neither alone reaches the whole run.
+ *
+ * The sweep does not depend on the run's own process being alive. The orphan case
+ * -- Hermes and the main process group already gone, `timeout`/login-shell
+ * descendants still holding memory -- is precisely the case that needs this, and
+ * gating on main-process liveness would skip it.
  */
 export function sweepRunDescendantsByRunId(
   runId: string,
   signal: NodeJS.Signals,
   options: RunDescendantSweepOptions = {},
 ): RunDescendantSweepResult {
-  const exclude = new Set<number>(options.excludePids ?? [process.pid]);
+  // Union, never replace: this process is excluded unconditionally so no caller
+  // can make the Paperclip server sweepable by passing its own excludePids.
+  const exclude = new Set<number>(options.excludePids ?? []);
+  exclude.add(process.pid);
   const listPids = options.listPids ?? defaultListPids;
+  const readRunId = options.readRunId ?? readRunIdFromProc;
   const result: RunDescendantSweepResult = {
     matchedRunIds: [],
     signaledPids: [],
     alreadyExited: [],
+    attributionLost: [],
     excludedPids: [],
   };
   if (!runId) return result;
@@ -273,10 +325,18 @@ export function sweepRunDescendantsByRunId(
       result.excludedPids.push(pid);
       continue;
     }
-    if (readRunIdFromProc(pid) !== runId) continue;
+    if (readRunId(pid) !== runId) continue;
     seenRunIds.add(runId);
     if (!isLivePid(pid)) {
       result.alreadyExited.push(pid);
+      continue;
+    }
+    // Re-attribute immediately before signalling. Between the scan above and this
+    // point the original process may have exited and had its pid reused; the run
+    // id in /proc is then someone else's, and signalling it would be a
+    // cross-run kill.
+    if (!options.skipIdentityRecheck && !stillAttributedToRun(pid, runId, readRunId)) {
+      result.attributionLost.push(pid);
       continue;
     }
     try {

@@ -177,4 +177,113 @@ describe.skipIf(!IS_LINUX)("sweepRunDescendantsByRunId", () => {
     expect(result.matchedRunIds).toEqual([]);
     expect(pidAlive(process.pid)).toBe(true);
   });
+
+  // Operator review finding: the exclusion set used to be REPLACED by the
+  // caller's excludePids, so any caller could make this process sweepable by
+  // omitting it. The union must hold no matter what the caller passes.
+  describe("exclusion is a union, never a replacement", () => {
+    it("always excludes this process even when the caller omits it", () => {
+      const result = sweepRunDescendantsByRunId("some-run", "SIGKILL", {
+        // A pid list that contains this process and nothing else. The run id does
+        // not even match, so nothing should be signalled -- but the guard we are
+        // testing is that the exclusion, not the mismatch, is what protects us.
+        listPids: () => [process.pid],
+        excludePids: [999_999],
+      });
+      expect(result.signaledPids).toEqual([]);
+      expect(result.excludedPids).toEqual([process.pid]);
+    });
+
+    it("excludes this process when excludePids is undefined", () => {
+      const result = sweepRunDescendantsByRunId("some-run", "SIGKILL", {
+        listPids: () => [process.pid],
+      });
+      expect(result.excludedPids).toEqual([process.pid]);
+      expect(pidAlive(process.pid)).toBe(true);
+    });
+
+    it("keeps caller exclusions alongside this process", () => {
+      const result = sweepRunDescendantsByRunId("some-run", "SIGKILL", {
+        listPids: () => [process.pid, 999_999],
+        excludePids: [999_999],
+      });
+      expect(result.excludedPids.sort()).toEqual([999_999, process.pid].sort());
+    });
+  });
+
+  // Operator review finding: between the /proc scan and the kill, a pid can be
+  // reused. Signalling on stale attribution would kill an unrelated process.
+  describe("pid reuse guard", () => {
+    it("does not signal a pid whose run id changed after the scan", () => {
+      // Real, live children: the sweep checks liveness before the recheck, so a
+      // fabricated pid would be recorded as alreadyExited and never reach the
+      // branch under test. The reader reports the run id on the scanning call and
+      // a different one on the pre-signal recheck, which is exactly what pid reuse
+      // looks like from the sweep's side.
+      const marker = `reuse-${process.pid}-${Date.now()}`;
+      const a = spawn("/bin/bash", ["-c", "sleep 120"], {
+        stdio: "ignore",
+        env: { ...process.env, PAPERCLIP_RUN_ID: marker },
+      });
+      const b = spawn("/bin/bash", ["-c", "sleep 120"], {
+        stdio: "ignore",
+        env: { ...process.env, PAPERCLIP_RUN_ID: marker },
+      });
+      try {
+        expect(a.pid).toBeTypeOf("number");
+        expect(b.pid).toBeTypeOf("number");
+
+        const calls = new Map<number, number>();
+        const result = sweepRunDescendantsByRunId(marker, "SIGKILL", {
+          listPids: () => [a.pid!, b.pid!],
+          readRunId: (pid) => {
+            const n = (calls.get(pid) ?? 0) + 1;
+            calls.set(pid, n);
+            // First read attributes to our run; the recheck does not.
+            return n === 1 ? marker : "some-other-run";
+          },
+          excludePids: [],
+        });
+
+        expect(result.attributionLost.sort()).toEqual([a.pid!, b.pid!].sort());
+        expect(result.signaledPids).toEqual([]);
+        // Both are still running: the guard protected them rather than
+        // coincidentally killing them.
+        expect(pidAlive(a.pid!)).toBe(true);
+        expect(pidAlive(b.pid!)).toBe(true);
+      } finally {
+        for (const p of [a.pid, b.pid]) {
+          try {
+            process.kill(p!, "SIGKILL");
+          } catch {
+            // already gone
+          }
+        }
+      }
+    });
+
+    it("signals a pid that is still attributed to the run at recheck time", () => {
+      // A live child we own. Its run id is stable across both reads, so it must
+      // be signalled -- the guard must not disable the fix.
+      const marker = `reuse-stable-${process.pid}-${Date.now()}`;
+      const child = spawn("/bin/bash", ["-c", "sleep 120"], {
+        stdio: "ignore",
+        env: { ...process.env, PAPERCLIP_RUN_ID: marker },
+      });
+      try {
+        expect(child.pid).toBeTypeOf("number");
+        const result = sweepRunDescendantsByRunId(marker, "SIGKILL", {
+          excludePids: [],
+        });
+        expect(result.signaledPids).toContain(child.pid);
+        expect(result.attributionLost).toEqual([]);
+      } finally {
+        try {
+          process.kill(child.pid!, "SIGKILL");
+        } catch {
+          // already gone
+        }
+      }
+    });
+  });
 });
