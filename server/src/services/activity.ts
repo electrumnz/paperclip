@@ -41,12 +41,22 @@ export function normalizeActivityLimit(limit: number | undefined) {
 
 type ActivityCursor = { createdAt: string; id: string };
 
+const ACTIVITY_CURSOR_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * `/companies/:companyId/activity` predates cursor support and its response
  * body is a bare array consumed by the CLI and UI (see activity-parity
  * tests) — changing that shape is a breaking change. The cursor is instead
  * threaded through the `before` query param and an `X-Next-Cursor` response
  * header, so old and new clients both keep working (KEE-546).
+ *
+ * A cursor is client-supplied opaque input even though we minted it, and it is
+ * compared against a `timestamptz` cast and a uuid column. So both halves are
+ * validated before use: a well-formed but non-uuid `id`, or a `createdAt` that
+ * Postgres cannot parse, throws inside the query and turns an otherwise-valid
+ * page request into a 500. A cursor we cannot fully validate is treated as
+ * absent, which serves the newest page rather than failing the request.
  */
 export function decodeActivityCursor(cursor: string | undefined): ActivityCursor | null {
   if (!cursor) return null;
@@ -55,7 +65,9 @@ export function decodeActivityCursor(cursor: string | undefined): ActivityCursor
     if (
       parsed && typeof parsed === "object" &&
       typeof (parsed as ActivityCursor).createdAt === "string" &&
-      typeof (parsed as ActivityCursor).id === "string"
+      typeof (parsed as ActivityCursor).id === "string" &&
+      ACTIVITY_CURSOR_ID_PATTERN.test((parsed as ActivityCursor).id) &&
+      !Number.isNaN(Date.parse((parsed as ActivityCursor).createdAt))
     ) {
       return parsed as ActivityCursor;
     }

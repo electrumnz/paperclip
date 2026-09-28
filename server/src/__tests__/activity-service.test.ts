@@ -157,6 +157,55 @@ describeEmbeddedPostgres("activity service", () => {
     expect(secondPage.nextCursor).toBeNull();
   });
 
+  it("ignores a forged or malformed before cursor instead of failing the query", async () => {
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "test.newest",
+      entityType: "company",
+      entityId: companyId,
+      createdAt: new Date("2026-04-21T12:00:00.000Z"),
+    });
+
+    const svc = activityService(db);
+    const forge = (value: unknown) =>
+      Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+
+    // Each of these reached Postgres before the decode was tightened, where a
+    // non-uuid `id` / unparseable `createdAt` threw and surfaced as a 500.
+    const rejected = [
+      { label: "non-uuid id", cursor: forge({ createdAt: "2026-04-21T11:00:00.000Z", id: "not-a-uuid" }) },
+      { label: "uuid id with quote/terminator", cursor: forge({ createdAt: "2026-04-21T11:00:00.000Z", id: "x\"; drop table activity_log; --" }) },
+      { label: "unparseable createdAt", cursor: forge({ createdAt: "garbage-not-a-time", id: randomUUID() }) },
+      { label: "wrong field types", cursor: forge({ createdAt: 123, id: true }) },
+    ];
+
+    for (const { label, cursor } of rejected) {
+      const page = await svc.list({ companyId, limit: 10, before: cursor });
+      // Treated as absent: the newest page is served, not an error.
+      expect(page.rows.map((event) => event.action), label).toEqual(["test.newest"]);
+    }
+
+    // A well-formed cursor still pages correctly — the guard is not a blanket
+    // rejection of client input.
+    const deep = await svc.list({
+      companyId,
+      limit: 10,
+      before: forge({ createdAt: "2026-04-21T11:00:00.000Z", id: "ffffffff-ffff-ffff-ffff-ffffffffffff" }),
+    });
+    expect(deep.rows).toEqual([]);
+  });
+
   it("returns compact usage and result summaries for issue runs", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

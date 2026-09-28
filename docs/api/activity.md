@@ -25,6 +25,11 @@ Responses are capped at `limit` rows ordered newest first. When more rows exist,
 `X-Next-Cursor` header — pass its value back as `before` to fetch the next (older) page. A response with
 no `X-Next-Cursor` header is the last page.
 
+The cursor is client-supplied input, so it is validated before use. A `before` value that is not a
+well-formed cursor (not base64url JSON, a non-UUID row id, or an unparseable timestamp) is treated as
+absent and the newest page is returned. Paging therefore never fails the request; a client that
+round-trips a cursor this server did not mint restarts at the newest page instead of receiving an error.
+
 ## Activity Record
 
 Each entry includes:
