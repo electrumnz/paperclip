@@ -8923,37 +8923,50 @@ export async function terminateHeartbeatRunProcess(input: {
 }) {
   const pid = input.pid ?? null;
   const processGroupId = input.processGroupId ?? null;
-  if (typeof pid !== "number" && typeof processGroupId !== "number") return;
 
-  await terminateLocalService(
-    {
-      pid:
-        typeof pid === "number" && Number.isInteger(pid) && pid > 0
-          ? pid
-          : (processGroupId ?? 0),
-      processGroupId:
-        typeof processGroupId === "number" &&
-        Number.isInteger(processGroupId) &&
-        processGroupId > 0
-          ? processGroupId
-          : null,
-    },
-    { forceAfterMs: input.graceMs, signal: input.signal },
-  );
+  // The process-group signal is best effort. The run-id sweep below is not, and
+  // it must run even when there is no process to signal at all.
+  //
+  // This is the orphan case: the run's own process and its group are already
+  // gone -- a crash, the oomd kill, or a registry entry that never existed
+  // because the run never registered a local child -- while a `timeout`-wrapped
+  // or login-shell descendant still carries the run id and is still holding
+  // memory. Returning early on absent pid/group left exactly those holding
+  // memory, because there was no process group left for the group signal to
+  // reach. Cleanup must not depend on main-process liveness.
+  if (typeof pid === "number" || typeof processGroupId === "number") {
+    await terminateLocalService(
+      {
+        pid:
+          typeof pid === "number" && Number.isInteger(pid) && pid > 0
+            ? pid
+            : (processGroupId ?? 0),
+        processGroupId:
+          typeof processGroupId === "number" &&
+          Number.isInteger(processGroupId) &&
+          processGroupId > 0
+            ? processGroupId
+            : null,
+      },
+      { forceAfterMs: input.graceMs, signal: input.signal },
+    );
+  }
 
-  // Companion to the group signal above: catch descendants that a `timeout`-wrapped
-  // tool command moved into a process group of its own. Best effort, and it runs
+  // Companion to the group signal: catch descendants that a `timeout`-wrapped tool
+  // command moved into a process group of their own. Best effort, and it runs
   // after the group signal so a sweep failure can never turn a successful
   // cancellation into a failure. The direct child is excluded because the group
-  // signal already owned it.
-  if (input.runId) {
-    try {
-      sweepRunDescendantsByRunId(input.runId, input.signal ?? "SIGKILL", {
-        excludePids: [typeof pid === "number" && pid > 0 ? pid : process.pid],
-      });
-    } catch {
-      // The group signal already ran.
-    }
+  // signal already owned it; the helper always excludes this process.
+  //
+  // Attribution is the run id in the environment, which is host-local by
+  // construction: a remote run's processes do not carry this server's run id, so
+  // the sweep cannot reach across a remote boundary even if one were passed here.
+  try {
+    sweepRunDescendantsByRunId(input.runId, input.signal ?? "SIGKILL", {
+      excludePids: [typeof pid === "number" && pid > 0 ? pid : process.pid],
+    });
+  } catch {
+    // Never turn a successful cancellation into a reported failure.
   }
 }
 
@@ -15161,6 +15174,14 @@ export function heartbeatService(
             pid: running.child.pid,
             processGroupId: running.processGroupId,
             graceMs: Math.max(1, running.graceSec) * 1000,
+          });
+        } else {
+          // Shutdown must not strand a `timeout`-wrapped descendant just because
+          // the registry has no entry for this run.
+          await terminateHeartbeatRunProcess({
+            runId: run.id,
+            pid: null,
+            processGroupId: null,
           });
         }
       } finally {
@@ -29080,6 +29101,17 @@ export function heartbeatService(
                   options.terminationGraceMs,
                 ),
               });
+            } else {
+              // No registry entry: the run never registered a local child, or it
+              // was already cleaned up. That says nothing about descendants a
+              // `timeout`-wrapped command moved into another process group, so
+              // the run-id sweep still has to run. It is the only cleanup left.
+              await terminateHeartbeatRunProcess({
+                runId: run.id,
+                pid: null,
+                processGroupId: null,
+                signal: !control && agent?.adapterType === "codex_local" ? "SIGINT" : undefined,
+              });
             }
             terminationSettled = true;
           } finally {
@@ -29287,6 +29319,16 @@ export function heartbeatService(
             pid: running.child.pid,
             processGroupId: running.processGroupId,
             graceMs: Math.max(1, running.graceSec) * 1000,
+          });
+        } else {
+          // Same orphan case as the single-run path: an empty registry does not
+          // mean there is nothing left to clean up. This is the path that
+          // finalised runs as `cancelled` in the 12:21Z attribution, where
+          // cancelled runs still held 24 / 22 / 6 child processes.
+          await terminateHeartbeatRunProcess({
+            runId: run.id,
+            pid: null,
+            processGroupId: null,
           });
         }
         runningProcesses.delete(run.id);
