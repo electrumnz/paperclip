@@ -72,6 +72,12 @@ test("release package configuration validates successfully", () => {
 // gemini-local and opencode-local published without a skills/ directory. The
 // set must be derived from files[], and the adapters that resolve skills at
 // runtime must stay in it.
+//
+// The literal list below is intentional. The test below already checks the
+// invariant (derivation == every package claiming "skills" in files[]), so
+// this one exists to make an intentional addition to that list an explicit,
+// reviewed edit. Deriving the expectation from the same function under test
+// would make the assertion unfalsifiable.
 test("every published package that declares skills in files[] is in the skills staging set", () => {
   const skillsDirs = findSkillsPackages(getReleasePackages()).map((pkg) => pkg.dir);
 

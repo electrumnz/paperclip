@@ -45,6 +45,10 @@ list_public_package_info() {
 }
 package_publish_tool() { printf 'pnpm\\n'; }
 list_skills_package_dirs() {
+  if [ -n "\${FAKE_SKILLS_DERIVATION_FAILS:-}" ]; then
+    echo "fixture: release-package-map.mjs threw while deriving the skills set" >&2
+    return 7
+  fi
   if [ -n "\${FAKE_SKILLS_DIRS:-}" ]; then
     printf '%b' "$FAKE_SKILLS_DIRS"
     return 0
@@ -491,4 +495,35 @@ test("release tolerates a trailing newline in the derived skills package list", 
   assert.equal(result.status, 0, result.output);
   assert.match(result.output, /staged skills\/ into server/);
   assert.match(result.output, /staged skills\/ into packages\/adapters\/cursor-local/);
+});
+
+// A failing derivation must abort the release, not stage nothing and continue.
+// `while ... done < <(list_skills_package_dirs)` ran the derivation in a
+// subshell whose exit status the loop never observed, so a malformed manifest,
+// an unparseable package.json or a node regression would have let the release
+// continue into publish with no skills/ staged anywhere — the exact silent
+// failure this change exists to remove.
+test("release aborts when the skills package derivation fails", () => {
+  const result = runRelease(
+    ["canary", "--skip-verify", "--dry-run"],
+    { FAKE_BUILD_OK: "1", FAKE_SKILLS_DERIVATION_FAILS: "1" },
+    (fixture) => prepareSkillsFixture(fixture),
+  );
+
+  assert.notEqual(result.status, 0, "a failed derivation must not fail the dry run open");
+  assert.doesNotMatch(result.output, /staged skills\/ into /);
+  assert.doesNotMatch(result.output, /Would create git tag/);
+  assert.doesNotMatch(result.calls, /^pnpm publish/m);
+});
+
+test("release refuses to publish when the skills package derivation is empty", () => {
+  const result = runRelease(
+    ["canary", "--skip-verify", "--dry-run"],
+    { FAKE_BUILD_OK: "1", FAKE_SKILLS_DIRS: "\n" },
+    (fixture) => prepareSkillsFixture(fixture),
+  );
+
+  assert.equal(result.status, 1, result.output);
+  assert.match(result.output, /skills staging derived an empty package set/);
+  assert.doesNotMatch(result.output, /Would create git tag/);
 });
