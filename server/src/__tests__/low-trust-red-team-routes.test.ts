@@ -193,7 +193,32 @@ async function quiesceAssignedReviewForWrite(
   heartbeat: ReturnType<typeof heartbeatService>,
   agentId: string,
   issueId: string,
+  opts: { keepRunRef?: string } = {},
 ) {
+  // `keepRunRef` names a run whose `contextSnapshot` carries the trust
+  // boundary. The reparent stop relay reads that boundary from the assignee's
+  // run via `issue.checkoutRunId ?? issue.executionRunId`, so clearing both
+  // makes `resolveAgentTrustForIssue` fall through to `standard` and silently
+  // suppresses the relay. Measured on this host: with the reference cleared the
+  // issue was still `status: "blocked"` under the right parent, yet
+  // `reparentedRelayComments` was empty.
+  //
+  // Only the reparent write needs this, and it is exempt from the live-lock
+  // guard (a `blocked` write under a parent relays), so pointing it at a
+  // settled-but-present run is safe and costs one update instead of another
+  // convergence loop.
+  if (opts.keepRunRef) {
+    await db
+      .update(issues)
+      .set({
+        checkoutRunId: opts.keepRunRef,
+        executionRunId: opts.keepRunRef,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+      })
+      .where(eq(issues.id, issueId));
+    return;
+  }
   // A woken run can re-register a successor run while a pass is settling, so
   // drain+settle until the issue is clear or the pass bound is reached. The
   // bound is a backstop; a loaded runner that cannot converge in this many
@@ -1296,12 +1321,13 @@ describeEmbeddedPostgres(
       // `contextSnapshot.issueId`, so the `standardChild` run that the 409
       // assertion further down depends on is never settled and the guard keeps
       // something real to refuse.
-      const quiesceBeforeWrite = async () => {
+      const quiesceBeforeWrite = async (opts?: { keepRunRef?: string }) => {
         await quiesceAssignedReviewForWrite(
           db,
           heartbeatService(db),
           fixture.agents.lowTrust.id,
           fixture.issues.assignedReview.id,
+          opts ?? {},
         );
       };
 
@@ -1355,7 +1381,13 @@ describeEmbeddedPostgres(
         .update(issues)
         .set({ parentId: null })
         .where(eq(issues.id, fixture.issues.assignedReview.id));
-      await quiesceBeforeWrite();
+      // The reparent write is the one write whose expected outcome depends on
+      // the stop relay, so it keeps a reference to the seeded low-trust run —
+      // the one whose `contextSnapshot.executionPolicy` carries the trust
+      // boundary the relay gate reads. Every other write above clears the
+      // reference, which is what the live-lock guard needs. See
+      // quiesceAssignedReviewForWrite.
+      await quiesceBeforeWrite({ keepRunRef: fixture.runs.lowTrust.id });
       await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
         .send({
