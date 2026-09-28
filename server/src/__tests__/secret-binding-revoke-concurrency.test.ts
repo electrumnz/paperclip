@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import express from "express";
 import request from "supertest";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -32,7 +32,6 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : 
 describeEmbeddedPostgres("secret-binding revoke is not undone by a concurrent agent config write", () => {
   let stopDb: (() => Promise<void>) | null = null;
   let db!: ReturnType<typeof createDb>;
-  let lockDb!: ReturnType<typeof createDb>;
   const previousKeyFile = process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE;
   const secretsTmpDir = path.join(os.tmpdir(), `paperclip-revoke-probe-${randomUUID()}`);
 
@@ -40,10 +39,9 @@ describeEmbeddedPostgres("secret-binding revoke is not undone by a concurrent ag
     mkdirSync(secretsTmpDir, { recursive: true });
     process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = path.join(secretsTmpDir, "master.key");
     const started = await startEmbeddedPostgresTestDatabase("revoke-probe");
-    lockDb = createDb(started.connectionString, { maxConnections: 1, applicationName: "revoke-probe-lock" });
     db = createDb(started.connectionString);
     stopDb = started.cleanup;
-  }, 60_000);
+  }, 30_000);
 
   afterEach(async () => {
     await db.delete(activityLog);
@@ -62,23 +60,6 @@ describeEmbeddedPostgres("secret-binding revoke is not undone by a concurrent ag
     else process.env.PAPERCLIP_SECRETS_MASTER_KEY_FILE = previousKeyFile;
     rmSync(secretsTmpDir, { recursive: true, force: true });
   });
-
-  async function blockedAgentLockCount() {
-    const [row] = await db.execute<{ waiting: number }>(sql`
-      SELECT count(*)::int AS waiting
-      FROM pg_stat_activity
-      WHERE state = 'active' AND wait_event_type = 'Lock'
-        AND query ILIKE '%agents%' AND query ILIKE '%for update%'`);
-    return row?.waiting ?? 0;
-  }
-
-  async function waitForBlockedAgentLocks(minimum: number) {
-    for (let attempt = 0; attempt < 80; attempt += 1) {
-      if (await blockedAgentLockCount() >= minimum) return true;
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    }
-    return false;
-  }
 
   async function seedCompany(name = "Probe Co") {
     const companyId = randomUUID();
