@@ -91,6 +91,11 @@ export type RunProcessCleanupOutcome =
       adapterType: string;
       pid: number | null;
       processGroupId: number | null;
+      // Present only when the run-id sweep found and signalled descendants that
+      // had escaped the run's process group (a `set +m` login shell puts each
+      // backgrounded job in a new group). Absent when there were none, so an
+      // existing consumer that does not know about it is unaffected.
+      escapedDescendantsSignaled?: number;
     }
   | {
       attempted: true;

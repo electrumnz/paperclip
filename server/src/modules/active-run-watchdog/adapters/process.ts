@@ -1,4 +1,4 @@
-import { runningProcesses } from "../../../adapters/utils.js";
+import { runningProcesses, sweepRunDescendantsByRunId } from "../../../adapters/utils.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../../../services/local-service-supervisor.js";
 import type { RunProcessController } from "../application/ports.js";
 import type { RunProcessCleanupOutcome, RunProcessMetadata } from "../application/types.js";
@@ -59,6 +59,21 @@ export function createProcessAdapter(): RunProcessController {
           },
           running ? { forceAfterMs: Math.max(1, running.graceSec) * 1000 } : undefined,
         );
+        // `terminateLocalService` signals the run's process group, which does not
+        // contain descendants that a `set +m` login shell placed in a group of
+        // their own. Those escapees are what accumulated until oomd killed the
+        // service, so sweep them by run id as well. The direct child is excluded:
+        // it is either already gone or still owned by the group signal above.
+        let escapedDescendantsSignaled = 0;
+        try {
+          const sweep = sweepRunDescendantsByRunId(input.runId, "SIGKILL", {
+            excludePids: [pid ?? process.pid],
+          });
+          escapedDescendantsSignaled = sweep.signaledPids.length;
+        } catch {
+          // Best effort: the group signal already ran, so a failed sweep must not
+          // turn a successful cancel into a reported failure.
+        }
         runningProcesses.delete(input.runId);
         const stillAlive =
           (pid !== null && isPidAlive(pid)) ||
@@ -69,6 +84,7 @@ export function createProcessAdapter(): RunProcessController {
           adapterType: input.adapterType,
           pid,
           processGroupId,
+          ...(escapedDescendantsSignaled > 0 ? { escapedDescendantsSignaled } : {}),
         };
       } catch (error) {
         return {
