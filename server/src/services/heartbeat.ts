@@ -17234,6 +17234,7 @@ export function heartbeatService(
   async function claimQueuedRun(
     run: typeof heartbeatRuns.$inferSelect,
     companyAgents?: AgentOrgRow[],
+    cancelledBeforeClaim?: Array<typeof heartbeatRuns.$inferSelect>,
   ) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
@@ -17378,6 +17379,10 @@ export function heartbeatService(
       });
       if (staleness.outcome === "cancelled") {
         applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+        // A stale queued successor may have held back the new assignee's
+        // deferred wake. It has no executor/finally block to drain that queue.
+        if (cancelledBeforeClaim) cancelledBeforeClaim.push(run);
+        else await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true });
         logger.info(
           { runId: run.id, issueId, errorCode: staleness.errorCode },
           "claimQueuedRun: cancelled stale queued run",
@@ -19482,6 +19487,70 @@ export function heartbeatService(
         logger.warn({ err, queueId: wake.id }, "failed to resume interrupted comment queue");
       });
     }
+    // A stale queued cancellation can leave a new assignee's assignment wake
+    // deferred if its post-lock promotion fails. Retry only the exact source
+    // run stored in that wake. The promotion transaction clears the issue
+    // execution lock and claims the wake by compare-and-set, so a retry after
+    // an ambiguous commit cannot create a second run.
+    const strandedAssignmentHandoffs = await db
+      .select({
+        wakeId: agentWakeupRequests.id,
+        companyId: agentWakeupRequests.companyId,
+        sourceRunId: sql<string>`${agentWakeupRequests.payload}->>'deferredByRunId'`,
+      })
+      .from(agentWakeupRequests)
+      .innerJoin(issues, and(
+        eq(issues.companyId, agentWakeupRequests.companyId),
+        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        eq(issues.assigneeAgentId, agentWakeupRequests.agentId),
+        // A failed promotion rolls back the lock release with it, so the issue
+        // still points at the very source run this wake is waiting on. Accept
+        // that exact stale lock as well as a free one, and never treat a lock
+        // held by any other run as a candidate.
+        or(
+          isNull(issues.executionRunId),
+          sql`${issues.executionRunId}::text = ${agentWakeupRequests.payload}->>'deferredByRunId'`,
+        ),
+      ))
+      .innerJoin(companies, and(
+        eq(companies.id, issues.companyId),
+        eq(companies.status, "active"),
+      ))
+      .where(and(
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        eq(agentWakeupRequests.source, "assignment"),
+        sql`${agentWakeupRequests.payload}->>'deferredByRunId' is not null`,
+        sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'issue_assigned'`,
+        cutoff
+          ? gte(agentWakeupRequests.requestedAt, cutoff)
+          : undefined,
+      ))
+      .orderBy(asc(agentWakeupRequests.updatedAt), asc(agentWakeupRequests.id))
+      .limit(50);
+    for (const handoff of strandedAssignmentHandoffs) {
+      if (!handoff.sourceRunId) continue;
+      // The release is company-scoped: it re-reads the source run inside its
+      // own transaction. Only an already-terminal run is safe to retry, so a
+      // still-active lock owner is never promoted around.
+      const [sourceRun] = await db
+        .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, handoff.sourceRunId),
+          eq(heartbeatRuns.companyId, handoff.companyId),
+          inArray(heartbeatRuns.status, ["cancelled", "failed", "timed_out", "interrupted", "succeeded"]),
+        ));
+      if (!sourceRun) continue;
+      await releaseIssueExecutionAndPromote(sourceRun, {
+        suppressImmediateRecovery: true,
+      }).catch((err) => {
+        logger.warn(
+          { err, queueId: handoff.wakeId, runId: handoff.sourceRunId },
+          "failed to retry deferred assignment handoff",
+        );
+      });
+    }
+
     // A server restart or a message/cleanup race can leave a deferred wake
     // after its owner has released the issue lock. Revisit it through the same
     // release admission, so recovery holds and operator Stops still apply.
@@ -19874,6 +19943,7 @@ export function heartbeatService(
   async function startNextQueuedRunForAgent(agentId: string) {
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
+    const cancelledBeforeClaim: Array<typeof heartbeatRuns.$inferSelect> = [];
 
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
@@ -19985,7 +20055,7 @@ export function heartbeatService(
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
-        const claimed = await claimQueuedRun(queuedRun, companyAgents);
+        const claimed = await claimQueuedRun(queuedRun, companyAgents, cancelledBeforeClaim);
         if (claimed) claimedRuns.push(claimed);
       }
       if (claimedRuns.length === 0) return [];
@@ -20009,6 +20079,15 @@ export function heartbeatService(
         });
       }
       return claimedRuns;
+    }).finally(async () => {
+      // Promotion can target this same agent. Release its start lock first;
+      // otherwise nested promotion waits on its own lock until the stale timeout.
+      for (const cancelled of cancelledBeforeClaim) {
+        await releaseIssueExecutionAndPromote(cancelled, { suppressImmediateRecovery: true }).catch((err) => {
+          logger.error({ err, runId: cancelled.id },
+            "failed to promote deferred task wake after stale queued cancellation");
+        });
+      }
     });
   }
 
@@ -27831,7 +27910,16 @@ export function heartbeatService(
                 contextSnapshot: enrichedContextSnapshot,
                 source,
                 triggerDetail,
-                payload,
+                // Keep the exact execution that caused an assignment handoff
+                // wait. The periodic recovery sweep can then retry only this
+                // source run after a transient post-cancellation promotion
+                // failure. Override any caller value with the row-lock identity.
+                payload: {
+                  ...(payload ?? {}),
+                  ...(source === "assignment" && reason === "issue_assigned"
+                    ? { deferredByRunId: activeExecutionRun.id }
+                    : {}),
+                },
                 requestedByActorType: opts.requestedByActorType ?? null,
                 requestedByActorId: opts.requestedByActorId ?? null,
                 idempotencyKey: opts.idempotencyKey ?? null,
