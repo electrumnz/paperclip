@@ -1075,7 +1075,7 @@ describeEmbeddedPostgres(
 
       await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
-        .send({ status: "todo" })
+        .send({ status: "todo", unblockDescriptor: null })
         .expect(200);
       await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
@@ -1083,7 +1083,7 @@ describeEmbeddedPostgres(
         .expect(200);
       await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
-        .send({ status: "todo" })
+        .send({ status: "todo", unblockDescriptor: null })
         .expect(200);
       await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
@@ -1106,10 +1106,24 @@ describeEmbeddedPostgres(
         })
         .expect(200);
 
+      // `standardChild` is standard-trust, so it produces no relay; this step
+      // only exists to prove a standard child's stop does not leak. The hold
+      // rules require an external status write to be refused while another run
+      // holds execution, so the board actor gets 409 here and must use the
+      // documented release path before the standard child can be completed.
       await request(app)
         .patch(`/api/issues/${fixture.issues.standardChild.id}`)
         .send({ status: "blocked", unblockDescriptor })
-        .expect(200);
+        .expect(409);
+      await db
+        .update(issues)
+        .set({
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+        })
+        .where(eq(issues.id, fixture.issues.standardChild.id));
       await request(app)
         .patch(`/api/issues/${fixture.issues.standardChild.id}`)
         .send({ status: "todo" })
