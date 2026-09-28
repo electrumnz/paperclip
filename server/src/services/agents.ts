@@ -123,6 +123,12 @@ interface UpdateAgentOptions {
   allowBuiltInAgentMetadata?: boolean;
   allowPendingApprovalConfigUpdate?: boolean;
   claudeLogin?: ClaudeLoginContext;
+  /**
+   * Optimistic concurrency guard for callers that prepare a config patch before
+   * taking the row lock. The service compares this value after it acquires the
+   * lock and refuses a patch prepared from stale state.
+   */
+  expectedUpdatedAt?: Date;
 }
 
 interface CreateAgentOptions {
@@ -399,10 +405,14 @@ export function agentService(db: Db) {
     return db.select().from(agents).where(eq(agents.companyId, companyId));
   }
 
-  async function getMonthlySpendByAgentIds(companyId: string, agentIds: string[]) {
+  async function getMonthlySpendByAgentIds(
+    companyId: string,
+    agentIds: string[],
+    dbClient: Db = db,
+  ) {
     if (agentIds.length === 0) return new Map<string, number>();
     const { start, end } = currentUtcMonthWindow();
-    const rows = await db
+    const rows = await dbClient
       .select({
         agentId: costEvents.agentId,
         spentMonthlyCents: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::double precision`,
@@ -420,29 +430,37 @@ export function agentService(db: Db) {
     return new Map(rows.map((row) => [row.agentId, Number(row.spentMonthlyCents ?? 0)]));
   }
 
-  async function hydrateAgentSpend<T extends { id: string; companyId: string; spentMonthlyCents: number }>(rows: T[]) {
+  async function hydrateAgentSpend<T extends { id: string; companyId: string; spentMonthlyCents: number }>(
+    rows: T[],
+    dbClient: Db = db,
+  ) {
     const agentIds = rows.map((row) => row.id);
     const companyId = rows[0]?.companyId;
     if (!companyId || agentIds.length === 0) return rows;
-    const spendByAgentId = await getMonthlySpendByAgentIds(companyId, agentIds);
+    const spendByAgentId = await getMonthlySpendByAgentIds(companyId, agentIds, dbClient);
     return rows.map((row) => ({
       ...row,
       spentMonthlyCents: spendByAgentId.get(row.id) ?? 0,
     }));
   }
 
-  async function getById(id: string) {
-    const row = await db
+  async function getByIdWithDb(dbClient: Db, id: string, lock = false) {
+    const selectQuery = dbClient
       .select()
       .from(agents)
-      .where(eq(agents.id, id))
+      .where(eq(agents.id, id));
+    const row = await (lock ? selectQuery.for("update") : selectQuery)
       .then((rows) => rows[0] ?? null);
     if (!row) return null;
     const [companyRows, hydrated] = await Promise.all([
-      listCompanyAgentRows(row.companyId),
-      hydrateAgentSpend([row]).then((rows) => rows[0]!),
+      dbClient.select().from(agents).where(eq(agents.companyId, row.companyId)),
+      hydrateAgentSpend([row], dbClient).then((rows) => rows[0]!),
     ]);
     return normalizeAgentRow(hydrated, companyRows);
+  }
+
+  async function getById(id: string) {
+    return getByIdWithDb(db, id);
   }
 
   async function requireGetById(id: string) {
@@ -696,13 +714,42 @@ export function agentService(db: Db) {
     });
   }
 
+  type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
+
   async function updateAgent(
     id: string,
     data: Partial<typeof agents.$inferInsert>,
     options?: UpdateAgentOptions,
   ) {
-    const existing = await getById(id);
+    const transaction = (db as unknown as {
+      transaction?: (callback: (tx: unknown) => Promise<AgentUpdateResult>) => Promise<AgentUpdateResult>;
+    }).transaction;
+    if (typeof transaction !== "function") {
+      return updateAgentInTransaction(id, data, options, db);
+    }
+    return transaction.call(db, async (tx) => {
+      const txDb = tx as unknown as Db;
+      return updateAgentInTransaction(id, data, options, txDb);
+    });
+  }
+
+  async function updateAgentInTransaction(
+    id: string,
+    data: Partial<typeof agents.$inferInsert>,
+    options: UpdateAgentOptions | undefined,
+    txDb: Db,
+  ) {
+    const existing = await getByIdWithDb(txDb, id, true);
     if (!existing) return null;
+    if (
+      options?.expectedUpdatedAt &&
+      existing.updatedAt.getTime() !== options.expectedUpdatedAt.getTime()
+    ) {
+      throw conflict("The agent changed before this update acquired the agent lock; refresh and retry", {
+        code: "agent_config_concurrency_conflict",
+        agentId: id,
+      });
+    }
 
     if (existing.status === "terminated" && data.status && data.status !== "terminated") {
       throw conflict("Terminated agents cannot be resumed");
@@ -852,11 +899,7 @@ export function agentService(db: Db) {
       return normalizedUpdated;
     };
 
-    const transaction = (db as unknown as {
-      transaction?: (callback: (tx: unknown) => Promise<AgentUpdateResult>) => Promise<AgentUpdateResult>;
-    }).transaction;
-    if (typeof transaction !== "function") return applyUpdate(db);
-    return transaction.call(db, async (tx) => applyUpdate(tx as unknown as Db));
+    return applyUpdate(txDb);
   }
 
   return {
