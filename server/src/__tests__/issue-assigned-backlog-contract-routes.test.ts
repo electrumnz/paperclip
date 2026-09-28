@@ -4,7 +4,8 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 const assigneeAgentId = "22222222-2222-4222-8222-222222222222";
 
-const mockWakeup = vi.hoisted(() => vi.fn(async () => undefined));
+const mockWakeup = vi.hoisted(() => vi.fn(async () => ({ id: "queued-wake-1" })));
+const queuedWakeupId = "queued-wake-1";
 const mockLogActivity = vi.hoisted(() => vi.fn(async () => undefined));
 const mockIssueService = vi.hoisted(() => ({
   create: vi.fn(),
@@ -179,6 +180,11 @@ describe("assigned backlog creation contract", () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // `clearAllMocks` drops the implementation, and the response field is
+    // derived from whatever `heartbeat.wakeup` actually resolves to. Re-seat
+    // the queued-wakeup return and assert against that same value, so the test
+    // exercises the real contract instead of a hand-written constant.
+    mockWakeup.mockResolvedValue({ id: queuedWakeupId });
     mockIssueService.getById.mockResolvedValue(makeIssue({
       id: "parent-1",
       title: "Parent issue",
@@ -233,6 +239,9 @@ describe("assigned backlog creation contract", () => {
     expect(res.body).toEqual(expect.objectContaining({
       assigneeAgentId,
       status: "todo",
+      assignmentWakeSkipped: false,
+      assignmentWakeSkipReason: null,
+      assignmentWakeId: queuedWakeupId,
     }));
     expect(mockWakeup).toHaveBeenCalledWith(
       assigneeAgentId,
@@ -285,6 +294,8 @@ describe("assigned backlog creation contract", () => {
       assigneeAgentId,
       parentId: "parent-1",
       status: "todo",
+      assignmentWakeSkipped: false,
+      assignmentWakeId: queuedWakeupId,
     }));
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
@@ -330,6 +341,9 @@ describe("assigned backlog creation contract", () => {
     expect(res.body).toEqual(expect.objectContaining({
       assigneeAgentId,
       status: "backlog",
+      assignmentWakeSkipped: true,
+      assignmentWakeSkipReason: "assigned_backlog",
+      assignmentWakeId: null,
     }));
     expect(mockLogActivity).toHaveBeenCalledWith(
       expect.anything(),
