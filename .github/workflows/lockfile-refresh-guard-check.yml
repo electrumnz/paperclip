@@ -2,11 +2,12 @@ name: Lockfile refresh guard check
 
 # KEE-1025. The lockfile refresh claim step is shell, and the only tests that
 # execute it live in .github/scripts/tests/manual/. The fork's pr.yml pins
-# `paperclipai/paperclip/.github/workflows/pr-trusted.yml@<upstream sha>`, and
-# GitHub resolves `uses: owner/repo/path@ref` inside the *named* repository, so
-# a step added to the fork's own pr-trusted.yml never runs here. That is the
-# same dead-coverage problem KEE-999 found for the worktree guard suites, and
-# this workflow is the fork-local lane that gives the collision suite real CI.
+# `paperclipai/paperclip/.github/workflows/pr-trusted.yml@<upstream ref>`
+# (currently `@master`), and GitHub resolves `uses: owner/repo/path@ref` inside
+# the *named* repository, so a step added to the fork's own pr-trusted.yml never
+# runs here, whether that ref is a SHA or a branch name. That is the same
+# dead-coverage problem KEE-999 found for the worktree guard suites, and this
+# workflow is the fork-local lane that gives the collision suite real CI.
 #
 # It does NOT replace the upstream pin. fork/master's pr-trusted.yml is stale
 # relative to upstream master, and the pin is what keeps the fork on upstream's
