@@ -17375,9 +17375,19 @@ export function heartbeatService(
         typeof bindingOwner === "object" &&
         "agentId" in bindingOwner &&
         bindingOwner.agentId === run.agentId;
+      // Same exemption as the wake-time gate: a hold that requires the stopped
+      // run to be reconciled must not cancel the reconciled continuation. The
+      // stored `wakeReason` is only trusted together with the recovery action
+      // id and the reconciliation source stamp, all written by the delivery
+      // path itself rather than by a caller.
+      const isReconciledContinuation =
+        bindingWakeReason === "issue_recovery_action_restored" &&
+        context.source === "execution.reconciled" &&
+        isUuidLike(readNonEmptyString(context.recoveryActionId) ?? "");
       if (
         bindingIssue?.unblockDescriptor &&
-        !isNamedAgentUnblockWake
+        !isNamedAgentUnblockWake &&
+        !isReconciledContinuation
       ) {
         await cancelRunInternal(
           run.id,
@@ -26807,7 +26817,15 @@ export function heartbeatService(
           typeof bindingOwner === "object" &&
           "agentId" in bindingOwner &&
           bindingOwner.agentId === agentId;
-        if (!isNamedAgentUnblockWake) {
+        // A board hold names the reconciliation as the required next step, e.g.
+        // "verify safe staging, THEN reconcile the stopped run". The hold gates
+        // NEW work; the continuation for an already-stopped, operator-reconciled
+        // run is the action the hold asks for. Refusing it strands the run with
+        // no delivery path, because nothing re-arms `continuationDelivery`.
+        // `executionReconciliationWake` is the validated signal for this, derived
+        // from the server-minted `execution-reconciliation:` idempotency key, not
+        // from a caller-supplied wake reason.
+        if (!isNamedAgentUnblockWake && !executionReconciliationWake) {
           const wait = await writeSkippedRequest(
             "issue_unblock_hold_active",
             {
