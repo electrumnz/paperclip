@@ -27,6 +27,26 @@ import {
 import { resolveCliVersion } from "../version.js";
 import { systemdServiceName } from "../services/service-manager.js";
 
+// A temporary HOME is NOT isolation for service-manager code: `systemctl --user`
+// reaches the host user bus through $XDG_RUNTIME_DIR, not through HOME. A bare
+// `uninstallCommand()` therefore stops the operator's live Paperclip service even
+// though the test's filesystem sandbox is honoured (operator finding, KEE-1123,
+// 2026-09-28). Every uninstall test in this file injects its own detector; this
+// tripwire turns a future bare call into a loud local failure instead of a real
+// service stop. install.ts never imports service-manager, so nothing else in
+// this suite depends on the real implementation.
+vi.mock("../services/service-manager.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../services/service-manager.js")>();
+  return {
+    ...actual,
+    detectServiceManager: async () => {
+      throw new Error(
+        "install-command.test.ts reached the real service manager. Inject detectServiceManager into the command under test; the host user service must never be reachable from this suite.",
+      );
+    },
+  };
+});
+
 const ORIGINAL_ENV = { ...process.env };
 
 describe("managed install commands", () => {
@@ -105,8 +125,13 @@ describe("managed install commands", () => {
     expect(runCommand.mock.calls[0]?.[0]).toBe(process.execPath);
   });
 
-  const createGitCheckoutRunCommand = (sha: string) =>
-    vi.fn(async (file: string, args: string[], _options?: Parameters<CommandRunner>[2]) => {
+  const createGitCheckoutRunCommand = (
+    sha: string,
+    options: { serverUiDist?: boolean } = {},
+  ) => {
+    // Default models the real payload: a staged server that carries ui-dist.
+    const serverUiDist = options.serverUiDist ?? true;
+    return vi.fn(async (file: string, args: string[], _options?: Parameters<CommandRunner>[2]) => {
       if (file === "curl" && !args.includes("--output")) return { stdout: JSON.stringify({ sha }), stderr: "" };
       if (file === "curl") { fs.writeFileSync(args[args.indexOf("--output") + 1], "archive"); return { stdout: "", stderr: "" }; }
       if (file === "tar") {
@@ -141,7 +166,24 @@ describe("managed install commands", () => {
         fs.writeFileSync(path.join(args[args.indexOf("--pack-destination") + 1], `${packageName}-0.3.1.tgz`), "package");
         return { stdout: "", stderr: "" };
       }
-      if (file === "npm" && args[0] === "install") { const prefix = args[args.indexOf("--prefix") + 1]; const packageRoot = path.join(prefix, "node_modules", "paperclipai"); fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true }); fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" })); fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n"); return { stdout: "", stderr: "" }; }
+      if (file === "npm" && args[0] === "install") {
+        const prefix = args[args.indexOf("--prefix") + 1];
+        const packageRoot = path.join(prefix, "node_modules", "paperclipai");
+        fs.mkdirSync(path.join(packageRoot, "dist"), { recursive: true });
+        fs.writeFileSync(path.join(packageRoot, "package.json"), JSON.stringify({ version: "0.3.1" }));
+        fs.writeFileSync(path.join(packageRoot, "dist", "index.js"), "#!/usr/bin/env node\n");
+        // A real install also lays down the staged @paperclipai/server tarball,
+        // which now carries ui-dist and skills (KEE-1123). The stub has to model
+        // that, otherwise the installer's own presence check rejects a payload
+        // that no real `npm install` would ever produce.
+        const serverRoot = path.join(prefix, "node_modules", "@paperclipai", "server");
+        fs.mkdirSync(path.join(serverRoot, "skills"), { recursive: true });
+        if (serverUiDist) {
+          fs.mkdirSync(path.join(serverRoot, "ui-dist"), { recursive: true });
+          fs.writeFileSync(path.join(serverRoot, "ui-dist", "index.html"), "<!doctype html>");
+        }
+        return { stdout: "", stderr: "" };
+      }
       if (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")) {
         fs.mkdirSync(args[2], { recursive: true });
         fs.writeFileSync(path.join(args[2], "package.json"), JSON.stringify({ name: "@paperclipai/db", version: "0.3.1" }));
@@ -150,6 +192,7 @@ describe("managed install commands", () => {
       if (file === process.execPath) return { stdout: "0.3.1\n", stderr: "" };
       throw new Error(`Unexpected command: ${file} ${args.join(" ")}`);
     });
+  };
 
   it("installs a GitHub branch through codeload and reuses the resolved SHA", async () => {
     const sha = "c".repeat(40);
@@ -178,7 +221,10 @@ describe("managed install commands", () => {
       file === "corepack" ||
       (file === "npm" && args[0] === "pack") ||
       (file === process.execPath && args[0]?.endsWith("prepare-bundled-package.mjs")));
-    expect(buildCalls).toHaveLength(9);
+    // 9 at base plus the `bash scripts/prepare-server-ui-dist.sh` call KEE-1123
+    // added to match scripts/release.sh. Asserted by name below, so dropping the
+    // step fails on a readable assertion rather than an opaque count drift.
+    expect(buildCalls).toHaveLength(10);
     for (const call of buildCalls) {
       const env = call[2]?.env;
       expect(env, `${call[0]} ${call[1].join(" ")} must run with an explicit env`).toBeDefined();
@@ -186,6 +232,26 @@ describe("managed install commands", () => {
     }
     const uiPackCall = buildCalls.find(([file, , options]) => file === "corepack" && options?.env?.PAPERCLIP_RELEASE_REUSE_UI_DIST === "1");
     expect(uiPackCall).toBeDefined();
+    // The two release.sh steps a git install must not skip (KEE-1123). The first
+    // is what gives the staged server a ui-dist at all; the second is what makes
+    // the staged workspace versions agree so the payload install resolves.
+    expect(buildCalls.some(([file, args]) => file === "bash" && args.includes("scripts/prepare-server-ui-dist.sh"))).toBe(true);
+    const setVersionCall = runCommand.mock.calls.find(([file, args]) =>
+      file === process.execPath && args.some((arg) => arg.endsWith("release-package-map.mjs")));
+    expect(setVersionCall?.[1].at(-2)).toBe("set-version");
+    expect(setVersionCall?.[2]?.env).toBeDefined();
+  });
+
+  it("refuses to publish a payload whose staged server has no ui-dist", async () => {
+    // The check the codeload test exercises by accident. A payload with no
+    // ui-dist installs cleanly and then serves an API with no board, which is a
+    // worse failure than the ENOENT this replaced, so the install has to stop.
+    const sha = "e".repeat(40);
+    const runCommand = createGitCheckoutRunCommand(sha, { serverUiDist: false });
+    await expect(installGitPayload("paperclipai/paperclip", sha, runCommand, resolveInstallStorePaths()))
+      .rejects.toThrow("has no ui-dist");
+    // And it must not promote the payload or flip `current` on the way out.
+    expect(fs.existsSync(payloadPathFor(resolveInstallStorePaths(), "git", sha.slice(0, 12)))).toBe(false);
   });
 
   it("resolves the complete server workspace dependency closure in dependency order", () => {
@@ -335,7 +401,11 @@ describe("managed install commands", () => {
     fs.mkdirSync(paths.cliRoot, { recursive: true });
     fs.writeFileSync(unrelatedFile, "keep");
 
-    await expect(uninstallCommand()).rejects.toThrow("unverified install store");
+    await expect(uninstallCommand({
+      detectServiceManager: async () => ({ supported: false as const, reason: "Unit test: host service access disabled" }),
+      platform: "linux",
+      userHomeDir: process.env.HOME!,
+    })).rejects.toThrow("unverified install store");
     expect(fs.readFileSync(unrelatedFile, "utf8")).toBe("keep");
   });
 
@@ -357,7 +427,11 @@ describe("managed install commands", () => {
 
     await withInstallStoreLock(
       async () => {
-        await expect(uninstallCommand()).rejects.toThrow("already running");
+        await expect(uninstallCommand({
+          detectServiceManager: async () => ({ supported: false as const, reason: "Unit test: host service access disabled" }),
+          platform: "linux",
+          userHomeDir: process.env.HOME!,
+        })).rejects.toThrow("already running");
       },
       paths,
     );
