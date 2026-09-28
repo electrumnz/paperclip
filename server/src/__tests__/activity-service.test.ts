@@ -193,6 +193,14 @@ describeEmbeddedPostgres("activity service", () => {
       { label: "calendar-invalid createdAt (day overflow)", cursor: forge({ createdAt: "2026-02-30T00:00:00.000Z", id: randomUUID() }) },
       { label: "calendar-invalid createdAt (month day overflow)", cursor: forge({ createdAt: "2026-02-31T00:00:00.000Z", id: randomUUID() }) },
       { label: "calendar-invalid createdAt (leap day in a non-leap year)", cursor: forge({ createdAt: "2026-02-29T00:00:00.000Z", id: randomUUID() }) },
+      // The strict round-trip check still admits every instant JavaScript's own
+      // `Date` can represent, which is far wider than what Postgres casts:
+      // year 0 and the two ends of the JS Date range all raise "date/time field
+      // value out of range" (or "time zone displacement out of range") in
+      // `::timestamptz`. The predicate and the cast must be the same predicate.
+      { label: "createdAt below Postgres' accepted range (year 0)", cursor: forge({ createdAt: "0000-01-01T00:00:00.000Z", id: randomUUID() }) },
+      { label: "createdAt at the lower end of the JS Date range", cursor: forge({ createdAt: "-271821-04-20T00:00:00.000Z", id: randomUUID() }) },
+      { label: "createdAt at the upper end of the JS Date range", cursor: forge({ createdAt: "+275760-09-13T00:00:00.000Z", id: randomUUID() }) },
       { label: "wrong field types", cursor: forge({ createdAt: 123, id: true }) },
     ];
 
