@@ -266,7 +266,7 @@ describeEmbeddedPostgres("DELETE /secrets/:secretId/bindings/:bindingId", () => 
     const competingUpdate = agentService(db).update(
       agent.id,
       { adapterConfig: { unrelatedFlag: true } },
-      { expectedUpdatedAt: current.updatedAt },
+      { expectedAdapterConfig: current.adapterConfig },
     );
     expect(await waitForBlockedAgentLocks(1)).toBe(true);
 

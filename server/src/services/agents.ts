@@ -1,4 +1,5 @@
 import { agentAppearanceSchema, randomAgentAppearance, resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
+import { isDeepStrictEqual } from "node:util";
 import { createHash, randomBytes } from "node:crypto";
 import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -125,10 +126,22 @@ interface UpdateAgentOptions {
   claudeLogin?: ClaudeLoginContext;
   /**
    * Optimistic concurrency guard for callers that prepare a config patch before
-   * taking the row lock. The service compares this value after it acquires the
-   * lock and refuses a patch prepared from stale state.
+   * taking the row lock. The service compares the config the caller observed
+   * against the config now on the row and refuses a patch prepared from stale
+   * state.
+   *
+   * This deliberately keys on the caller's observed `adapterConfig` rather than
+   * the row's `updatedAt`. Several background writers update `agents.updated_at`
+   * without touching the config at all -- the cost rollup in
+   * services/costs.ts, budget updates in services/budgets.ts, the active-run
+   * watchdog on every run completion, and the execution-control reconciler.
+   * Keying the guard on `updatedAt` therefore rejects a perfectly good edit
+   * whenever one of those lands between a handler's read and its write, turning
+   * a security control into a routine 409 on the main PATCH /agents/:id path.
+   * Comparing config state keeps the guarantee that matters -- a patch built
+   * from a stale config cannot clobber a newer config -- without that cost.
    */
-  expectedUpdatedAt?: Date;
+  expectedAdapterConfig?: unknown;
 }
 
 interface CreateAgentOptions {
@@ -759,8 +772,8 @@ export function agentService(db: Db) {
     const existing = await getBaseAgentByIdWithDb(txDb, id, true);
     if (!existing) return null;
     if (
-      options?.expectedUpdatedAt &&
-      existing.updatedAt.getTime() !== options.expectedUpdatedAt.getTime()
+      options?.expectedAdapterConfig !== undefined &&
+      !isDeepStrictEqual(existing.adapterConfig, options.expectedAdapterConfig)
     ) {
       throw conflict("The agent changed before this update acquired the agent lock; refresh and retry", {
         code: "agent_config_concurrency_conflict",

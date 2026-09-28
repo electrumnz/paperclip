@@ -2713,7 +2713,7 @@ export function agentRoutes(
       const updated = await svc.update(agent.id, { adapterConfig: nextAdapterConfig }, {
         // Guard the read-modify-write against a config change that committed
         // after `agent` was read.
-        expectedUpdatedAt: agent.updatedAt,
+        expectedAdapterConfig: agent.adapterConfig,
         allowPendingApprovalConfigUpdate: true,
       });
       return (updated as T | null) ?? { ...agent, adapterConfig: nextAdapterConfig };
@@ -2733,7 +2733,7 @@ export function agentRoutes(
     const updated = await svc.update(agent.id, { adapterConfig: nextAdapterConfig }, {
       // Guard the read-modify-write against a config change that committed
       // after `agent` was read.
-      expectedUpdatedAt: agent.updatedAt,
+      expectedAdapterConfig: agent.adapterConfig,
       allowPendingApprovalConfigUpdate: true,
     });
     return (updated as T | null) ?? { ...agent, adapterConfig: nextAdapterConfig };
@@ -3948,7 +3948,7 @@ export function agentRoutes(
       }, {
         // Guard the read-modify-write against a config change that committed
         // after `agent` was read.
-        expectedUpdatedAt: agent.updatedAt,
+        expectedAdapterConfig: agent.adapterConfig,
         recordRevision: {
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -5035,7 +5035,7 @@ export function agentRoutes(
       {
         // Guard the read-modify-write against a config change that committed
         // after `existing` was read.
-        expectedUpdatedAt: existing.updatedAt,
+        expectedAdapterConfig: existing.adapterConfig,
         recordRevision: {
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -5106,7 +5106,7 @@ export function agentRoutes(
       {
         // Guard the read-modify-write against a config change that committed
         // after `existing` was read.
-        expectedUpdatedAt: existing.updatedAt,
+        expectedAdapterConfig: existing.adapterConfig,
         recordRevision: {
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -5174,7 +5174,7 @@ export function agentRoutes(
       {
         // Guard the read-modify-write against a config change that committed
         // after `existing` was read.
-        expectedUpdatedAt: existing.updatedAt,
+        expectedAdapterConfig: existing.adapterConfig,
         recordRevision: {
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -5415,7 +5415,7 @@ export function agentRoutes(
       // `existing` was read before this handler built its patch. A concurrent
       // config write that has since committed (for example a secret-binding
       // revoke) must not be silently overwritten by this stale read-modify-write.
-      expectedUpdatedAt: existing.updatedAt,
+      expectedAdapterConfig: existing.adapterConfig,
       recordRevision: {
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,

@@ -146,7 +146,7 @@ describeEmbeddedPostgres("secret-binding revoke is not undone by a concurrent ag
     const patched = await agentService(db).update(
       agent.id,
       { adapterConfig: { ...(handlerRead.adapterConfig as Record<string, unknown>), unrelatedFlag: true } },
-      { expectedUpdatedAt: handlerRead.updatedAt },
+      { expectedAdapterConfig: handlerRead.adapterConfig },
     ).then(() => "committed" as const, (error: unknown) => error as Error);
 
     const conflict = patched instanceof Error && /changed before this update/i.test(patched.message);
