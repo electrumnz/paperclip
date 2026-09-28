@@ -26,9 +26,13 @@ Responses are capped at `limit` rows ordered newest first. When more rows exist,
 no `X-Next-Cursor` header is the last page.
 
 The cursor is client-supplied input, so it is validated before use. A `before` value that is not a
-well-formed cursor (not base64url JSON, a non-UUID row id, or an unparseable timestamp) is treated as
-absent and the newest page is returned. Paging therefore never fails the request; a client that
-round-trips a cursor this server did not mint restarts at the newest page instead of receiving an error.
+well-formed cursor is treated as absent and the newest page is returned. A cursor must be base64url
+JSON with a UUID row id and a timestamp that round-trips through ISO-8601 — the exact shape
+`X-Next-Cursor` emits. That last rule is stricter than Postgres: it rejects a calendar-invalid value
+such as `2026-02-30T00:00:00.000Z`, which JavaScript accepts but Postgres raises on, and it also
+rejects valid-but-differently-spelled timestamps such as `2026-09-15T12:00:00Z` (no milliseconds).
+Paging therefore never fails the request; a client that round-trips a cursor this server did not
+mint restarts at the newest page instead of receiving an error.
 
 ## Activity Record
 

@@ -45,6 +45,27 @@ const ACTIVITY_CURSOR_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
+ * `Date.parse` is *more lenient* than a Postgres `::timestamptz` cast: it rolls
+ * calendar-invalid dates over instead of rejecting them, so
+ * `2026-02-30T00:00:00.000Z` parses here (as `2026-03-02`) and only throws once
+ * the value reaches the query.
+ *
+ * Requiring the value to round-trip through `toISOString()` closes that gap.
+ * The check is deliberately *narrower* than Postgres: it also rejects valid but
+ * non-canonical spellings such as `2026-09-15T12:00:00Z` (no milliseconds) or a
+ * space separator. That is safe because this predicate defines exactly the
+ * cursor shape this server mints — the sole mint site in `list` writes
+ * `new Date(last.createdAt).toISOString()`, so a round-tripping value is
+ * exactly what a real `X-Next-Cursor` always contains. Anything else is
+ * unusable, so failing soft (treated as absent) is correct and loses no
+ * pagination.
+ */
+function isServerMintableActivityTimestamp(value: string): boolean {
+  const parsed = Date.parse(value);
+  return !Number.isNaN(parsed) && new Date(parsed).toISOString() === value;
+}
+
+/**
  * `/companies/:companyId/activity` predates cursor support and its response
  * body is a bare array consumed by the CLI and UI (see activity-parity
  * tests) — changing that shape is a breaking change. The cursor is instead
@@ -56,7 +77,10 @@ const ACTIVITY_CURSOR_ID_PATTERN =
  * validated before use: a well-formed but non-uuid `id`, or a `createdAt` that
  * Postgres cannot parse, throws inside the query and turns an otherwise-valid
  * page request into a 500. A cursor we cannot fully validate is treated as
- * absent, which serves the newest page rather than failing the request.
+ * absent, which serves the newest page rather than failing the request. The
+ * timestamp check is the strict round-trip form, not `Date.parse` alone, because
+ * `Date.parse` is more lenient than Postgres and would still admit a
+ * calendar-invalid date that only throws once it reaches the query.
  */
 export function decodeActivityCursor(cursor: string | undefined): ActivityCursor | null {
   if (!cursor) return null;
@@ -67,7 +91,7 @@ export function decodeActivityCursor(cursor: string | undefined): ActivityCursor
       typeof (parsed as ActivityCursor).createdAt === "string" &&
       typeof (parsed as ActivityCursor).id === "string" &&
       ACTIVITY_CURSOR_ID_PATTERN.test((parsed as ActivityCursor).id) &&
-      !Number.isNaN(Date.parse((parsed as ActivityCursor).createdAt))
+      isServerMintableActivityTimestamp((parsed as ActivityCursor).createdAt)
     ) {
       return parsed as ActivityCursor;
     }
