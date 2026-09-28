@@ -1,0 +1,102 @@
+name: Lockfile refresh guard check
+
+# KEE-1025. The lockfile refresh claim step is shell, and the only tests that
+# execute it live in .github/scripts/tests/manual/. The fork's pr.yml pins
+# `paperclipai/paperclip/.github/workflows/pr-trusted.yml@<upstream ref>`
+# (currently `@master`), and GitHub resolves `uses: owner/repo/path@ref` inside
+# the *named* repository, so a step added to the fork's own pr-trusted.yml never
+# runs here, whether that ref is a SHA or a branch name. That is the same
+# dead-coverage problem KEE-999 found for the worktree guard suites, and this
+# workflow is the fork-local lane that gives the collision suite real CI.
+#
+# It does NOT replace the upstream pin. fork/master's pr-trusted.yml is stale
+# relative to upstream master, and the pin is what keeps the fork on upstream's
+# definition of that workflow. The step added to the fork's pr-trusted.yml in
+# this pull request is therefore for upstream, where it will take effect when
+# this lands; this lane is what makes it real in the fork today.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/lockfile-refresh-guard-check.yml
+      - .github/workflows/refresh-lockfile.yml
+      - .github/scripts/refresh-lockfile-branch.mjs
+      - .github/scripts/check-pr-lockfile.mjs
+      - .github/scripts/tests/manual/refresh-lockfile-collision-e2e.sh
+      - .github/scripts/tests/refresh-lockfile-branch.test.mjs
+      - .github/scripts/tests/refresh-lockfile-exit-code.test.mjs
+      - .github/scripts/tests/lockfile-collision-e2e-wiring.test.mjs
+
+permissions: {}
+
+concurrency:
+  group: lockfile-refresh-guard-check-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    name: Lockfile refresh collision guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      # No pnpm bootstrap. The collision suite builds a throwaway git remote and
+      # stubs `gh`, so it needs no network, no token, and no workspace package.
+      # A missing node_modules here is not an error condition; the suite would
+      # fail loudly if it were.
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
+        with:
+          node-version: 24
+
+      # Detect by content, not by branch. A guard suite that reports success
+      # without running is the exact failure mode this lane exists to remove, so
+      # absence must never read as green.
+      - name: Detect collision suite presence
+        id: suite
+        env:
+          E2E: .github/scripts/tests/manual/refresh-lockfile-collision-e2e.sh
+          SCRIPT: .github/scripts/refresh-lockfile-branch.mjs
+        run: |
+          present=all
+          for f in "$E2E" "$SCRIPT"; do
+            if [ ! -f "$f" ]; then
+              echo "::notice title=Lockfile refresh suite not present::$f is missing on $(git rev-parse --short HEAD); the suite did not run on this pull request"
+              present=none
+            fi
+          done
+          echo "present=$present" >> "$GITHUB_OUTPUT"
+
+      - name: Report collision suite not landed
+        if: steps.suite.outputs.present == 'none'
+        run: |
+          {
+            echo "### Lockfile refresh suite: not run"
+            echo
+            echo "The lockfile refresh guard is not on this pull request's head, so its"
+            echo "suite did not run. This check is **not** evidence that the guard"
+            echo "passed. Re-run it once the guard is on the head."
+            echo
+            echo "See KEE-1025."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Test lockfile refresh exit-code contract
+        if: steps.suite.outputs.present != 'none'
+        run: node --test .github/scripts/tests/refresh-lockfile-exit-code.test.mjs
+
+      # The step that catches a fail-closed regression. The static-text unit
+      # tests stay green when `claim_rc` handling is mutated away, so this is
+      # the only check that executes the real shell block.
+      - name: Test lockfile refresh collision guards
+        if: steps.suite.outputs.present != 'none'
+        run: bash .github/scripts/tests/manual/refresh-lockfile-collision-e2e.sh
+
+      # Runs on every trigger, suite present or not: it is what stops this lane
+      # from being deleted or narrowed back into a fake green.
+      - name: Test guard CI wiring
+        run: node --test .github/scripts/tests/lockfile-collision-e2e-wiring.test.mjs
