@@ -63,6 +63,41 @@ describe("buildIssueBlockersResolvedWakeStateKey", () => {
     );
   });
 
+  // Regression guard for KEE-1137. The duplicate-wake symptom was investigated
+  // as an unstable idempotency key, but the measured defect was elsewhere: the
+  // two observed wake calls carried the SAME key and were refused, not
+  // duplicated. This test pins the key-level invariant the issue describes so a
+  // future key change cannot quietly collapse distinct resolution events.
+  it("keeps one key for a repeated delivery of the same resolution event", () => {
+    const firstDelivery = buildIssueBlockersResolvedResolutionEventKey({
+      dependentIssueId,
+      resolvedBlockerIssueId: blockerIssueId,
+      blockerStatusVersion: 7,
+    });
+    const repeatDelivery = buildIssueBlockersResolvedResolutionEventKey({
+      dependentIssueId,
+      resolvedBlockerIssueId: blockerIssueId,
+      blockerStatusVersion: 7,
+    });
+    expect(repeatDelivery).toBe(firstDelivery);
+  });
+
+  it("mints a new key when the same blocker resolves again after a re-block", () => {
+    // A blocker that re-blocks and resolves again is a genuinely new
+    // completion event, and must not be suppressed by the earlier one.
+    const firstResolution = buildIssueBlockersResolvedResolutionEventKey({
+      dependentIssueId,
+      resolvedBlockerIssueId: blockerIssueId,
+      blockerStatusVersion: 7,
+    });
+    const secondResolution = buildIssueBlockersResolvedResolutionEventKey({
+      dependentIssueId,
+      resolvedBlockerIssueId: blockerIssueId,
+      blockerStatusVersion: 9,
+    });
+    expect(secondResolution).not.toBe(firstResolution);
+  });
+
   it("is identical for the same dependent, blockers, and blockedTransitionAt", () => {
     const first = buildIssueBlockersResolvedWakeStateKey({
       dependentIssueId,
