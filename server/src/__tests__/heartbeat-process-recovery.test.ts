@@ -15383,20 +15383,28 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db.execute(
       sql`create trigger test_native_blocked_wait_fault before insert on issue_comments for each row execute function test_native_blocked_wait_fault()`,
     );
+    let failed: number;
+    let failedIssueIds: string[];
     try {
-      await expect(
-        heartbeatService(db).reconcileStrandedAssignedIssues(),
-      ).rejects.toMatchObject({
-        cause: expect.objectContaining({
-          message: "native_blocked_wait_fixture_fault",
-        }),
-      });
+      // KEE-1095: this used to assert that the whole call *rejects*. The
+      // per-issue containment in `reconcileStrandedAssignedIssues` now catches
+      // this failure and continues the sweep, which is the point of that change,
+      // so propagation out of the sweep is no longer the observable. What this
+      // test is actually about — the rollback — is unchanged and still asserted
+      // in full below. The pass now reports the failure instead of throwing it.
+      const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+      failed = result.failed;
+      failedIssueIds = result.failedIssueIds;
     } finally {
       await db.execute(
         sql`drop trigger test_native_blocked_wait_fault on issue_comments`,
       );
       await db.execute(sql`drop function test_native_blocked_wait_fault()`);
     }
+    // The failure is contained per issue and attributed to the issue that caused
+    // it, not silently dropped and not attributed to the whole sweep.
+    expect(failed).toBe(1);
+    expect(failedIssueIds).toEqual([issueId]);
     expect(
       await db.select().from(issues).where(eq(issues.id, issueId)),
     ).toEqual(before);
