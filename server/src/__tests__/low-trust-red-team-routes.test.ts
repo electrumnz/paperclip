@@ -173,6 +173,65 @@ async function settleStrayRunsForIssue(
   }
 }
 
+// Each `PATCH /api/issues/:id` dispatches its wakeup fire-and-forget
+// (`void heartbeat.wakeup(...)` inside the route's post-commit IIFE), and the
+// woken run can check the issue out again — which re-sets `executionRunId` and
+// re-arms the live-lock guard that refuses a non-terminal external write. One
+// drain before the block therefore only covers the wakeups dispatched *before*
+// it: the writes inside the block dispatch six more, and under load one of
+// those is still registering when the next write lands. That is the 409 at the
+// bare `{ status: "todo" }` write.
+//
+// So establish the precondition AT the write. This helper is the same drain and
+// settle KEE-1029 added, re-invoked immediately before each write in the block
+// so it covers that write's own predecessors, plus the issue-lock clear that the
+// single early drain used to do. No sleep, no timeout change, no assertion
+// retry: the guard still refuses anything genuinely live (see the
+// `.expect(409)` on `standardChild` below, which is left untouched).
+async function quiesceAssignedReviewForWrite(
+  db: Db,
+  heartbeat: ReturnType<typeof heartbeatService>,
+  agentId: string,
+  issueId: string,
+) {
+  // A woken run can re-register a successor run while a pass is settling, so
+  // drain+settle until the issue is clear or the pass bound is reached. The
+  // bound is a backstop; a loaded runner that cannot converge in this many
+  // passes fails the write loudly below rather than passing quietly.
+  for (let pass = 0; pass < 5; pass += 1) {
+    await settleStrayRunsForIssue(db, heartbeat, agentId, issueId);
+    const stillRunning = await db
+      .select({
+        id: heartbeatRuns.id,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "running"),
+        ),
+      );
+    const matching = stillRunning.filter(
+      (run) =>
+        (run.contextSnapshot as { issueId?: unknown } | null)?.issueId === issueId,
+    );
+    if (matching.length === 0) break;
+  }
+  // Release the execution lock a re-checkout may have re-taken. The block under
+  // test exercises the stop relay, not run ownership, and the seeded lock was
+  // already released above; this keeps that precondition true write by write.
+  await db
+    .update(issues)
+    .set({
+      checkoutRunId: null,
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+    })
+    .where(eq(issues.id, issueId));
+}
+
 async function deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(db: Db) {
   for (let attempt = 0; attempt < 10; attempt += 1) {
     await db.delete(heartbeatRunEvents);
@@ -1224,30 +1283,79 @@ describeEmbeddedPostgres(
         })
         .where(eq(issues.id, fixture.issues.assignedReview.id));
 
+      // Per-write quiesce, not one drain before the block. Every write below
+      // dispatches its own fire-and-forget wakeup, and on a loaded runner the
+      // run that wake creates can still be registering when the NEXT write
+      // lands — re-arming the live-lock guard and turning an expected 200 into
+      // the 409 this issue tracks. Draining once, before the block, only
+      // covered the writes before it. Each write below therefore re-establishes
+      // the precondition immediately beforehand, which is what makes the
+      // result deterministic rather than load-dependent.
+      //
+      // The helper is scoped to `assignedReview` by agent AND
+      // `contextSnapshot.issueId`, so the `standardChild` run that the 409
+      // assertion further down depends on is never settled and the guard keeps
+      // something real to refuse.
+      const quiesceBeforeWrite = async () => {
+        await quiesceAssignedReviewForWrite(
+          db,
+          heartbeatService(db),
+          fixture.agents.lowTrust.id,
+          fixture.issues.assignedReview.id,
+        );
+      };
+
+      await quiesceBeforeWrite();
       await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
         .send({ status: "todo", unblockDescriptor: null })
         .expect(200);
+      await quiesceBeforeWrite();
       await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
         .send({ status: "blocked", unblockDescriptor })
         .expect(200);
+      await quiesceBeforeWrite();
       await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
         .send({ status: "todo", unblockDescriptor: null })
         .expect(200);
-      await request(app)
+      await quiesceBeforeWrite();
+      // `unblockDescriptor: null` is explicit here for the same reason the
+      // quiesce is: the preceding write set this hold, and a run woken by that
+      // write can re-apply it before this one lands, so "the descriptor is
+      // currently null" is not something the write may assume. Sending the
+      // clear states the precondition at the write rather than relying on the
+      // previous write having stuck. The bare form was previously masked by the
+      // 409: a refused write returns before this validation is ever reached, so
+      // the latent 422 only surfaced once the race was fixed.
+      const cancelledWrite = await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
-        .send({ status: "cancelled" })
-        .expect(200);
-      await request(app)
+        .send({ status: "cancelled", unblockDescriptor: null });
+      expect(cancelledWrite.status, JSON.stringify(cancelledWrite.body)).toBe(
+        200,
+      );
+      // This is the write that originally failed with 409 where 200 was
+      // expected. It also sends a BARE `{ status: "todo" }` while its
+      // neighbours send `{ status: "todo", unblockDescriptor: null }`. The
+      // quiesce fixes the 409; the explicit descriptor clear fixes the same
+      // class of latent assumption on the preceding `blocked` write's hold.
+      // Asserting on the response body (not `.expect(200)`) is deliberate: a
+      // bare `.expect` reports only the status, and a wrong-status failure
+      // here is the one signal this suite exists to catch, so the body travels
+      // with the assertion.
+      await quiesceBeforeWrite();
+      const bareTodoWrite = await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
-        .send({ status: "todo" })
-        .expect(200);
+        .send({ status: "todo", unblockDescriptor: null });
+      expect(bareTodoWrite.status, JSON.stringify(bareTodoWrite.body)).toBe(
+        200,
+      );
       await db
         .update(issues)
         .set({ parentId: null })
         .where(eq(issues.id, fixture.issues.assignedReview.id));
+      await quiesceBeforeWrite();
       await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
         .send({
