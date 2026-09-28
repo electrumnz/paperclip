@@ -95,6 +95,17 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.code).not.toBe("cross_issue_influence_run_context_required");
   });
 
+  it("does not send a caller with an anchored run back for the same header", () => {
+    // A run that reached the write with a valid id but no issue anchor cannot be
+    // fixed by resending that id. Telling the caller to resend makes it burn
+    // calls on a dead end, so the copy must name the other escape route.
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_context_required");
+    expect(copy.description).toContain("no issue anchor");
+    expect(copy.sanctionedPath).toContain("no issue anchor");
+    expect(copy.sanctionedPath).toContain("resending will not");
+    expect(copy.sanctionedPath).toContain("open a new issue");
+  });
+
   it("tells a spoof attempt that the write itself was fine", () => {
     const copy = describeIssueWriteDenial("issue_write_attribution_spoof_rejected", {
       actorLabel: "Fable",
