@@ -121,6 +121,58 @@ async function settleSeededHeartbeatRuns(db: Db, runIds: Set<string>) {
     .where(inArray(heartbeatRuns.id, ids));
 }
 
+// `resolveActiveIssueRun` (server/src/routes/issues.ts) has a second source of
+// truth beyond `issue.executionRunId`: once that is null it falls back to
+// `getActiveRunForAgent(assigneeAgentId)`, which returns the most recent
+// `running` run for that agent WITHOUT scoping by issue
+// (server/src/services/heartbeat.ts). The PATCHes in this test dispatch
+// wakeups fire-and-forget (`void heartbeat.wakeup(...)`), and
+// `drainActiveRunExecutions` exists precisely because such a wake is not
+// observable until it registers. On a loaded runner one of those wakeups can
+// still be in flight at the write below, register a fresh `running` run for the
+// same agent scoped to this same issue, and re-arm the live-lock guard -- so the
+// write fails 409 where 200 is expected. That is a load-dependent test defect,
+// not a route defect.
+//
+// Settle those, and only those. The match is on agent AND
+// `contextSnapshot.issueId`; scoping by agent alone would also settle
+// `fixture.runs.standardReport`, which belongs to the same `standard` agent and
+// is the very run the 409 assertion further down depends on, silently
+// weakening the guard this suite exists to prove.
+async function settleStrayRunsForIssue(
+  db: Db,
+  heartbeat: ReturnType<typeof heartbeatService>,
+  agentId: string,
+  issueId: string,
+) {
+  // Bounded passes: each drain awaits wakeups that were still before run
+  // registration, and an execution that dispatched one can register a further
+  // run. The pass cap is a backstop, not the expected path.
+  for (let pass = 0; pass < 3; pass += 1) {
+    await heartbeat.drainActiveRunExecutions();
+    const running = await db
+      .select({
+        id: heartbeatRuns.id,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "running"),
+        ),
+      );
+    const matching = running
+      .filter((run) => run.contextSnapshot?.issueId === issueId)
+      .map((run) => run.id);
+    if (matching.length === 0) return;
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(inArray(heartbeatRuns.id, matching));
+  }
+}
+
 async function deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(db: Db) {
   for (let attempt = 0; attempt < 10; attempt += 1) {
     await db.delete(heartbeatRunEvents);
@@ -1137,6 +1189,22 @@ describeEmbeddedPostgres(
       // the step below asserts the guard *does* return 409 for that issue.
       // Settling the guard's own behaviour is covered directly in
       // `issue-stale-execution-lock-routes.test.ts`.
+      //
+      // The two seeded runs below are settled, then the lock is cleared. The
+      // assignee fallback still has a hole: this test's own earlier PATCHes
+      // dispatch wakeups fire-and-forget, and on a loaded runner one can still
+      // be in flight at the writes after this point, registering a fresh
+      // `running` run for this same agent on this same issue. Drain those and
+      // settle them too, so the guard's precondition is deterministic instead of
+      // dependent on background timing. Scoped to `assignedReview`, so the
+      // `standardChild` run that the 409 assertion below depends on is left
+      // running.
+      await settleStrayRunsForIssue(
+        db,
+        heartbeatService(db),
+        fixture.agents.lowTrust.id,
+        fixture.issues.assignedReview.id,
+      );
       await db
         .update(heartbeatRuns)
         .set({ status: "succeeded", finishedAt: new Date() })
