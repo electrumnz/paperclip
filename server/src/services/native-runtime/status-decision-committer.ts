@@ -1994,31 +1994,36 @@ export async function commitNativeStatusDecision(input: {
       // ownership, so an in-flight run cannot clear or replace a hold that a
       // board user or another agent placed.
       //
-      // This guard runs FIRST. It throws, so it can only ever narrow what the
-      // projection below is allowed to write; the two are complementary
-      // ownership invariants on the same site, not alternatives.
-      const completingRun = await tx
-        .select({ agentId: heartbeatRuns.agentId })
-        .from(heartbeatRuns)
-        .where(eq(heartbeatRuns.id, input.runId))
-        .limit(1)
-        .then((rows) => rows[0] ?? null);
-      if (completingRun) {
-        const existingDescriptor = (
-          issue as typeof issues.$inferSelect | null
-        )?.unblockDescriptor;
-        if (existingDescriptor) {
-          const existingOwner = existingDescriptor.owner;
-          const ownedByCompletingRun =
-            typeof existingOwner === "object" &&
-            "agentId" in existingOwner &&
-            existingOwner.agentId === completingRun.agentId;
-          const changingDescriptor =
-            input.decision.unblockDescriptor !== undefined &&
-            JSON.stringify(input.decision.unblockDescriptor) !==
-              JSON.stringify(existingDescriptor);
-          if (!ownedByCompletingRun && changingDescriptor) {
-            throw new NativeStatusRaceError();
+      // This guard applies to every non-`blocked` status action: it is the
+      // "a run may not clear or rewrite someone else's hold" invariant. It
+      // deliberately does NOT run for a `blocked` decision - see the KEE-916
+      // projection below, which is the policy for binding a new blocker, and
+      // which this guard would otherwise reject for every agent-owned
+      // `bind_blocker` on a card that already carries a hold.
+      if (input.decision.statusAction !== "blocked") {
+        const completingRun = await tx
+          .select({ agentId: heartbeatRuns.agentId })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, input.runId))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (completingRun) {
+          const existingDescriptor = (
+            issue as typeof issues.$inferSelect | null
+          )?.unblockDescriptor;
+          if (existingDescriptor) {
+            const existingOwner = existingDescriptor.owner;
+            const ownedByCompletingRun =
+              typeof existingOwner === "object" &&
+              "agentId" in existingOwner &&
+              existingOwner.agentId === completingRun.agentId;
+            const changingDescriptor =
+              input.decision.unblockDescriptor !== undefined &&
+              JSON.stringify(input.decision.unblockDescriptor) !==
+                JSON.stringify(existingDescriptor);
+            if (!ownedByCompletingRun && changingDescriptor) {
+              throw new NativeStatusRaceError();
+            }
           }
         }
       }
