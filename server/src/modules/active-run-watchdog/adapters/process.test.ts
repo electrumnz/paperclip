@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { spawn } from "node:child_process";
 import { runningProcesses } from "../../../adapters/utils.js";
 import { isPidAlive, isProcessGroupAlive, terminateLocalService } from "../../../services/local-service-supervisor.js";
 import { createProcessAdapter } from "./process.js";
@@ -12,6 +13,27 @@ vi.mock("../../../services/local-service-supervisor.js", () => ({
 const mockedIsPidAlive = vi.mocked(isPidAlive);
 const mockedIsProcessGroupAlive = vi.mocked(isProcessGroupAlive);
 const mockedTerminateLocalService = vi.mocked(terminateLocalService);
+
+// Real-process helpers. The orphan cases need genuinely live processes carrying a
+// real `PAPERCLIP_RUN_ID`, because the production sweep reads /proc; a mocked
+// liveness probe would not exercise the attribution at all.
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function waitForExit(pid: number, timeoutMs = 5_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!pidAlive(pid)) return true;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return !pidAlive(pid);
+}
 
 describe("adapters", () => {
   describe("createProcessAdapter", () => {
@@ -46,7 +68,13 @@ describe("adapters", () => {
         fallbackProcessGroupId: null,
       });
 
-      expect(outcome).toEqual({ attempted: false, outcome: "no_process_metadata", adapterType: "codex_local" });
+      expect(outcome).toEqual({
+        attempted: false,
+        outcome: "no_process_metadata",
+        adapterType: "codex_local",
+        pid: null,
+        processGroupId: null,
+      });
     });
 
     it("reports not_running when the process is dead", async () => {
@@ -168,11 +196,124 @@ describe("adapters", () => {
           attempted: false,
           outcome: "no_process_metadata",
           adapterType: "codex_local",
+          pid: null,
+          processGroupId: null,
         });
         expect(mockedIsPidAlive).not.toHaveBeenCalled();
         expect(mockedIsProcessGroupAlive).not.toHaveBeenCalled();
         expect(mockedTerminateLocalService).not.toHaveBeenCalled();
       },
     );
+
+    // The orphan cases the 12:10:56Z oomd kill and the operator's 12:21Z
+    // attribution both showed: the run's own process is gone, but a
+    // `timeout`-wrapped descendant still carries the run id and is still holding
+    // memory. The early returns below used to skip the sweep entirely, so
+    // exactly these processes were the ones that accumulated.
+    describe("orphan descendants (run process already gone)", () => {
+      it("sweeps a live tagged descendant when the main pid and group are dead", async () => {
+        const runId = `orphan-pgid-${process.pid}-${Date.now()}`;
+        // A `timeout`-wrapped payload: its own process group, carrying the run id.
+        const orphan = spawn("/usr/bin/timeout", ["120", "sleep", "120"], {
+          stdio: "ignore",
+          env: { ...process.env, PAPERCLIP_RUN_ID: runId },
+        });
+        // An unrelated process that must survive the sweep.
+        const bystanderRunId = `bystander-${process.pid}-${Date.now()}`;
+        const bystander = spawn("/usr/bin/timeout", ["120", "sleep", "120"], {
+          stdio: "ignore",
+          env: { ...process.env, PAPERCLIP_RUN_ID: bystanderRunId },
+        });
+        try {
+          await new Promise((r) => setTimeout(r, 400));
+          expect(pidAlive(orphan.pid!)).toBe(true);
+          expect(pidAlive(bystander.pid!)).toBe(true);
+
+          // Main process and its group are both dead: the group signal cannot
+          // reach anything, which is the whole point of this branch.
+          mockedIsPidAlive.mockReturnValue(false);
+          mockedIsProcessGroupAlive.mockReturnValue(false);
+
+          const outcome = await createProcessAdapter().cleanupRunProcess({
+            runId,
+            adapterType: "hermes_local",
+            // A pid that is long gone.
+            fallbackPid: 999_001,
+            fallbackProcessGroupId: null,
+          });
+
+          // The orphan is reaped even though the main process was already dead.
+          expect(await waitForExit(orphan.pid!, 5_000)).toBe(true);
+          expect(outcome.attempted).toBe(true);
+          expect(outcome.outcome).toBe("terminated");
+          expect(
+            (outcome as { escapedDescendantsSignaled?: number }).escapedDescendantsSignaled,
+          ).toBeGreaterThan(0);
+          expect(mockedTerminateLocalService).not.toHaveBeenCalled();
+
+          // An unrelated run's process is untouched.
+          expect(pidAlive(bystander.pid!)).toBe(true);
+        } finally {
+          for (const p of [orphan.pid, bystander.pid]) {
+            try {
+              process.kill(p!, "SIGKILL");
+            } catch {
+              // already gone
+            }
+          }
+        }
+      }, 20_000);
+
+      it("sweeps a live tagged descendant when no process metadata exists at all", async () => {
+        const runId = `orphan-nometa-${process.pid}-${Date.now()}`;
+        const orphan = spawn("/usr/bin/timeout", ["120", "sleep", "120"], {
+          stdio: "ignore",
+          env: { ...process.env, PAPERCLIP_RUN_ID: runId },
+        });
+        try {
+          await new Promise((r) => setTimeout(r, 400));
+          expect(pidAlive(orphan.pid!)).toBe(true);
+
+          // No pid and no process group: previously an immediate no-op return.
+          const outcome = await createProcessAdapter().cleanupRunProcess({
+            runId,
+            adapterType: "hermes_local",
+            fallbackPid: null,
+            fallbackProcessGroupId: null,
+          });
+
+          expect(await waitForExit(orphan.pid!, 5_000)).toBe(true);
+          expect(outcome.attempted).toBe(true);
+          expect(outcome.outcome).toBe("terminated");
+          expect(mockedTerminateLocalService).not.toHaveBeenCalled();
+        } finally {
+          try {
+            process.kill(orphan.pid!, "SIGKILL");
+          } catch {
+            // already gone
+          }
+        }
+      }, 20_000);
+
+      it("still reports not_running when there is nothing attributed to the run", async () => {
+        mockedIsPidAlive.mockReturnValue(false);
+        mockedIsProcessGroupAlive.mockReturnValue(false);
+
+        const outcome = await createProcessAdapter().cleanupRunProcess({
+          runId: `no-such-run-${process.pid}-${Date.now()}`,
+          adapterType: "hermes_local",
+          fallbackPid: 999_002,
+          fallbackProcessGroupId: null,
+        });
+
+        expect(outcome).toEqual({
+          attempted: false,
+          outcome: "not_running",
+          adapterType: "hermes_local",
+          pid: 999_002,
+          processGroupId: null,
+        });
+      });
+    });
   });
 });

@@ -261,7 +261,7 @@ import {
   providerTraceStore,
   PROVIDER_TRACE_MAX_BYTES,
 } from "./provider-trace-store.js";
-import { getServerAdapter, runningProcesses } from "../adapters/index.js";
+import { getServerAdapter, readProcessGroupIdFromProc, runningProcesses, sweepRunDescendantsByRunId } from "../adapters/index.js";
 import type {
   AdapterExecutionResult,
   AdapterInvocationMeta,
@@ -8891,31 +8891,151 @@ export async function persistHeartbeatRunProcessMetadata(
   });
 }
 
-async function terminateHeartbeatRunProcess(input: {
+// Cancellation of a run must reach the whole run, not just the processes still
+// in the run's process group.
+//
+// `runChildProcess` spawns detached, so the direct child leads a process group,
+// and signalling `-processGroupId` only reaches that group. Tool commands break
+// it: a `timeout`-wrapped command (`timeout 900 pnpm --filter server exec vitest
+// ...`) makes `timeout` place its payload in a NEW process group via
+// `setpgid(0, 0)` — same session, different group — so the payload and everything
+// it spawns (pnpm, tsc, vitest, embedded postgres fixtures) sit outside the run's
+// group and survive the group signal.
+//
+// The comment above the codex_local SIGINT special case below records the same
+// failure mode being worked around for one adapter only. This is the general
+// fix: `PAPERCLIP_RUN_ID` is assigned to the run's child and inherited by every
+// descendant regardless of which process group it ended up in, so sweeping by
+// run id reaches whatever the group signal missed.
+//
+// The run id is required rather than optional so no caller can silently take the
+// group-only path that leaves descendants behind.
+// Exported for the regression test that proves cancellation reaches descendants
+// outside the run's process group. Not part of the service surface: callers
+// inside this module use it directly, and `heartbeatService(...).cancelRun` is
+// the supported entry point.
+export async function terminateHeartbeatRunProcess(input: {
+  runId: string;
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
   graceMs?: number;
   signal?: NodeJS.Signals;
+  /**
+   * Pids the run owns and that must SURVIVE this cleanup, even though they carry
+   * the run id in their environment.
+   *
+   * This is the adapter's own live child. Session-shaped adapters (`claude_local`
+   * with the ACP engine, `codex_local`, and the sessioned local adapters generally)
+   * keep one long-lived process across a stop: the ACP fixture in
+   * `scripts/mcp-fixtures/servers/acp-stop-agent.mjs` writes a `continued` marker
+   * on `session/cancel` and stays alive expecting a later `session/prompt` on the
+   * SAME process. Killing it is indistinguishable, from the next run's point of
+   * view, from an agent that never started -- the follow-up run then has nothing
+   * to talk to and simply never produces a message.
+   *
+   * The group signal above deliberately stops the run's work; this preserves the
+   * session carrier itself. The two are different lifetimes and were previously
+   * conflated because the sweep inferred ownership from `pid`, which is null on
+   * the no-registry path.
+   *
+   * Preservation is a SWEEP concern only. The caller must still pass `pid: null`
+   * and `processGroupId: null` on the no-registry path, so the group signal stays
+   * silent: a persisted pid with no live registry entry is deliberately not
+   * signalled (`heartbeat-process-recovery.test.ts`, "does not signal an unowned
+   * persisted process"). Feeding the run's recorded group in as `processGroupId`
+   * re-arms that signal and fails those three tests.
+   */
+  preservePids?: number[];
 }) {
   const pid = input.pid ?? null;
   const processGroupId = input.processGroupId ?? null;
-  if (typeof pid !== "number" && typeof processGroupId !== "number") return;
 
-  await terminateLocalService(
-    {
-      pid:
-        typeof pid === "number" && Number.isInteger(pid) && pid > 0
-          ? pid
-          : (processGroupId ?? 0),
-      processGroupId:
-        typeof processGroupId === "number" &&
-        Number.isInteger(processGroupId) &&
-        processGroupId > 0
-          ? processGroupId
-          : null,
-    },
-    { forceAfterMs: input.graceMs, signal: input.signal },
-  );
+  // The process-group signal is best effort. The run-id sweep below is not, and
+  // it must run even when there is no process to signal at all.
+  //
+  // This is the orphan case: the run's own process and its group are already
+  // gone -- a crash, the oomd kill, or a registry entry that never existed
+  // because the run never registered a local child -- while a `timeout`-wrapped
+  // or login-shell descendant still carries the run id and is still holding
+  // memory. Returning early on absent pid/group left exactly those holding
+  // memory, because there was no process group left for the group signal to
+  // reach. Cleanup must not depend on main-process liveness.
+  if (typeof pid === "number" || typeof processGroupId === "number") {
+    await terminateLocalService(
+      {
+        pid:
+          typeof pid === "number" && Number.isInteger(pid) && pid > 0
+            ? pid
+            : (processGroupId ?? 0),
+        processGroupId:
+          typeof processGroupId === "number" &&
+          Number.isInteger(processGroupId) &&
+          processGroupId > 0
+            ? processGroupId
+            : null,
+      },
+      { forceAfterMs: input.graceMs, signal: input.signal },
+    );
+  }
+
+  // Companion to the group signal: catch descendants that a `timeout`-wrapped tool
+  // command moved into a process group of their own. Best effort, and it runs
+  // after the group signal so a sweep failure can never turn a successful
+  // cancellation into a failure.
+  //
+  // The exclusion set is explicit and is the union of:
+  //   - this process, which the helper always adds;
+  //   - the run's own child when the caller has one, which the group signal
+  //     above already owned;
+  //   - `preservePids`, the session carriers that must outlive the stop.
+  //
+  // Note what is NOT here: any inference about which pids "belong" to the run
+  // based on liveness or on the presence of a registry entry. On the no-registry
+  // path `pid` is null, and inferring ownership from it silently widened the
+  // sweep to the run's live session process -- which is what broke
+  // `tests/e2e/acp-stop-continuation.spec.ts`.
+  //
+  // Attribution is the run id in the environment, which is host-local by
+  // construction: a remote run's processes do not carry this server's run id, so
+  // the sweep cannot reach across a remote boundary even if one were passed here.
+  try {
+    const exclude = new Set<number>(input.preservePids ?? []);
+    if (typeof pid === "number" && Number.isInteger(pid) && pid > 0) {
+      exclude.add(pid);
+    }
+    // Preserve the group of every preserved pid, not only a group passed in
+    // separately.
+    //
+    // A session carrier is a supervisor (`timeout`, a wrapper, a login shell)
+    // whose payload shares ITS OWN process group. A warm-reused persistent ACP
+    // session reports exactly this shape: `acpx-engine/execute.ts:4485-4489`
+    // calls onSpawn with the session pid and `processGroupId: null`, because the
+    // session was not spawned by this run. With no group on the run record there
+    // is nothing to preserve, so the sweep signals the payload and the
+    // supervisor dies transitively -- measured: `timeout 30 sleep 30`, SIGKILL
+    // on the `sleep` alone, reports the `timeout` as Killed.
+    //
+    // So the preserved pids' own groups are resolved here, which covers the
+    // null-group case as well as a recorded one.
+    const preserveGroups = new Set<number>();
+    for (const preserved of exclude) {
+      const groupId = readProcessGroupIdFromProc(preserved);
+      if (groupId !== null) preserveGroups.add(groupId);
+    }
+    if (
+      typeof processGroupId === "number" &&
+      Number.isInteger(processGroupId) &&
+      processGroupId > 0
+    ) {
+      preserveGroups.add(processGroupId);
+    }
+    sweepRunDescendantsByRunId(input.runId, input.signal ?? "SIGKILL", {
+      excludePids: [...exclude],
+      preserveProcessGroupIds: [...preserveGroups],
+    });
+  } catch {
+    // Never turn a successful cancellation into a reported failure.
+  }
 }
 
 function buildProcessLossMessage(
@@ -15118,9 +15238,26 @@ export function heartbeatService(
         }
         if (running) {
           await terminateHeartbeatRunProcess({
+            runId: run.id,
             pid: running.child.pid,
             processGroupId: running.processGroupId,
+            // The live child is the session carrier and must survive the stop;
+            // the group signal above already ended the run's work.
+            preservePids: typeof running.child.pid === "number" ? [running.child.pid] : [],
             graceMs: Math.max(1, running.graceSec) * 1000,
+          });
+        } else {
+          // Shutdown must not strand a `timeout`-wrapped descendant just because
+          // the registry has no entry for this run.
+          await terminateHeartbeatRunProcess({
+            runId: run.id,
+            pid: null,
+            processGroupId: null,
+            // Preserve the run's session carrier; see the single-run path.
+            preservePids: [run.processPid].filter(
+              (value): value is number =>
+                typeof value === "number" && Number.isInteger(value) && value > 0,
+            ),
           });
         }
       } finally {
@@ -29117,8 +29254,12 @@ export function heartbeatService(
             });
             if (running) {
               await terminateHeartbeatRunProcess({
+                runId: run.id,
                 pid: running.child.pid,
                 processGroupId: running.processGroupId,
+                // The live child is the session carrier and must survive the stop;
+                // the group signal above already ended the run's work.
+                preservePids: typeof running.child.pid === "number" ? [running.child.pid] : [],
                 // Codex handles Ctrl-C by cancelling its tool sessions. SIGTERM
                 // can leave commands in their separate process groups alive.
                 signal: !control && agent?.adapterType === "codex_local" ? "SIGINT" : undefined,
@@ -29126,6 +29267,25 @@ export function heartbeatService(
                   running.graceSec,
                   options.terminationGraceMs,
                 ),
+              });
+            } else {
+              // No registry entry: the run never registered a local child, or it
+              // was already cleaned up. That says nothing about descendants a
+              // `timeout`-wrapped command moved into another process group, so
+              // the run-id sweep still has to run. It is the only cleanup left.
+              await terminateHeartbeatRunProcess({
+                runId: run.id,
+                pid: null,
+                processGroupId: null,
+                // The run's persisted child is the session carrier for
+                // session-shaped adapters and must survive a stop: a later run in
+                // the same session talks to the SAME process. Preserve it by
+                // pid even though the live registry has no entry.
+                preservePids: [run.processPid].filter(
+                  (value): value is number =>
+                    typeof value === "number" && Number.isInteger(value) && value > 0,
+                ),
+                signal: !control && agent?.adapterType === "codex_local" ? "SIGINT" : undefined,
               });
             }
             terminationSettled = true;
@@ -29330,9 +29490,28 @@ export function heartbeatService(
         const running = runningProcesses.get(run.id);
         if (running) {
           await terminateHeartbeatRunProcess({
+            runId: run.id,
             pid: running.child.pid,
             processGroupId: running.processGroupId,
+            // The live child is the session carrier and must survive the stop;
+            // the group signal above already ended the run's work.
+            preservePids: typeof running.child.pid === "number" ? [running.child.pid] : [],
             graceMs: Math.max(1, running.graceSec) * 1000,
+          });
+        } else {
+          // Same orphan case as the single-run path: an empty registry does not
+          // mean there is nothing left to clean up. This is the path that
+          // finalised runs as `cancelled` in the 12:21Z attribution, where
+          // cancelled runs still held 24 / 22 / 6 child processes.
+          await terminateHeartbeatRunProcess({
+            runId: run.id,
+            pid: null,
+            processGroupId: null,
+            // Preserve the run's session carrier; see the single-run path.
+            preservePids: [run.processPid].filter(
+              (value): value is number =>
+                typeof value === "number" && Number.isInteger(value) && value > 0,
+            ),
           });
         }
         runningProcesses.delete(run.id);
