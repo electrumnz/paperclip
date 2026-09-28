@@ -2685,6 +2685,7 @@ export function agentRoutes(
     role: string;
     adapterType: string;
     adapterConfig: unknown;
+    updatedAt: Date;
   }>(
     agent: T,
     input?: { files: Record<string, string>; entryFile?: string },
@@ -2710,6 +2711,9 @@ export function agentRoutes(
       if (!hadLegacyPrompt) return agent;
 
       const updated = await svc.update(agent.id, { adapterConfig: nextAdapterConfig }, {
+        // Guard the read-modify-write against a config change that committed
+        // after `agent` was read.
+        expectedUpdatedAt: agent.updatedAt,
         allowPendingApprovalConfigUpdate: true,
       });
       return (updated as T | null) ?? { ...agent, adapterConfig: nextAdapterConfig };
@@ -2727,6 +2731,9 @@ export function agentRoutes(
     delete nextAdapterConfig.bootstrapPromptTemplate;
 
     const updated = await svc.update(agent.id, { adapterConfig: nextAdapterConfig }, {
+      // Guard the read-modify-write against a config change that committed
+      // after `agent` was read.
+      expectedUpdatedAt: agent.updatedAt,
       allowPendingApprovalConfigUpdate: true,
     });
     return (updated as T | null) ?? { ...agent, adapterConfig: nextAdapterConfig };
@@ -3939,6 +3946,9 @@ export function agentRoutes(
       const updated = await svc.update(agent.id, {
         adapterConfig: nextAdapterConfig,
       }, {
+        // Guard the read-modify-write against a config change that committed
+        // after `agent` was read.
+        expectedUpdatedAt: agent.updatedAt,
         recordRevision: {
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -5023,6 +5033,9 @@ export function agentRoutes(
       id,
       { adapterConfig: normalizedAdapterConfig },
       {
+        // Guard the read-modify-write against a config change that committed
+        // after `existing` was read.
+        expectedUpdatedAt: existing.updatedAt,
         recordRevision: {
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -5091,6 +5104,9 @@ export function agentRoutes(
       id,
       { adapterConfig: normalizedAdapterConfig },
       {
+        // Guard the read-modify-write against a config change that committed
+        // after `existing` was read.
+        expectedUpdatedAt: existing.updatedAt,
         recordRevision: {
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -5156,6 +5172,9 @@ export function agentRoutes(
       id,
       { adapterConfig: normalizedAdapterConfig },
       {
+        // Guard the read-modify-write against a config change that committed
+        // after `existing` was read.
+        expectedUpdatedAt: existing.updatedAt,
         recordRevision: {
           createdByAgentId: actor.agentId,
           createdByUserId: actor.actorType === "user" ? actor.actorId : null,
@@ -5393,6 +5412,10 @@ export function agentRoutes(
 
     const actor = getActorInfo(req);
     const agent = await svc.update(id, patchData, {
+      // `existing` was read before this handler built its patch. A concurrent
+      // config write that has since committed (for example a secret-binding
+      // revoke) must not be silently overwritten by this stale read-modify-write.
+      expectedUpdatedAt: existing.updatedAt,
       recordRevision: {
         createdByAgentId: actor.agentId,
         createdByUserId: actor.actorType === "user" ? actor.actorId : null,
