@@ -86,6 +86,15 @@ describe("describeIssueWriteDenial", () => {
     expect(copy.sanctionedPath).toContain("PAPERCLIP_RUN_ID");
   });
 
+  it("never tells an unanchored run that a header retry will work, and points it at the child-issue path instead", () => {
+    const copy = describeIssueWriteDenial("cross_issue_influence_run_not_issue_scoped");
+    expect(copy.status).toBe(403);
+    expect(copy.sanctionedPath).not.toContain("X-Paperclip-Run-Id");
+    expect(copy.sanctionedPath).not.toContain("PAPERCLIP_RUN_ID");
+    expect(copy.sanctionedPath).toContain("child issue");
+    expect(copy.code).not.toBe("cross_issue_influence_run_context_required");
+  });
+
   it("does not send a caller with an anchored run back for the same header", () => {
     // A run that reached the write with a valid id but no issue anchor cannot be
     // fixed by resending that id. Telling the caller to resend makes it burn
