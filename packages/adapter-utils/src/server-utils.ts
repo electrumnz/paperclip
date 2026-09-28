@@ -243,6 +243,19 @@ export interface RunDescendantSweepOptions {
    * sweepable by omitting its own pid from the exclusion set.
    */
   excludePids?: Iterable<number>;
+  /**
+   * Process GROUPS to preserve in full. Every member of these groups is treated
+   * as excluded, not just the leader.
+   *
+   * This exists because excluding a pid is not sufficient to keep a process
+   * alive. A session carrier is commonly a supervisor (`timeout`, a wrapper
+   * script, a login shell) whose payload is a child in the SAME process group.
+   * Signalling the payload kills the supervisor transitively -- measured:
+   * `timeout 30 sleep 30`, SIGKILL on the `sleep` alone, leaves the `timeout`
+   * reported as "Killed". Excluding the supervisor's pid would therefore not
+   * save it; the whole group has to be preserved.
+   */
+  preserveProcessGroupIds?: Iterable<number>;
   /** Injectable pid source; defaults to a /proc scan. Test seam only. */
   listPids?: () => number[];
   /**
@@ -256,6 +269,12 @@ export interface RunDescendantSweepOptions {
    * branch deterministically.
    */
   skipIdentityRecheck?: boolean;
+  /**
+   * Injectable process-group lookup. Test seam only; defaults to /proc.
+   * Defaults to `null` (unknown) when it cannot be read, which fails SAFE:
+   * an unknown group is preserved, never signalled.
+   */
+  readProcessGroupId?: (pid: number) => number | null;
 }
 
 export interface RunDescendantSweepResult {
@@ -281,6 +300,24 @@ function defaultListPids(): number[] {
     .filter((pid) => Number.isInteger(pid) && pid > 0);
 }
 
+// /proc/<pid>/stat field 5 is the process group id. Field 2 (comm) can contain
+// spaces and parentheses, so the parse anchors on the LAST ')' before the rest.
+// Exported so a caller that must preserve a process can also preserve the
+// process GROUP it leads, without re-implementing the parse.
+export function readProcessGroupIdFromProc(pid: number): number | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const close = stat.lastIndexOf(")");
+    if (close < 0) return null;
+    const fields = stat.slice(close + 2).trim().split(/\s+/);
+    // After comm, field 3 is state and field 4 is ppid, so ppgid is index 2.
+    const pgid = Number.parseInt(fields[2] ?? "", 10);
+    return Number.isInteger(pgid) && pgid > 0 ? pgid : null;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Signal every live process that carries `runId` in its environment, excluding
  * this process and `excludePids`.
@@ -304,6 +341,14 @@ export function sweepRunDescendantsByRunId(
   // can make the Paperclip server sweepable by passing its own excludePids.
   const exclude = new Set<number>(options.excludePids ?? []);
   exclude.add(process.pid);
+  // Whole groups to preserve. Membership is expanded per candidate pid, so a
+  // supervisor's payload in the same group is preserved with it. See
+  // `preserveProcessGroupIds` for why pid-level exclusion is not enough.
+  const preserveGroups = new Set<number>();
+  for (const groupId of options.preserveProcessGroupIds ?? []) {
+    if (Number.isInteger(groupId) && groupId > 0) preserveGroups.add(groupId);
+  }
+  const readProcessGroupId = options.readProcessGroupId ?? readProcessGroupIdFromProc;
   const listPids = options.listPids ?? defaultListPids;
   const readRunId = options.readRunId ?? readRunIdFromProc;
   const result: RunDescendantSweepResult = {
@@ -324,6 +369,16 @@ export function sweepRunDescendantsByRunId(
     if (exclude.has(pid)) {
       result.excludedPids.push(pid);
       continue;
+    }
+    // A preserved group is preserved in full. An unreadable group id is treated
+    // as "unknown" and preserved too: failing safe here can leak one process,
+    // whereas failing open would kill a session the caller asked to keep.
+    if (preserveGroups.size > 0) {
+      const groupId = readProcessGroupId(pid);
+      if (groupId === null || preserveGroups.has(groupId)) {
+        result.excludedPids.push(pid);
+        continue;
+      }
     }
     if (readRunId(pid) !== runId) continue;
     seenRunIds.add(runId);
