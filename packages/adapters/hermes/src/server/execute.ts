@@ -262,6 +262,66 @@ const TOKEN_USAGE_REGEX =
 /** Regex to extract cost from Hermes output. */
 const COST_REGEX = /(?:cost|spent)[:\s]*\$?([\d.]+)/i;
 
+/**
+ * Hermes in quiet mode (`-Q`) deliberately routes its session-resume status
+ * lines to stderr so that stdout stays machine-readable. Those lines are
+ * informational and always start with this marker.
+ *
+ * See `hermes_cli/cli_agent_setup_mixin.py` `_say()`: the `_say()` helper prints
+ * to `sys.stderr` in quiet mode, and every successful resume goes through it.
+ */
+const RESUME_BANNER_PREFIX_REGEX = /^\s*↻\s*Resumed session\b/i;
+
+/**
+ * A single line of stderr is treated as a genuine failure only when it names a
+ * failure word as a whole word.
+ *
+ * The previous pattern was `/error|exception|traceback|failed/i`, unanchored,
+ * so it matched any line that merely *contained* one of those letters
+ * sequences. A resumed session whose title read "Set Sam's exceptional approval
+ * boundaries" contains the substring "exception" inside the word
+ * "exceptional", which made an exit-0 run that had already saved its task
+ * outcome report as `adapter_failed` (live run
+ * ea8f13f4-2c62-461a-a763-2f52d54d9049). Word boundaries fix that class of
+ * false positive without suppressing a real diagnostic: "Error:",
+ * "Exception:", "Traceback" and "call failed" all still match.
+ */
+const STDERR_FAILURE_WORD_REGEX = /\b(?:errors?|exceptions?|tracebacks?|failed|failure)\b/i;
+
+/**
+ * Python exception class names are CamelCase compounds in which the failure
+ * word is glued to a prefix, so `\bError\b` does not match `RuntimeError` or
+ * `ValueError`. Those are genuine failures and must keep being reported, so a
+ * PascalCase identifier that *ends* in a failure word counts too. The leading
+ * capital is what keeps this from re-ignoring lowercase prose such as
+ * "exceptional".
+ */
+const STDERR_FAILURE_IDENTIFIER_REGEX = /\b[A-Z]\w*(?:Error|Exception|Traceback)\b/;
+
+/**
+ * Recognise a known-informational stderr line so it cannot be mistaken for a
+ * runtime failure. Kept deliberately narrow: an allow-list of exact
+ * informational shapes, not a suppression of stderr as a whole.
+ */
+function isInformationalStderrLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return true;
+  if (RESUME_BANNER_PREFIX_REGEX.test(trimmed)) return true;
+  // The companion line the quiet-mode resume path prints when a session has no
+  // replayable history.
+  if (/^Session\s+\S+\s+found but has no messages\.?\s*Starting fresh\.?$/i.test(trimmed)) {
+    return true;
+  }
+  return false;
+}
+
+/** True when a stderr line names a genuine runtime or provider failure. */
+function isFailureStderrLine(line: string): boolean {
+  return (
+    STDERR_FAILURE_WORD_REGEX.test(line) || STDERR_FAILURE_IDENTIFIER_REGEX.test(line)
+  );
+}
+
 interface ParsedOutput {
   sessionId?: string;
   response?: string;
@@ -348,11 +408,22 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
     result.costUsd = parseFloat(costMatch[1]);
   }
 
-  // Check for error patterns in stderr
+  // Check for error patterns in stderr.
+  //
+  // A line counts as a failure only when it names a failure word as a whole
+  // word, and never when it is a known-informational startup/resume banner.
+  // The old unanchored `/error|exception|traceback|failed/i` substring scan
+  // turned a resume banner whose session title contained "exceptional" into a
+  // spurious `adapter_failed` on an exit-0 run (KEE-1154, live run
+  // ea8f13f4-2c62-461a-a763-2f52d54d9049). stderr is still scanned: this is not
+  // a blanket ignore of stderr on exit 0, so a real exit-0 provider failure
+  // keeps producing an errorMessage and keeps reaching the typed
+  // provider-failure classifier below.
   if (stderr.trim()) {
     const errorLines = stderr
       .split("\n")
-      .filter((line) => /error|exception|traceback|failed/i.test(line))
+      .filter((line) => !isInformationalStderrLine(line))
+      .filter((line) => isFailureStderrLine(line))
       .filter((line) => !/INFO|DEBUG|warn/i.test(line)); // skip log-level noise
     if (errorLines.length > 0) {
       result.errorMessage = errorLines.slice(0, 5).join("\n");
