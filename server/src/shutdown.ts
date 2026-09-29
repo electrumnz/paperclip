@@ -5,7 +5,24 @@ type HotRestartShutdownPreparation = {
 type ShutdownLogger = {
   info(obj: object, msg: string): void;
   error(obj: object, msg: string): void;
+  /**
+   * Optional so the existing bounded-drain callers, which only ever needed
+   * `info`/`error`, keep their current logger shape.
+   */
+  warn?(obj: object, msg: string): void;
 };
+
+/**
+ * How long a shutdown waits for the heartbeat scheduler to quiesce before it
+ * forces the quiesce. The wait is a safety step, not a correctness step: the
+ * run drain that follows is bounded and idempotent, and a sweep that never
+ * settles must not spend the whole supervisor stop timeout waiting for it.
+ * Sized well under the caller's stop timeout so the remaining teardown steps
+ * (finalizer drain, HTTP listener, database) still fit inside it.
+ */
+export const HEARTBEAT_SCHEDULER_QUIESCE_TIMEOUT_MS = 5_000;
+
+export type HeartbeatSchedulerQuiesce = "idle" | "timed_out";
 
 export async function drainRunExecutionFinalizersForShutdown(input: {
   signal: "SIGINT" | "SIGTERM";
@@ -244,10 +261,20 @@ export async function coordinateHeartbeatSchedulerShutdown<
   signal: "SIGINT" | "SIGTERM";
   prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<TPreparation>) | null;
   waitForHeartbeatSchedulerIdle: () => Promise<void>;
+  /**
+   * Stops the scheduler from admitting new work and keeps it stopped, even
+   * after a forced quiesce. Called on every path, before the run drain begins,
+   * so a sweep that is still outstanding when the quiesce times out cannot
+   * claim a new run mid-drain and mutate state the drain has already read.
+   */
+  closeSchedulerAdmission?: () => void;
+  quiesceTimeoutMs?: number;
+  log?: ShutdownLogger;
 }): Promise<{
   hotRestart: TPreparation | null;
   preparationError: unknown;
   waitedForSchedulerIdle: boolean;
+  quiesce: HeartbeatSchedulerQuiesce;
 }> {
   let hotRestart: TPreparation | null = null;
   let preparationError: unknown = null;
@@ -256,7 +283,46 @@ export async function coordinateHeartbeatSchedulerShutdown<
   // Quiesce any callback that was already in flight before querying running
   // rows for the shutdown snapshot, otherwise a late queue claim can create a
   // run that is absent from both the snapshot and the selective drain set.
-  await input.waitForHeartbeatSchedulerIdle();
+  //
+  // The wait is bounded. `waitForHeartbeatSchedulerIdle` drains the tracked
+  // sweep set, and a single sweep that never settles (a hung socket, a run
+  // claim that never returns) would otherwise hold this await open forever:
+  // the process would never reach its own exit, and a supervisor that escalates
+  // on a stop timeout would SIGKILL the whole process group, losing every child
+  // worker that was not drained. A timed-out quiesce is therefore reported and
+  // the shutdown continues — the drain below is bounded and still runs.
+  const quiesceTimeoutMs = input.quiesceTimeoutMs ?? HEARTBEAT_SCHEDULER_QUIESCE_TIMEOUT_MS;
+  let quiesceTimer: NodeJS.Timeout | null = null;
+  let quiesce: HeartbeatSchedulerQuiesce;
+  try {
+    quiesce = await Promise.race([
+      input.waitForHeartbeatSchedulerIdle().then(() => "idle" as const),
+      new Promise<"timed_out">((resolve) => {
+        quiesceTimer = setTimeout(() => resolve("timed_out"), quiesceTimeoutMs);
+        // Never hold the event loop open for the quiesce deadline on its own.
+        quiesceTimer.unref?.();
+      }),
+    ]);
+  } catch (err) {
+    // A quiesce failure is not a shutdown failure: fall through to the drain.
+    input.log?.error({ err, signal: input.signal }, "heartbeat scheduler idle wait failed");
+    quiesce = "timed_out";
+  } finally {
+    if (quiesceTimer) clearTimeout(quiesceTimer);
+  }
+  if (quiesce === "timed_out") {
+    input.log?.warn?.(
+      { signal: input.signal, timeoutMs: quiesceTimeoutMs },
+      "heartbeat scheduler quiesce timed out; continuing shutdown with sweeps still in flight",
+    );
+  }
+
+  // Admission stays closed from here on. A sweep admitted before the signal is
+  // allowed to finish above, but nothing may be admitted once the drain starts:
+  // a late claim would create a run that is in neither the shutdown snapshot
+  // nor the drain's selected set, and would race the drain that is already
+  // reading and updating those rows.
+  input.closeSchedulerAdmission?.();
 
   if (input.prepareHotRestartShutdown) {
     try {
@@ -269,6 +335,7 @@ export async function coordinateHeartbeatSchedulerShutdown<
   return {
     hotRestart,
     preparationError,
-    waitedForSchedulerIdle: true,
+    waitedForSchedulerIdle: quiesce === "idle",
+    quiesce,
   };
 }

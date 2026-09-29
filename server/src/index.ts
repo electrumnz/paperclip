@@ -159,6 +159,13 @@ type EmbeddedPostgresCtor = new (opts: {
   onError?: (message: unknown) => void;
 }) => EmbeddedPostgresInstance;
 
+// How long the shutdown path holds the process-wide task drain. It only has to
+// cover the run drain that follows the scheduler quiesce, so this is generous
+// rather than tight. It exists so the drain is never permanent: if the process
+// is SIGKILLed part-way through the teardown, nothing clears this state except
+// an operator route, and a wedged drain would suppress every future run claim.
+const SHUTDOWN_TASK_DRAIN_TTL_MS = 5 * 60_000;
+
 
 export interface StartedServer {
   server: ReturnType<typeof createServer>;
@@ -1928,6 +1935,25 @@ async function startServerWithDatabaseTeardown(
       signal,
       prepareHotRestartShutdown,
       waitForHeartbeatSchedulerIdle,
+      // Admission is already stopped by `heartbeatSchedulerStopped` above; the
+      // coordinator additionally holds the task drain across the run drain so a
+      // sweep that outlived the quiesce deadline cannot claim a new run and race
+      // the drain that is already reading and updating the running rows.
+      closeSchedulerAdmission: () => {
+        if (!heartbeat) return;
+        if (heartbeat.getTaskDrainStatus().draining) return;
+        // Bounded, never permanent. The task drain is process-wide state that
+        // normally only an operator route clears, so a shutdown that is torn
+        // down from the outside (SIGKILL after the stop timeout) must not leave
+        // it wedged if this process ever survives. The TTL covers the whole
+        // remaining teardown with headroom and then releases on its own.
+        heartbeat.startTaskDrain({ ttlMs: SHUTDOWN_TASK_DRAIN_TTL_MS });
+        logger.info(
+          { signal, ttlMs: SHUTDOWN_TASK_DRAIN_TTL_MS },
+          "task drain engaged for the remainder of shutdown",
+        );
+      },
+      log: logger,
     });
     const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
     const selectiveDrainRunIds = heartbeatShutdown.hotRestart?.drainRunIds ?? null;

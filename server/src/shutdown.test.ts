@@ -19,7 +19,7 @@ function deferred<T = void>() {
 }
 
 function stubLogger() {
-  return { info: vi.fn(), error: vi.fn() };
+  return { info: vi.fn(), error: vi.fn(), warn: vi.fn() };
 }
 
 describe("finalizeServerShutdown", () => {
@@ -427,6 +427,7 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       hotRestart: { mode: "prepared", skipDrain: true },
       preparationError: null,
       waitedForSchedulerIdle: true,
+      quiesce: "idle",
     });
   });
 
@@ -452,6 +453,7 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       },
       preparationError: null,
       waitedForSchedulerIdle: true,
+      quiesce: "idle",
     });
   });
 
@@ -483,6 +485,7 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       hotRestart: { mode: "not_requested", skipDrain: false },
       preparationError: null,
       waitedForSchedulerIdle: true,
+      quiesce: "idle",
     });
   });
 
@@ -500,6 +503,7 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       hotRestart: null,
       preparationError: null,
       waitedForSchedulerIdle: true,
+      quiesce: "idle",
     });
   });
 
@@ -520,6 +524,202 @@ describe("coordinateHeartbeatSchedulerShutdown", () => {
       hotRestart: null,
       preparationError,
       waitedForSchedulerIdle: true,
+      quiesce: "idle",
     });
+  });
+});
+
+describe("coordinateHeartbeatSchedulerShutdown bounded quiesce", () => {
+  it("returns as soon as healthy sweeps settle, without waiting for the deadline", async () => {
+    vi.useFakeTimers();
+    try {
+      let releaseHealthy!: () => void;
+      const healthy = new Promise<void>((resolve) => {
+        releaseHealthy = resolve;
+      });
+      // A failing sweep models a real `.catch` on a tracked sweep: the tracked
+      // promise settles (with undefined) rather than rejecting.
+      const rejected = Promise.reject(new Error("sweep failed"));
+      const waitForHeartbeatSchedulerIdle = vi.fn(() =>
+        Promise.allSettled([healthy, rejected]),
+      );
+
+      const shutdown = coordinateHeartbeatSchedulerShutdown({
+        signal: "SIGTERM",
+        prepareHotRestartShutdown: null,
+        waitForHeartbeatSchedulerIdle,
+        quiesceTimeoutMs: 5_000,
+      });
+
+      releaseHealthy();
+      await vi.advanceTimersByTimeAsync(0);
+
+      await expect(shutdown).resolves.toMatchObject({
+        waitedForSchedulerIdle: true,
+        quiesce: "idle",
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("gives up on a sweep that never settles instead of hanging the exit", async () => {
+    vi.useFakeTimers();
+    try {
+      // `waitForHeartbeatSchedulerIdle` drains a set of tracked sweeps with
+      // `Promise.allSettled`. One sweep that never settles (a hung socket) keeps
+      // that await pending forever: the process never reaches its own exit, and a
+      // supervisor that escalates on a stop timeout kills the whole group,
+      // including every undrained child worker.
+      const waitForHeartbeatSchedulerIdle = vi.fn(() => new Promise<void>(() => {}));
+      const prepareHotRestartShutdown = vi.fn(async () => ({
+        mode: "not_requested" as const,
+        skipDrain: false,
+      }));
+      const log = stubLogger();
+
+      const shutdown = coordinateHeartbeatSchedulerShutdown({
+        signal: "SIGTERM",
+        prepareHotRestartShutdown,
+        waitForHeartbeatSchedulerIdle,
+        quiesceTimeoutMs: 5_000,
+        log,
+      });
+
+      let settled = false;
+      void shutdown.then(() => {
+        settled = true;
+      });
+
+      // Before the deadline the shutdown is still waiting, as it should be.
+      await vi.advanceTimersByTimeAsync(4_999);
+      expect(settled).toBe(false);
+      expect(prepareHotRestartShutdown).not.toHaveBeenCalled();
+
+      await vi.advanceTimersByTimeAsync(1);
+
+      await expect(shutdown).resolves.toMatchObject({
+        hotRestart: { mode: "not_requested", skipDrain: false },
+        preparationError: null,
+        // The quiesce did not complete, and the result says so rather than
+        // claiming an idle scheduler it never observed.
+        waitedForSchedulerIdle: false,
+        quiesce: "timed_out",
+      });
+      // The drain still runs, so shutdown does not stop at the quiesce.
+      expect(prepareHotRestartShutdown).toHaveBeenCalledOnce();
+      expect(log.warn).toHaveBeenCalledWith(
+        { signal: "SIGTERM", timeoutMs: 5_000 },
+        expect.stringContaining("quiesce timed out"),
+      );
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("closes scheduler admission before the drain, so a late sweep cannot race it", async () => {
+    vi.useFakeTimers();
+    try {
+      const order: string[] = [];
+      const waitForHeartbeatSchedulerIdle = vi.fn(() => new Promise<void>(() => {}));
+      const closeSchedulerAdmission = vi.fn(() => {
+        order.push("admission:closed");
+      });
+
+      const shutdown = coordinateHeartbeatSchedulerShutdown({
+        signal: "SIGTERM",
+        prepareHotRestartShutdown: vi.fn(async () => {
+          order.push("drain:start");
+          return { mode: "not_requested" as const, skipDrain: false };
+        }),
+        waitForHeartbeatSchedulerIdle,
+        closeSchedulerAdmission,
+        quiesceTimeoutMs: 5_000,
+        log: stubLogger(),
+      });
+
+      await vi.advanceTimersByTimeAsync(5_000);
+      await shutdown;
+
+      // Admission closes on the forced path too, not only on a clean quiesce:
+      // the whole point is that a sweep which outlived the deadline still cannot
+      // claim a new run once the drain is reading and updating rows.
+      expect(order).toEqual(["admission:closed", "drain:start"]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("closes scheduler admission after a clean quiesce, before the snapshot", async () => {
+    const order: string[] = [];
+
+    const result = await coordinateHeartbeatSchedulerShutdown({
+      signal: "SIGTERM",
+      prepareHotRestartShutdown: vi.fn(async () => {
+        order.push("drain:start");
+        return { mode: "not_requested" as const, skipDrain: false };
+      }),
+      waitForHeartbeatSchedulerIdle: vi.fn(async () => undefined),
+      closeSchedulerAdmission: vi.fn(() => {
+        order.push("admission:closed");
+      }),
+      log: stubLogger(),
+    });
+
+    expect(order).toEqual(["admission:closed", "drain:start"]);
+    expect(result.quiesce).toBe("idle");
+  });
+
+  it("unrefs the quiesce deadline so the deadline alone cannot hold the process open", async () => {
+    const handles: NodeJS.Timeout[] = [];
+    const realSetTimeout = globalThis.setTimeout;
+    const spy = vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+      ...args: Parameters<typeof realSetTimeout>
+    ) => {
+      const handle = realSetTimeout(...args);
+      handles.push(handle);
+      return handle;
+    }) as typeof realSetTimeout);
+
+    try {
+      await coordinateHeartbeatSchedulerShutdown({
+        signal: "SIGTERM",
+        prepareHotRestartShutdown: null,
+        waitForHeartbeatSchedulerIdle: vi.fn(() => new Promise<void>(() => {})),
+        quiesceTimeoutMs: 5,
+        log: stubLogger(),
+      });
+
+      expect(handles).toHaveLength(1);
+      // The shutdown path is what ends the process. A ref'd deadline would keep
+      // the loop alive on its own, so a forced quiesce could leave a process
+      // hanging exactly like the case this change is meant to prevent.
+      expect(handles[0].hasRef()).toBe(false);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("treats a rejected idle wait as a forced quiesce and still drains", async () => {
+    const log = stubLogger();
+    const prepareHotRestartShutdown = vi.fn(async () => ({
+      mode: "not_requested" as const,
+      skipDrain: false,
+    }));
+
+    const result = await coordinateHeartbeatSchedulerShutdown({
+      signal: "SIGTERM",
+      prepareHotRestartShutdown,
+      waitForHeartbeatSchedulerIdle: vi.fn(() => Promise.reject(new Error("idle wait exploded"))),
+      log,
+    });
+
+    expect(result.quiesce).toBe("timed_out");
+    expect(result.preparationError).toBeNull();
+    expect(prepareHotRestartShutdown).toHaveBeenCalledOnce();
+    expect(log.error).toHaveBeenCalledWith(
+      { err: expect.any(Error), signal: "SIGTERM" },
+      expect.stringContaining("idle wait failed"),
+    );
   });
 });
