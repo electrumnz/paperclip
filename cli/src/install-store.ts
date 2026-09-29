@@ -29,6 +29,7 @@ export type InstallManifest = InstallRecord & {
 
 export type InstallStorePaths = {
   paperclipHome: string;
+  homeDir: string;
   cliRoot: string;
   installsRoot: string;
   manifestPath: string;
@@ -76,6 +77,7 @@ export function resolveInstallStorePaths(options: {
   const cliRoot = path.join(paperclipHome, "cli");
   return {
     paperclipHome,
+    homeDir,
     cliRoot,
     installsRoot: path.join(cliRoot, "installs"),
     manifestPath: path.join(cliRoot, "install.json"),
@@ -319,6 +321,142 @@ export function buildNextManifest(
     .slice(0, 2);
 
   return { schemaVersion: INSTALL_MANIFEST_VERSION, ...record, previous };
+}
+
+/**
+ * Relative location of the managed skill source root inside an installed payload.
+ * Mirrors PAPERCLIP_SKILL_ROOT_RELATIVE_CANDIDATES in packages/adapter-utils/src/server-utils.ts
+ * as resolved from the bundled @paperclipai/server/dist module directory.
+ */
+const MANAGED_SKILL_ROOT_RELATIVE = path.join(
+  "node_modules",
+  "@paperclipai",
+  "server",
+  "skills",
+);
+
+export type ManagedSkillLinkMigration = {
+  link: string;
+  from: string;
+  to: string;
+};
+
+/**
+ * Agent homes whose `.hermes/skills` directory can hold links into an installed payload.
+ * Only the Hermes layout is known to the CLI; other adapters resolve their own paths.
+ */
+export function defaultManagedSkillHomes(
+  paths: InstallStorePaths = resolveInstallStorePaths(),
+): string[] {
+  return [path.join(paths.homeDir, ".hermes", "skills")];
+}
+
+/**
+ * A link is only ours to migrate when the manifest proves this install owns the payload it
+ * currently points into: the payload must be the current one or in the retained `previous`
+ * lineage. Anything else may belong to a different installation and is left untouched.
+ */
+function ownedPayloadPrefixes(manifest: InstallManifest, paths: InstallStorePaths): string[] {
+  return [manifest, ...manifest.previous]
+    .map((record) => {
+      const relative = path.relative(paths.installsRoot, path.resolve(record.payloadPath));
+      if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return null;
+      return path.join(paths.installsRoot, relative);
+    })
+    .filter((value): value is string => value !== null);
+}
+
+function isPathInside(candidate: string, parent: string): boolean {
+  const relative = path.relative(parent, candidate);
+  return Boolean(relative) && !relative.startsWith("..") && !path.isAbsolute(relative);
+}
+
+/**
+ * Repoint agent skill symlinks that resolve into a payload this install owns, so that
+ * advancing or rolling back the payload never leaves a link stranded in the old one.
+ *
+ * The previous payload is deliberately retained for rollback, which means a link pointing
+ * into it is still valid on disk. Adapters only repair dangling links, so a retained link
+ * survives the advance and their strict ownership guard then rejects the new source as
+ * "occupied by another installation". Migrating here keeps the link and the manifest in the
+ * same lineage.
+ *
+ * Only links into an owned payload are touched. Foreign installations, auxiliary skills
+ * (TypeSafe/Jev and any other non-managed link) and plain directories are never modified.
+ */
+export function migrateManagedSkillLinks(
+  manifest: InstallManifest,
+  paths: InstallStorePaths = resolveInstallStorePaths(),
+  options: { skillsHomes?: string[] } = {},
+): ManagedSkillLinkMigration[] {
+  const owned = ownedPayloadPrefixes(manifest, paths);
+  if (owned.length === 0) return [];
+  const newSkillRoot = path.join(path.resolve(manifest.payloadPath), MANAGED_SKILL_ROOT_RELATIVE);
+  const migrations: ManagedSkillLinkMigration[] = [];
+
+  for (const skillsHome of options.skillsHomes ?? defaultManagedSkillHomes(paths)) {
+    let names: string[];
+    try {
+      const stat = fs.lstatSync(skillsHome);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) continue;
+      names = fs.readdirSync(skillsHome);
+    } catch {
+      continue;
+    }
+
+    for (const name of names) {
+      const link = path.join(skillsHome, name);
+      let stat: fs.Stats;
+      let linkedPath: string;
+      try {
+        stat = fs.lstatSync(link);
+        if (!stat.isSymbolicLink()) continue;
+        linkedPath = fs.readlinkSync(link);
+      } catch {
+        continue;
+      }
+      assertOwnedByCurrentUser(stat, link);
+
+      const resolvedFrom = path.resolve(path.dirname(link), linkedPath);
+      const ownedPayload = owned.find((prefix) => isPathInside(resolvedFrom, prefix));
+      if (!ownedPayload) continue;
+      // Already pointing at the active payload: nothing to migrate.
+      if (isPathInside(resolvedFrom, newSkillRoot)) continue;
+
+      // The link must point at a managed skill inside the owned payload, i.e. under that
+      // payload's own skill root. Anything deeper or shallower is not a managed skill link.
+      const ownedSkillRoot = path.join(ownedPayload, MANAGED_SKILL_ROOT_RELATIVE);
+      if (!isPathInside(resolvedFrom, ownedSkillRoot)) continue;
+
+      // Preserve the link's position relative to the old skill root, and re-root it under the
+      // new payload's skill root. The new link is written relative to the skills home so the
+      // layout matches what the adapter's own ensurePaperclipSkillSymlink produces.
+      const skillRelative = path.relative(ownedSkillRoot, resolvedFrom);
+      if (skillRelative.startsWith("..") || path.isAbsolute(skillRelative)) continue;
+      const resolvedTo = path.join(newSkillRoot, skillRelative);
+      // Only follow a link whose skill still exists in the new payload. If the skill was
+      // dropped upstream we leave the link alone rather than inventing a target.
+      if (!fs.existsSync(resolvedTo)) continue;
+
+      const linkRelative = path.relative(skillsHome, resolvedTo);
+      const temporaryLink = path.join(
+        skillsHome,
+        `.${name}.migrate-${process.pid}-${Date.now()}`,
+      );
+      try {
+        fs.symlinkSync(linkRelative, temporaryLink, "dir");
+        fs.renameSync(temporaryLink, link);
+      } catch (error) {
+        fs.rmSync(temporaryLink, { force: true });
+        throw new Error(`Failed to migrate managed skill link ${link}.`, { cause: error });
+      } finally {
+        fs.rmSync(temporaryLink, { force: true });
+      }
+      migrations.push({ link, from: resolvedFrom, to: resolvedTo });
+    }
+  }
+
+  return migrations;
 }
 
 export function pruneInstallPayloads(
