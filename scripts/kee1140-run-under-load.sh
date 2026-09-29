@@ -53,15 +53,28 @@ extract() {
 
 for i in $(seq 1 "$RUNS"); do
   # Start the load. heartbeat-dependency-scheduling is the suite KEE-1020 used.
+  #
+  # Recorded limitation (KEE-1140): on this host that suite embeds a fresh
+  # postgres per process, so each load process can die on the 20s `beforeAll`
+  # boot timeout before running a test. Measured 0 of 9 load processes reaching
+  # a test. A load that cannot boot is not load -- see
+  # ~/Work/keece-1140-evidence/ac7-load-analysis.md. The harness reports each
+  # process's liveness and whether it ran a test so this is visible rather than
+  # assumed, but the recipe still needs a load that boots to be meaningful.
   loadpids=()
   for n in $(seq 1 "$LOAD_PROCS"); do
-    npx vitest run "$LOAD_SUITE" > "$SCRATCH/load-${i}-${n}.log" 2>&1 &
+    # setsid puts each load process in its own process group, so the teardown
+    # below can signal the whole group (npx wrapper AND the vitest child it
+    # re-execs into) rather than just the pid that $! captured.
+    setsid npx vitest run "$LOAD_SUITE" > "$SCRATCH/load-${i}-${n}.log" 2>&1 &
     loadpids+=($!)
   done
 
   # Let the load get established before the timed run starts.
   sleep 6
   la=$(cut -d' ' -f1 /proc/loadavg)
+  alive_start=0
+  for pid in "${loadpids[@]}"; do kill -0 "$pid" 2>/dev/null && alive_start=$((alive_start+1)); done
 
   # Timed run, with the load still running.
   log="$SCRATCH/lowtrust-${LABEL}-${i}.log"
@@ -69,14 +82,35 @@ for i in $(seq 1 "$RUNS"); do
   rc=$?
   read -r p f <<<"$(extract "$log")"
 
+  # How many load processes are still alive, and how many actually ran a test
+  # rather than dying on the beforeAll boot. A run that reports alive=0/3 or
+  # ran=0/3 was not loaded, and its result is not evidence about the target.
+  alive_end=0
+  for pid in "${loadpids[@]}"; do kill -0 "$pid" 2>/dev/null && alive_end=$((alive_end+1)); done
+  ran=0
+  for n in $(seq 1 "$LOAD_PROCS"); do
+    grep -qE 'Tests +[0-9]+ passed' "$SCRATCH/load-${i}-${n}.log" 2>/dev/null && ran=$((ran+1))
+  done
+
   # Record 409-at-status-write evidence if it fired.
   conflict=$(grep -c '409 "Conflict"' "$log" 2>/dev/null || echo 0)
   hookto=$(grep -c 'Hook timed out' "$log" 2>/dev/null || echo 0)
 
-  echo -e "$LABEL\t$i\t$p\t$f\tloadavg=$la\tconflicts=$conflict\thooktimeouts=$hookto\trc=$rc\t$log"
+  echo -e "$LABEL\t$i\t$p\t$f\tloadavg=$la\tloadalive=$alive_start/$LOAD_PROCS->$alive_end/$LOAD_PROCS\tloadran=$ran/$LOAD_PROCS\tconflicts=$conflict\thooktimeouts=$hookto\trc=$rc\t$log"
 
   # Stop the load before the next iteration.
-  for pid in "${loadpids[@]}"; do kill "$pid" 2>/dev/null; done
+  #
+  # `kill $pid` alone is not enough: $! is the npx wrapper, and npx re-execs, so
+  # the vitest child outlives it, is reparented to init, and keeps loading the
+  # box during later iterations. Kill the whole process group instead, and fall
+  # back to SIGKILL for anything still standing.
+  for pid in "${loadpids[@]}"; do
+    kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+  done
+  sleep 2
+  for pid in "${loadpids[@]}"; do
+    kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+  done
   wait 2>/dev/null
   sleep 4
 done
