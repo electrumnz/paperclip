@@ -52,18 +52,27 @@ jobs:
           fi
 
       - name: Assert the ref is a full commit SHA
+        env:
+          CANDIDATE_REF: ${{ inputs.ref }}
         run: |
           set -euo pipefail
-          ref="${{ inputs.ref }}"
-          if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::ref must be a full 40-character lowercase commit SHA so the verified tree is frozen; got '$ref'"
+          if [[ ! "$CANDIDATE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            # The value is untrusted until it passes, so it is not echoed into
+            # the workflow command, which is itself injectable via ::error::.
+            echo "::error::ref must be a full 40-character lowercase commit SHA so the verified tree is frozen"
             exit 1
           fi
-          echo "Verifying frozen candidate $ref"
+          echo "Verifying frozen candidate $CANDIDATE_REF"
 
   verify:
     name: Release Verify
     needs: [gate]
+    # Token scopes can only be maintained or reduced through a called-workflow
+    # chain, so this is the floor the caller must grant: every job in
+    # release-verify.yml and runner-chaos-evals.yml checks out the candidate, and
+    # contents: read is the only scope any of them declares.
+    permissions:
+      contents: read
     uses: ./.github/workflows/release-verify.yml
     with:
       ref: ${{ inputs.ref }}
