@@ -341,10 +341,39 @@ export async function coordinateHeartbeatSchedulerShutdown<
 }
 
 /**
- * Own the lifetime of the shutdown admission hold so the release rule is
+ * Engage the teardown's own admission hold and report which drain it took.
+ *
+ * Kept separate from `createShutdownAdmissionHold` so the decision itself is
+ * testable: `index.ts` wires it to the real heartbeat service, and a test can
+ * drive it against a stand-in state machine. The rule is deliberately
+ * unconditional.
+ *
+ * The defect this replaces: the engage used to open with
+ * `if (getTaskDrainStatus().draining) return`, skipping its own drain whenever
+ * one was already active. An already-active *operator* drain therefore made the
+ * teardown inherit the operator's expiry, so admission reopened mid-drain once
+ * that TTL lapsed — the same failure the no-TTL hold was introduced to prevent,
+ * arriving by the opposite door. `draining === true` cannot distinguish the
+ * operator's drain from our own, so it is not used as a guard at all.
+ *
+ * Engaging over an operator drain does not shorten it: the operator's route
+ * still stops it, and the operator's TTL simply stops being what governs
+ * admission during the teardown. That is the teardown's own protection, not a
+ * change to the operator's decision.
+ */
+export function engageShutdownAdmissionHold(input: {
+  startTaskDrain: () => void;
+  getTaskDrainStatus: () => { startedAt: Date | null } | null;
+}): { startedAt: Date } | null {
+  input.startTaskDrain();
+  return { startedAt: input.getTaskDrainStatus()?.startedAt ?? new Date() };
+}
+
+/**
+ * Own the lifetime of the shutdown admission hold so the release rules are
  * testable without booting a server.
  *
- * Two invariants, and they pull against each other:
+ * Three invariants, and they pull against each other:
  *
  * 1. The hold must span the whole run drain. `drainRunningRunsForShutdown` has
  *    no overall deadline, so a hold with an expiry would lapse mid-drain and a
@@ -355,27 +384,37 @@ export async function coordinateHeartbeatSchedulerShutdown<
  *    but `StartedServer.shutdown` is `shutdown(signal, false)` and its caller
  *    can hold a process that outlives the teardown. Without a release that
  *    process would suppress run admission forever.
+ * 3. A drain the operator owns keeps its own semantics, and the operator's
+ *    route must stay able to release it.
  *
- * A TTL satisfies neither cleanly: it is either too short (breaks 1) or long
- * enough to be unbounded in practice. Releasing explicitly satisfies both.
+ * A TTL on the hold satisfies none of 1 cleanly: too short breaks it, long
+ * enough is unbounded in practice. So the hold is never given an expiry.
  *
- * `engaged` distinguishes a hold this lifecycle created from a pre-existing
- * operator drain, which the operator owns and releases through its own route.
+ * Ownership is tracked by *identity* (`startedAt`), not by the `draining`
+ * boolean: an active operator drain and our own both read `draining === true`,
+ * so that boolean cannot distinguish them. `getTaskDrainStatus()` already
+ * reports `startedAt`, so the hold records which drain it engaged and treats
+ * any other active drain as the operator's. See
+ * `engageShutdownAdmissionHold` for why the engage is unconditional.
  */
 export function createShutdownAdmissionHold(input: {
-  /** Engage the hold, or report that an operator drain is already set. */
-  engage: () => boolean;
+  /** Engage the hold. Returns the identity of the drain now active. */
+  engage: () => { startedAt: Date } | null;
   /** Release a hold this lifecycle engaged. */
   release: () => void;
   log?: ShutdownLogger;
 }): { hold: () => void; releaseIfHeld: (signal: "SIGINT" | "SIGTERM", exitsProcess: boolean) => void } {
-  let engagedHere = false;
+  // The identity of the drain this lifecycle engaged, or null if it has
+  // engaged none. Compared by timestamp because the real state machine hands
+  // back a fresh `Date` per engage.
+  let engagedSince: number | null = null;
 
   return {
     hold: () => {
-      if (engagedHere) return;
-      engagedHere = input.engage();
-      if (engagedHere) {
+      if (engagedSince !== null) return;
+      const engaged = input.engage();
+      engagedSince = engaged ? engaged.startedAt.getTime() : null;
+      if (engagedSince !== null) {
         input.log?.info?.(
           {},
           "task drain engaged for the remainder of shutdown",
@@ -385,9 +424,9 @@ export function createShutdownAdmissionHold(input: {
     releaseIfHeld: (signal, exitsProcess) => {
       // A signal-driven shutdown reaches `process.exit(0)`, which clears the
       // process-local state anyway. Releasing here would be harmless but would
-      // also drop a hold that an operator might still own.
-      if (exitsProcess || !engagedHere) return;
-      engagedHere = false;
+      // also drop a drain the operator may still own.
+      if (exitsProcess || engagedSince === null) return;
+      engagedSince = null;
       input.release();
       input.log?.info?.(
         { signal },

@@ -118,6 +118,7 @@ import {
   coordinateHeartbeatSchedulerShutdown,
   createShutdownAdmissionHold,
   drainRunExecutionFinalizersForShutdown,
+  engageShutdownAdmissionHold,
   finalizeServerShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
 } from "./shutdown.js";
@@ -1920,21 +1921,13 @@ async function startServerWithDatabaseTeardown(
     // and releases it again if this teardown finishes without exiting, so the
     // hold cannot outlive the teardown that created it.
     const admissionHold = createShutdownAdmissionHold({
-      engage: () => {
-        if (!heartbeat) return false;
-        // An operator drain that is already set belongs to the operator and is
-        // released only by its own route. Leave it, and report that this
-        // lifecycle engaged nothing so the teardown will not release it.
-        if (heartbeat.getTaskDrainStatus().draining) return false;
-        // No TTL. The hold must span the whole run drain, which has no overall
-        // deadline: an expiring hold re-opens the exact race this closes,
-        // because a sweep still in flight when it lapses can claim a run
-        // mid-drain. `taskDrainState` is module-scope process memory, so the
-        // signal path clears it by exiting; the non-exiting path releases it
-        // via `releaseIfHeld` below.
-        heartbeat.startTaskDrain();
-        return true;
-      },
+      engage: () =>
+        heartbeat
+          ? engageShutdownAdmissionHold({
+              startTaskDrain: () => heartbeat.startTaskDrain(),
+              getTaskDrainStatus: () => heartbeat.getTaskDrainStatus(),
+            })
+          : null,
       release: () => heartbeat?.stopTaskDrain(),
       log: logger,
     });
