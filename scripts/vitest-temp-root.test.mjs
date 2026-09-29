@@ -364,6 +364,41 @@ describe("isMarkerOwnerAlive", () => {
       assert.equal(isMarkerOwnerAlive(marker), false, JSON.stringify(marker));
     }
   });
+
+  // The fallback branch is what macOS and Windows always take, because
+  // processIdentity() returns nulls for bootId and startTicks wherever /proc
+  // is absent. These cases pin it without depending on the host platform, so
+  // the branch stays covered when the suite runs on Linux too.
+  it("falls back to a pid existence check when the marker carries no start time", () => {
+    const live = isMarkerOwnerAlive({ pid: process.pid, bootId: null, startTicks: null });
+    assert.equal(live, true, "the current process must read as alive on the fallback path");
+
+    // A pid that cannot be running: probe for a free one rather than hardcoding
+    // a number, so the case does not rot on a busy host.
+    let deadPid = 0;
+    for (let candidate = 4_194_303; candidate > 4_194_290; candidate -= 1) {
+      try {
+        process.kill(candidate, 0);
+      } catch (err) {
+        if (err?.code === "ESRCH") {
+          deadPid = candidate;
+          break;
+        }
+      }
+    }
+    assert.ok(deadPid > 0, "expected to find an unused pid for the dead-owner case");
+    assert.equal(
+      isMarkerOwnerAlive({ pid: deadPid, bootId: null, startTicks: null }),
+      false,
+      "a pid with no live process must read as dead on the fallback path",
+    );
+  });
+
+  it("survives a marker whose owner lookup has no start-time evidence and no boot id", () => {
+    // Must not throw: an exception here escapes classifyRoot and takes down the
+    // sweep, and from there the run it was meant to protect.
+    assert.doesNotThrow(() => isMarkerOwnerAlive({ pid: process.pid, bootId: undefined, startTicks: undefined }));
+  });
 });
 
 describe("tempRootParent", () => {

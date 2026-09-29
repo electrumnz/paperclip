@@ -111,9 +111,12 @@ export function isMarkerOwnerAlive(marker) {
     return current === marker.startTicks;
   }
 
-  // No start-time evidence to compare (non-Linux). Fall back to the weaker
-  // existence check; the grace period covers a recycled pid in that window.
-  if (hasLiveFallbackLookup()) return pidExists(pid);
+  // No start-time evidence to compare (non-Linux, or a marker written on such a
+  // host). Fall back to the weaker existence check; the grace period covers a
+  // recycled pid in that window. This path must stay reachable and must not
+  // throw: on macOS and Windows /proc is absent, so processIdentity() writes
+  // exactly this marker shape, and a throw here would take down every
+  // test:run on those platforms.
   return pidExists(pid);
 }
 

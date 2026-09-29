@@ -87,6 +87,20 @@ let invocationIndex = 0;
 // The hook is what makes the process.exit() failure paths below clean up.
 const ownedTestRoots = new Set();
 registerExitCleanup(ownedTestRoots);
+// The root of the invocation that is currently running, kept separately so the
+// next invocation can release it once this one has returned.
+let currentTestRootHandle = null;
+
+// Release the previous invocation's root now that its vitest run has finished.
+// The exit hook still owns every root as a backstop; this only shortens the
+// window in which a long multi-invocation run holds N roots at once.
+function releaseFinishedTestRoots() {
+  if (!currentTestRootHandle) return;
+  const previous = currentTestRootHandle;
+  currentTestRootHandle = null;
+  ownedTestRoots.delete(previous);
+  previous.release("next-invocation");
+}
 const serializedModeName = "serialized";
 const generalModeName = "general";
 const allModeName = "all";
@@ -330,14 +344,34 @@ function runVitest(args, label, testShard = null) {
   console.log(`\n[test:run] ${label}`);
   invocationIndex += 1;
   const tempRootParentDir = tempRootParent();
+  // A multi-invocation run (for example --mode all, which calls this 7+ times)
+  // otherwise holds every root it ever created until the process exits, so peak
+  // usage is higher than steady state, and the peak is exactly the window in
+  // which the original out-of-space failure happened. The previous invocation
+  // has already returned by the time the next one starts, so its root is no
+  // longer in use and can go now rather than at process exit.
+  releaseFinishedTestRoots();
   // Reclaim roots left by runs that were killed instead of exiting, so a
   // cancelled CI job or an OOM kill cannot leak a root for good.
-  const swept = sweepOrphanedTestRoots({ parent: tempRootParentDir });
+  //
+  // A leak-reclaim helper must never be able to fail the run it is protecting:
+  // the sweep runs before the suite starts, so an error here would abort a test
+  // run for a reason that has nothing to do with the code under test. Log it and
+  // carry on to createTestRoot, which is the path that actually matters.
+  let swept = [];
+  try {
+    swept = sweepOrphanedTestRoots({ parent: tempRootParentDir });
+  } catch (error) {
+    console.warn(
+      `[test:run] orphan sweep failed (${error?.message ?? error}); continuing without reclaiming`,
+    );
+  }
   if (swept.length > 0) {
     console.log(`[test:run] reclaimed ${swept.length} orphaned test temp root(s) in ${tempRootParentDir}`);
   }
   const testRootHandle = createTestRoot({ parent: tempRootParentDir });
   ownedTestRoots.add(testRootHandle);
+  currentTestRootHandle = testRootHandle;
   const testRoot = testRootHandle.root;
   // Keep per-run paths compact so Unix socket fixtures stay under macOS path limits.
   const env = {
