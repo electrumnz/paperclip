@@ -116,6 +116,7 @@ import { createDecisionRetentionNotifyOriginAgent, createDecisionWakeOriginAgent
 import {
   closeHttpListenerForShutdown,
   coordinateHeartbeatSchedulerShutdown,
+  createShutdownAdmissionHold,
   drainRunExecutionFinalizersForShutdown,
   finalizeServerShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
@@ -1915,6 +1916,29 @@ async function startServerWithDatabaseTeardown(
     signal: "SIGINT" | "SIGTERM",
     exitProcess: boolean,
   ) => {
+    // Owns the admission hold for this call: engages it before the run drain
+    // and releases it again if this teardown finishes without exiting, so the
+    // hold cannot outlive the teardown that created it.
+    const admissionHold = createShutdownAdmissionHold({
+      engage: () => {
+        if (!heartbeat) return false;
+        // An operator drain that is already set belongs to the operator and is
+        // released only by its own route. Leave it, and report that this
+        // lifecycle engaged nothing so the teardown will not release it.
+        if (heartbeat.getTaskDrainStatus().draining) return false;
+        // No TTL. The hold must span the whole run drain, which has no overall
+        // deadline: an expiring hold re-opens the exact race this closes,
+        // because a sweep still in flight when it lapses can claim a run
+        // mid-drain. `taskDrainState` is module-scope process memory, so the
+        // signal path clears it by exiting; the non-exiting path releases it
+        // via `releaseIfHeld` below.
+        heartbeat.startTaskDrain();
+        return true;
+      },
+      release: () => heartbeat?.stopTaskDrain(),
+      log: logger,
+    });
+
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
     heartbeatSchedulerStopped = true;
     clearInterval(executionControlInterval);
@@ -1927,27 +1951,14 @@ async function startServerWithDatabaseTeardown(
       signal,
       prepareHotRestartShutdown,
       waitForHeartbeatSchedulerIdle,
-      // Admission is already stopped by `heartbeatSchedulerStopped` above; the
-      // coordinator additionally holds the task drain across the run drain so a
-      // sweep that outlived the quiesce deadline cannot claim a new run and race
-      // the drain that is already reading and updating the running rows.
-      closeSchedulerAdmission: () => {
-        if (!heartbeat) return;
-        if (heartbeat.getTaskDrainStatus().draining) return;
-        // No TTL. The drain must outlive the whole teardown, including a run
-        // drain that takes longer than any fixed window: an expiring TTL
-        // re-opens the exact race this closes, because a sweep still in flight
-        // when it lapses can claim a run mid-drain. `taskDrainState` is
-        // module-scope process memory, so this state cannot outlive the
-        // process — a SIGKILL, a crash, or `process.exit(0)` below all clear
-        // it. It therefore needs no expiry, and adding one could only
-        // re-introduce the race.
-        heartbeat.startTaskDrain();
-        logger.info(
-          { signal },
-          "task drain engaged for the remainder of shutdown",
-        );
-      },
+      // `heartbeatSchedulerStopped` above stops the scheduler interval from
+      // scheduling new work, but it does not stop a sweep that is already
+      // in flight, and it is not the gate the admission checks read — they
+      // read the task drain. So this call is load-bearing for a late sweep,
+      // which is exactly the KEE-1149 mechanism: hold admission across the run
+      // drain so such a sweep cannot claim a new run and race rows the drain is
+      // already reading and updating.
+      closeSchedulerAdmission: () => admissionHold.hold(),
       log: logger,
     });
     const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
@@ -2032,6 +2043,15 @@ async function startServerWithDatabaseTeardown(
         });
       });
     }
+
+    // The hold is process-local, so a signal-driven shutdown clears it by
+    // exiting. This teardown is the non-exiting path (`StartedServer.shutdown`
+    // is `shutdown(signal, false)`, reachable from cli/src/commands/run.ts when
+    // an `afterStart` hook throws), where the caller can hold a process that
+    // outlives the teardown, so release the hold here. It is the only correct
+    // point: any earlier and it would re-open the late-sweep claim race for the
+    // run drain itself. A hold an operator owns is not released.
+    admissionHold.releaseIfHeld(signal, exitProcess);
 
     if (exitProcess) process.exit(0);
   };

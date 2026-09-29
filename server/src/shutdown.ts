@@ -339,3 +339,60 @@ export async function coordinateHeartbeatSchedulerShutdown<
     quiesce,
   };
 }
+
+/**
+ * Own the lifetime of the shutdown admission hold so the release rule is
+ * testable without booting a server.
+ *
+ * Two invariants, and they pull against each other:
+ *
+ * 1. The hold must span the whole run drain. `drainRunningRunsForShutdown` has
+ *    no overall deadline, so a hold with an expiry would lapse mid-drain and a
+ *    sweep still in flight could then claim a run that is in neither the
+ *    shutdown snapshot nor the drain's selected set.
+ * 2. The hold must not survive the teardown that created it. The state is
+ *    process memory, so a signal-driven shutdown always clears it by exiting,
+ *    but `StartedServer.shutdown` is `shutdown(signal, false)` and its caller
+ *    can hold a process that outlives the teardown. Without a release that
+ *    process would suppress run admission forever.
+ *
+ * A TTL satisfies neither cleanly: it is either too short (breaks 1) or long
+ * enough to be unbounded in practice. Releasing explicitly satisfies both.
+ *
+ * `engaged` distinguishes a hold this lifecycle created from a pre-existing
+ * operator drain, which the operator owns and releases through its own route.
+ */
+export function createShutdownAdmissionHold(input: {
+  /** Engage the hold, or report that an operator drain is already set. */
+  engage: () => boolean;
+  /** Release a hold this lifecycle engaged. */
+  release: () => void;
+  log?: ShutdownLogger;
+}): { hold: () => void; releaseIfHeld: (signal: "SIGINT" | "SIGTERM", exitsProcess: boolean) => void } {
+  let engagedHere = false;
+
+  return {
+    hold: () => {
+      if (engagedHere) return;
+      engagedHere = input.engage();
+      if (engagedHere) {
+        input.log?.info?.(
+          {},
+          "task drain engaged for the remainder of shutdown",
+        );
+      }
+    },
+    releaseIfHeld: (signal, exitsProcess) => {
+      // A signal-driven shutdown reaches `process.exit(0)`, which clears the
+      // process-local state anyway. Releasing here would be harmless but would
+      // also drop a hold that an operator might still own.
+      if (exitsProcess || !engagedHere) return;
+      engagedHere = false;
+      input.release();
+      input.log?.info?.(
+        { signal },
+        "teardown finished without exiting; releasing the shutdown task drain",
+      );
+    },
+  };
+}
