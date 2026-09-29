@@ -41,12 +41,67 @@ export function normalizeActivityLimit(limit: number | undefined) {
 
 type ActivityCursor = { createdAt: string; id: string };
 
+const ACTIVITY_CURSOR_ID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * `Date.parse` is *more lenient* than a Postgres `::timestamptz` cast: it rolls
+ * calendar-invalid dates over instead of rejecting them, so
+ * `2026-02-30T00:00:00.000Z` parses here (as `2026-03-02`) and only throws once
+ * the value reaches the query.
+ *
+ * Requiring the value to round-trip through `toISOString()` closes that gap, but
+ * on its own it is not sufficient either: the round-trip accepts every instant
+ * JavaScript's own `Date` can represent, which is *wider* than what Postgres
+ * casts. `0000-01-01T00:00:00.000Z`, `-271821-04-20T00:00:00.000Z` and
+ * `+275760-09-13T00:00:00.000Z` all round-trip and all raise "date/time field
+ * value out of range" (or "time zone displacement out of range") in Postgres, so
+ * without the bound below the 500 stays reachable from one crafted query
+ * parameter. The predicate guarding the value and the cast consuming it have to
+ * be the same predicate.
+ *
+ * Postgres' accepted range is also *session-timezone dependent* at its edges
+ * (`0001-01-01T00:00:00Z` casts under UTC but raises under a far-east zone, where
+ * the local-time rendering falls off the other end). So rather than hard-code
+ * Postgres' 4713 BC / 294276 AD bounds, this is deliberately conservative:
+ * years 1000-9999, which every cursor this server can possibly mint is inside
+ * anyway. A bound keyed to JS `Date` limits or to a fixed PG-1 boundary would
+ * pass on this host and fail on a differently-configured one.
+ *
+ * The check is also narrower than Postgres by design: it rejects valid but
+ * non-canonical spellings such as `2026-09-15T12:00:00Z` (no milliseconds) or a
+ * space separator. That is safe because this predicate defines exactly the
+ * cursor shape this server mints — the sole mint site in `list` writes
+ * `new Date(last.createdAt).toISOString()`, so a round-tripping value is
+ * exactly what a real `X-Next-Cursor` always contains. Anything else is
+ * unusable, so failing soft (treated as absent) is correct and loses no
+ * pagination.
+ */
+function isServerMintableActivityTimestamp(value: string): boolean {
+  const parsed = Date.parse(value);
+  if (Number.isNaN(parsed) || new Date(parsed).toISOString() !== value) return false;
+  const year = new Date(parsed).getUTCFullYear();
+  return year >= 1000 && year <= 9999;
+}
+
 /**
  * `/companies/:companyId/activity` predates cursor support and its response
  * body is a bare array consumed by the CLI and UI (see activity-parity
  * tests) — changing that shape is a breaking change. The cursor is instead
  * threaded through the `before` query param and an `X-Next-Cursor` response
  * header, so old and new clients both keep working (KEE-546).
+ *
+ * A cursor is client-supplied opaque input even though we minted it, and it is
+ * compared against a `timestamptz` cast and a uuid column. So both halves are
+ * validated before use: a well-formed but non-uuid `id`, or a `createdAt` that
+ * Postgres cannot parse, throws inside the query and turns an otherwise-valid
+ * page request into a 500. A cursor we cannot fully validate is treated as
+ * absent, which serves the newest page rather than failing the request. The
+ * timestamp check is the strict round-trip form plus a year bound, not
+ * `Date.parse` alone: `Date.parse` is more lenient than Postgres, and the
+ * round-trip alone is more generous still, so either one on its own still lets a
+ * crafted value reach a cast that rejects it. See
+ * `isServerMintableActivityTimestamp` for the range reasoning.
  */
 export function decodeActivityCursor(cursor: string | undefined): ActivityCursor | null {
   if (!cursor) return null;
@@ -55,7 +110,9 @@ export function decodeActivityCursor(cursor: string | undefined): ActivityCursor
     if (
       parsed && typeof parsed === "object" &&
       typeof (parsed as ActivityCursor).createdAt === "string" &&
-      typeof (parsed as ActivityCursor).id === "string"
+      typeof (parsed as ActivityCursor).id === "string" &&
+      ACTIVITY_CURSOR_ID_PATTERN.test((parsed as ActivityCursor).id) &&
+      isServerMintableActivityTimestamp((parsed as ActivityCursor).createdAt)
     ) {
       return parsed as ActivityCursor;
     }
