@@ -391,6 +391,18 @@ export function isShutdownAdmissionHoldActive(): boolean {
 }
 
 /**
+ * True while the hold registered under this lifecycle id is engaged.
+ *
+ * Exists because the set is module-level and process-wide: a route can only
+ * ask the global question, but a test that engages one hold needs to assert
+ * about *its* hold without depending on what any other hold is doing. Named
+ * holds are also the only ones a test can clean up deterministically.
+ */
+export function isShutdownAdmissionHoldRegistered(lifecycleId: string): boolean {
+  return shutdownAdmissionHolds.has(lifecycleId);
+}
+
+/**
  * Own the lifetime of the shutdown admission hold so the release rules are
  * testable without booting a server.
  *
@@ -449,16 +461,19 @@ export function createShutdownAdmissionHold(input: {
       }
     },
     releaseIfHeld: (signal, exitsProcess) => {
-      // A signal-driven shutdown reaches `process.exit(0)`, which clears the
-      // process-local state anyway. Releasing here would be harmless but would
-      // also drop a drain the operator may still own.
-      if (exitsProcess || engagedSince === null) return;
-      engagedSince = null;
-      // Clear the marker as soon as this teardown stops owning the hold, so a
-      // stale entry cannot refuse a later operator release in a process that
-      // outlived the teardown. The exiting path needs no marker cleanup: that
-      // process is on its way out.
+      if (engagedSince === null) return;
+      // The marker is cleared on both paths, not just the non-exiting one. A
+      // signal teardown normally reaches `process.exit(0)`, which discards
+      // process memory anyway — but if the teardown threw on the way there,
+      // that exit never runs and this process can linger. Leaving the marker
+      // behind would then refuse the operator's drain release for the life of
+      // a process that is neither draining nor exiting (KEE-1149, RC5).
       shutdownAdmissionHolds.delete(lifecycleId);
+      // The drain itself is only released on the non-exiting path: an exiting
+      // process is on its way out, and releasing would drop a drain the
+      // operator may still own.
+      if (exitsProcess) return;
+      engagedSince = null;
       input.release();
       input.log?.info?.(
         { signal },

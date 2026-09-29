@@ -1,7 +1,8 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   createShutdownAdmissionHold,
   engageShutdownAdmissionHold,
+  isShutdownAdmissionHoldRegistered,
 } from "../shutdown.ts";
 
 /**
@@ -273,6 +274,86 @@ describe("shutdown admission hold", () => {
       hold.releaseIfHeld("SIGTERM", false);
 
       expect(release).not.toHaveBeenCalled();
+    });
+  });
+
+  // RC5: a throw between engage and release used to strand the marker, which
+  // is what makes the operator route refuse — so a failed teardown turned a
+  // state the operator could clear into one they could not. The real
+  // `shutdown()` in index.ts runs that span under try/finally; these assert
+  // the rule the finally implements, and the route test in
+  // instance-settings-routes.test.ts asserts the consequence (409 before,
+  // 200 after).
+  describe("exceptional teardown must not strand the hold (RC5)", () => {
+    it("clears the marker when the span throws before the release", () => {
+      const drain = makeDrainState();
+      const hold = createShutdownAdmissionHold({
+        engage: () =>
+          engageShutdownAdmissionHold({
+            startTaskDrain: () => void drain.start(null),
+            getTaskDrainStatus: () => ({ startedAt: drain.startedAt }),
+          }),
+        release: () => drain.stop(),
+        lifecycleId: "rc5-throwing-span",
+      });
+
+      hold.hold();
+      expect(isShutdownAdmissionHoldRegistered("rc5-throwing-span")).toBe(true);
+
+      // Stands in for the throw at any unguarded await inside the span. The
+      // real shutdown() wraps it in try/finally, so releaseIfHeld still runs.
+      // Swallow the throw: what is under test is the finally, not the failure.
+      try {
+        throw new Error("teardown step failed");
+      } catch {
+        // expected — the release below is what must still have happened
+      } finally {
+        hold.releaseIfHeld("SIGTERM", false);
+      }
+
+      expect(isShutdownAdmissionHoldRegistered("rc5-throwing-span")).toBe(false);
+      expect(drain.draining).toBe(false);
+    });
+
+    it("clears the marker on the exiting path too, when the span throws", () => {
+      // The exiting path normally skips the release because `process.exit(0)`
+      // clears process memory. On a throw that exit never runs, so a lingering
+      // process would otherwise keep the marker. The finally covers it.
+      const drain = makeDrainState();
+      const hold = createShutdownAdmissionHold({
+        engage: () =>
+          engageShutdownAdmissionHold({
+            startTaskDrain: () => void drain.start(null),
+            getTaskDrainStatus: () => ({ startedAt: drain.startedAt }),
+          }),
+        release: vi.fn(),
+        lifecycleId: "rc5-exiting-throw",
+      });
+
+      hold.hold();
+      expect(isShutdownAdmissionHoldRegistered("rc5-exiting-throw")).toBe(true);
+
+      try {
+        throw new Error("teardown step failed before exit");
+      } catch {
+        // expected
+      } finally {
+        // `releaseIfHeld` still removes the marker even though it does not
+        // call `release` on the exiting path.
+        hold.releaseIfHeld("SIGTERM", true);
+      }
+
+      expect(isShutdownAdmissionHoldRegistered("rc5-exiting-throw")).toBe(false);
+    });
+
+    it("does not strand a marker when the engage itself never happens", () => {
+      const hold = createShutdownAdmissionHold({
+        engage: () => null,
+        release: vi.fn(),
+        lifecycleId: "rc5-no-engage",
+      });
+      hold.hold();
+      expect(isShutdownAdmissionHoldRegistered("rc5-no-engage")).toBe(false);
     });
   });
 });

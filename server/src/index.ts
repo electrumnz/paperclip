@@ -1968,83 +1968,98 @@ async function startServerWithDatabaseTeardown(
       );
     }
 
-    const telemetryClient = getTelemetryClient();
-    if (telemetryClient) {
-      telemetryClient.stop();
-      await telemetryClient.flush();
-    }
-
-    if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
-      try {
-        const drain = await drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds);
-        logger.info({ signal, drain }, "graceful heartbeat run drain complete");
-      } catch (err) {
-        logger.error({ err, signal }, "graceful heartbeat run drain failed");
+    // From here to the release, the admission hold is engaged. A throw at any
+    // point in that span would otherwise leave the hold — and the marker that
+    // makes the operator route refuse — set for the life of a process that
+    // never exits, with no route left to clear it (KEE-1149, RC5). So the span
+    // runs under try/finally: the release is guaranteed on every exit,
+    // including an exceptional one, and admission is not left shut after a
+    // teardown that failed.
+    try {
+      const telemetryClient = getTelemetryClient();
+      if (telemetryClient) {
+        telemetryClient.stop();
+        await telemetryClient.flush();
       }
-    }
 
-    if (!skipHeartbeatDrain) {
-      await drainRunExecutionFinalizersForShutdown({
+      if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
+        try {
+          const drain = await drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds);
+          logger.info({ signal, drain }, "graceful heartbeat run drain complete");
+        } catch (err) {
+          logger.error({ err, signal }, "graceful heartbeat run drain failed");
+        }
+      }
+
+      if (!skipHeartbeatDrain) {
+        await drainRunExecutionFinalizersForShutdown({
+          signal,
+          drain: drainHeartbeatExecutionFinalizers,
+          log: logger,
+        });
+      }
+
+      // Whatever the drain did not finalize (timed-out runs, the hot-restart
+      // skip path) still has a local-only tail when the in-flight run-log
+      // mirror is enabled; upload those tails now so an orderly restart
+      // never loses run output. No-op when the mirror is off.
+      try {
+        await flushInFlightRunLogMirrors();
+      } catch (err) {
+        logger.error({ err, signal }, "run-log in-flight mirror flush failed");
+      }
+
+      const appShutdown = (app as { locals?: { paperclipShutdown?: () => Promise<void> } }).locals
+        ?.paperclipShutdown;
+      const stopEmbeddedPostgres = embeddedPostgres && embeddedPostgresStartedByThisProcess
+        ? () => embeddedPostgresSupervisor?.shutdown() ?? embeddedPostgres!.stop()
+        : null;
+
+      // Await the ordered application teardown before the process exits. A live
+      // setup-token login session must stop and release its sandbox lease before
+      // the database and the provider stop, so an orderly shutdown never leaves a
+      // sandbox lease or confidential login state alive past the process exit.
+      // The HTTP listener closes first, while every service is still up, so a
+      // request in flight is drained against a working server and none reaches
+      // a route once the pool is gone; the programmatic close below then finds
+      // the listener already closed and skips.
+      await finalizeServerShutdown({
         signal,
-        drain: drainHeartbeatExecutionFinalizers,
+        shutdownAppServices: appShutdown,
+        closeHttpListener: () =>
+          closeHttpListenerForShutdown({ server, signal, log: logger }),
+        drainPendingRunFailureReports: waitForPendingRunFailureReports,
+        closeDatabase: closeDatabaseClients,
+        stopEmbeddedPostgres,
+        shutdownInstrumentation,
+        shutdownSentry,
         log: logger,
       });
-    }
 
-    // Whatever the drain did not finalize (timed-out runs, the hot-restart
-    // skip path) still has a local-only tail when the in-flight run-log
-    // mirror is enabled; upload those tails now so an orderly restart
-    // never loses run output. No-op when the mirror is off.
-    try {
-      await flushInFlightRunLogMirrors();
-    } catch (err) {
-      logger.error({ err, signal }, "run-log in-flight mirror flush failed");
-    }
-
-    const appShutdown = (app as { locals?: { paperclipShutdown?: () => Promise<void> } }).locals
-      ?.paperclipShutdown;
-    const stopEmbeddedPostgres = embeddedPostgres && embeddedPostgresStartedByThisProcess
-      ? () => embeddedPostgresSupervisor?.shutdown() ?? embeddedPostgres!.stop()
-      : null;
-
-    // Await the ordered application teardown before the process exits. A live
-    // setup-token login session must stop and release its sandbox lease before
-    // the database and the provider stop, so an orderly shutdown never leaves a
-    // sandbox lease or confidential login state alive past the process exit.
-    // The HTTP listener closes first, while every service is still up, so a
-    // request in flight is drained against a working server and none reaches
-    // a route once the pool is gone; the programmatic close below then finds
-    // the listener already closed and skips.
-    await finalizeServerShutdown({
-      signal,
-      shutdownAppServices: appShutdown,
-      closeHttpListener: () =>
-        closeHttpListenerForShutdown({ server, signal, log: logger }),
-      drainPendingRunFailureReports: waitForPendingRunFailureReports,
-      closeDatabase: closeDatabaseClients,
-      stopEmbeddedPostgres,
-      shutdownInstrumentation,
-      shutdownSentry,
-      log: logger,
-    });
-
-    if (!exitProcess && server.listening) {
-      await new Promise<void>((resolveClose, rejectClose) => {
-        server.close((err) => {
-          if (err) rejectClose(err);
-          else resolveClose();
+      if (!exitProcess && server.listening) {
+        await new Promise<void>((resolveClose, rejectClose) => {
+          server.close((err) => {
+            if (err) rejectClose(err);
+            else resolveClose();
+          });
         });
-      });
-    }
+      }
 
-    // The hold is process-local, so a signal-driven shutdown clears it by
-    // exiting. This teardown is the non-exiting path (`StartedServer.shutdown`
-    // is `shutdown(signal, false)`, reachable from cli/src/commands/run.ts when
-    // an `afterStart` hook throws), where the caller can hold a process that
-    // outlives the teardown, so release the hold here. It is the only correct
-    // point: any earlier and it would re-open the late-sweep claim race for the
-    // run drain itself. A hold an operator owns is not released.
-    admissionHold.releaseIfHeld(signal, exitProcess);
+    } finally {
+      // The hold is process-local, so a signal-driven shutdown clears it by
+      // exiting. This teardown is the non-exiting path
+      // (`StartedServer.shutdown` is `shutdown(signal, false)`, reachable from
+      // cli/src/commands/run.ts when an `afterStart` hook throws), where the
+      // caller can hold a process that outlives the teardown, so release the
+      // hold here. It is the only correct point: any earlier and it would
+      // re-open the late-sweep claim race for the run drain itself. A hold an
+      // operator owns is not released.
+      //
+      // Runs in `finally` so a teardown that threw still releases. That also
+      // hardens the pre-existing drain leak: a throw used to strand the drain
+      // itself, which the operator could still clear with the DELETE route.
+      admissionHold.releaseIfHeld(signal, exitProcess);
+    }
 
     if (exitProcess) process.exit(0);
   };
