@@ -24,6 +24,7 @@ import {
   type ActivityPublication,
 } from "../services/index.js";
 import { environmentService } from "../services/environments.js";
+import { isShutdownAdmissionHoldActive } from "../shutdown.js";
 import { assertEnvironmentSelectionForCompany } from "./environment-selection.js";
 import { assertBoardOrgAccess, getActorInfo } from "./authz.js";
 
@@ -359,6 +360,22 @@ export function instanceSettingsRoutes(db: Db) {
 
   router.delete("/instance/task-drain", async (req, res) => {
     assertCanManageInstanceSettings(req);
+    // A shutdown that owns the admission hold is still draining. Releasing the
+    // drain now would reopen run admission while that teardown reads and
+    // updates the very rows the drain is working through, which is the
+    // late-claim race the shutdown hold exists to prevent (KEE-1149, RC4).
+    // Refuse with a retryable conflict instead: the operator keeps the drain
+    // and can retry once the server is idle. Outside a shutdown this is
+    // untouched, so ordinary operator drain-release is unaffected.
+    if (isShutdownAdmissionHoldActive()) {
+      res.status(409).json({
+        error: "task_drain_owned_by_shutdown",
+        message:
+          "The server is shutting down and owns the task drain. Retry once the server is idle.",
+        retryable: true,
+      });
+      return;
+    }
     const actor = getActorInfo(req);
     const companyIds = await svc.listCompanyIds();
     // See the POST handler above for why the whole read-audit-apply

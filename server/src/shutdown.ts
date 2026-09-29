@@ -5,7 +5,24 @@ type HotRestartShutdownPreparation = {
 type ShutdownLogger = {
   info(obj: object, msg: string): void;
   error(obj: object, msg: string): void;
+  /**
+   * Optional so the existing bounded-drain callers, which only ever needed
+   * `info`/`error`, keep their current logger shape.
+   */
+  warn?(obj: object, msg: string): void;
 };
+
+/**
+ * How long a shutdown waits for the heartbeat scheduler to quiesce before it
+ * forces the quiesce. The wait is a safety step, not a correctness step: the
+ * run drain that follows is bounded and idempotent, and a sweep that never
+ * settles must not spend the whole supervisor stop timeout waiting for it.
+ * Sized well under the caller's stop timeout so the remaining teardown steps
+ * (finalizer drain, HTTP listener, database) still fit inside it.
+ */
+export const HEARTBEAT_SCHEDULER_QUIESCE_TIMEOUT_MS = 5_000;
+
+export type HeartbeatSchedulerQuiesce = "idle" | "timed_out";
 
 export async function drainRunExecutionFinalizersForShutdown(input: {
   signal: "SIGINT" | "SIGTERM";
@@ -244,10 +261,20 @@ export async function coordinateHeartbeatSchedulerShutdown<
   signal: "SIGINT" | "SIGTERM";
   prepareHotRestartShutdown: ((signal: "SIGINT" | "SIGTERM") => Promise<TPreparation>) | null;
   waitForHeartbeatSchedulerIdle: () => Promise<void>;
+  /**
+   * Stops the scheduler from admitting new work and keeps it stopped, even
+   * after a forced quiesce. Called on every path, before the run drain begins,
+   * so a sweep that is still outstanding when the quiesce times out cannot
+   * claim a new run mid-drain and mutate state the drain has already read.
+   */
+  closeSchedulerAdmission?: () => void;
+  quiesceTimeoutMs?: number;
+  log?: ShutdownLogger;
 }): Promise<{
   hotRestart: TPreparation | null;
   preparationError: unknown;
   waitedForSchedulerIdle: boolean;
+  quiesce: HeartbeatSchedulerQuiesce;
 }> {
   let hotRestart: TPreparation | null = null;
   let preparationError: unknown = null;
@@ -256,7 +283,46 @@ export async function coordinateHeartbeatSchedulerShutdown<
   // Quiesce any callback that was already in flight before querying running
   // rows for the shutdown snapshot, otherwise a late queue claim can create a
   // run that is absent from both the snapshot and the selective drain set.
-  await input.waitForHeartbeatSchedulerIdle();
+  //
+  // The wait is bounded. `waitForHeartbeatSchedulerIdle` drains the tracked
+  // sweep set, and a single sweep that never settles (a hung socket, a run
+  // claim that never returns) would otherwise hold this await open forever:
+  // the process would never reach its own exit, and a supervisor that escalates
+  // on a stop timeout would SIGKILL the whole process group, losing every child
+  // worker that was not drained. A timed-out quiesce is therefore reported and
+  // the shutdown continues — the drain below is bounded and still runs.
+  const quiesceTimeoutMs = input.quiesceTimeoutMs ?? HEARTBEAT_SCHEDULER_QUIESCE_TIMEOUT_MS;
+  let quiesceTimer: NodeJS.Timeout | null = null;
+  let quiesce: HeartbeatSchedulerQuiesce;
+  try {
+    quiesce = await Promise.race([
+      input.waitForHeartbeatSchedulerIdle().then(() => "idle" as const),
+      new Promise<"timed_out">((resolve) => {
+        quiesceTimer = setTimeout(() => resolve("timed_out"), quiesceTimeoutMs);
+        // Never hold the event loop open for the quiesce deadline on its own.
+        quiesceTimer.unref?.();
+      }),
+    ]);
+  } catch (err) {
+    // A quiesce failure is not a shutdown failure: fall through to the drain.
+    input.log?.error({ err, signal: input.signal }, "heartbeat scheduler idle wait failed");
+    quiesce = "timed_out";
+  } finally {
+    if (quiesceTimer) clearTimeout(quiesceTimer);
+  }
+  if (quiesce === "timed_out") {
+    input.log?.warn?.(
+      { signal: input.signal, timeoutMs: quiesceTimeoutMs },
+      "heartbeat scheduler quiesce timed out; continuing shutdown with sweeps still in flight",
+    );
+  }
+
+  // Admission stays closed from here on. A sweep admitted before the signal is
+  // allowed to finish above, but nothing may be admitted once the drain starts:
+  // a late claim would create a run that is in neither the shutdown snapshot
+  // nor the drain's selected set, and would race the drain that is already
+  // reading and updating those rows.
+  input.closeSchedulerAdmission?.();
 
   if (input.prepareHotRestartShutdown) {
     try {
@@ -269,6 +335,150 @@ export async function coordinateHeartbeatSchedulerShutdown<
   return {
     hotRestart,
     preparationError,
-    waitedForSchedulerIdle: true,
+    waitedForSchedulerIdle: quiesce === "idle",
+    quiesce,
+  };
+}
+
+/**
+ * Engage the teardown's own admission hold and report which drain it took.
+ *
+ * Kept separate from `createShutdownAdmissionHold` so the decision itself is
+ * testable: `index.ts` wires it to the real heartbeat service, and a test can
+ * drive it against a stand-in state machine. The rule is deliberately
+ * unconditional.
+ *
+ * The defect this replaces: the engage used to open with
+ * `if (getTaskDrainStatus().draining) return`, skipping its own drain whenever
+ * one was already active. An already-active *operator* drain therefore made the
+ * teardown inherit the operator's expiry, so admission reopened mid-drain once
+ * that TTL lapsed — the same failure the no-TTL hold was introduced to prevent,
+ * arriving by the opposite door. `draining === true` cannot distinguish the
+ * operator's drain from our own, so it is not used as a guard at all.
+ *
+ * Engaging over an operator drain does not shorten it: the operator's route
+ * still stops it, and the operator's TTL simply stops being what governs
+ * admission during the teardown. That is the teardown's own protection, not a
+ * change to the operator's decision.
+ */
+export function engageShutdownAdmissionHold(input: {
+  startTaskDrain: () => void;
+  getTaskDrainStatus: () => { startedAt: Date | null } | null;
+}): { startedAt: Date } | null {
+  input.startTaskDrain();
+  return { startedAt: input.getTaskDrainStatus()?.startedAt ?? new Date() };
+}
+
+/**
+ * Tracks whether a shutdown currently owns the admission hold, so an operator
+ * drain-release can be refused instead of allowed to reopen admission while a
+ * teardown is still draining (KEE-1149, RC4).
+ *
+ * The hold registers its own identity here when it engages and clears the entry
+ * when it releases. Deriving the route's view from the hold's own lifecycle —
+ * rather than a flag maintained somewhere else — is what keeps the two
+ * consistent, because a separate flag can drift from the hold that actually
+ * governs the drain.
+ *
+ * Keyed by lifecycle id so two concurrent teardowns (a signal and a
+ * programmatic `StartedServer.shutdown`) cannot clear each other's entry.
+ */
+const shutdownAdmissionHolds = new Set<string>();
+
+/** True while any registered shutdown-owned hold is engaged. */
+export function isShutdownAdmissionHoldActive(): boolean {
+  return shutdownAdmissionHolds.size > 0;
+}
+
+/**
+ * True while the hold registered under this lifecycle id is engaged.
+ *
+ * Exists because the set is module-level and process-wide: a route can only
+ * ask the global question, but a test that engages one hold needs to assert
+ * about *its* hold without depending on what any other hold is doing. Named
+ * holds are also the only ones a test can clean up deterministically.
+ */
+export function isShutdownAdmissionHoldRegistered(lifecycleId: string): boolean {
+  return shutdownAdmissionHolds.has(lifecycleId);
+}
+
+/**
+ * Own the lifetime of the shutdown admission hold so the release rules are
+ * testable without booting a server.
+ *
+ * Three invariants, and they pull against each other:
+ *
+ * 1. The hold must span the whole run drain. `drainRunningRunsForShutdown` has
+ *    no overall deadline, so a hold with an expiry would lapse mid-drain and a
+ *    sweep still in flight could then claim a run that is in neither the
+ *    shutdown snapshot nor the drain's selected set.
+ * 2. The hold must not survive the teardown that created it. The state is
+ *    process memory, so a signal-driven shutdown always clears it by exiting,
+ *    but `StartedServer.shutdown` is `shutdown(signal, false)` and its caller
+ *    can hold a process that outlives the teardown. Without a release that
+ *    process would suppress run admission forever.
+ * 3. A drain the operator owns keeps its own semantics, and the operator's
+ *    route must stay able to release it.
+ *
+ * A TTL on the hold satisfies none of 1 cleanly: too short breaks it, long
+ * enough is unbounded in practice. So the hold is never given an expiry.
+ *
+ * Ownership is tracked by *identity* (`startedAt`), not by the `draining`
+ * boolean: an active operator drain and our own both read `draining === true`,
+ * so that boolean cannot distinguish them. `getTaskDrainStatus()` already
+ * reports `startedAt`, so the hold records which drain it engaged and treats
+ * any other active drain as the operator's. See
+ * `engageShutdownAdmissionHold` for why the engage is unconditional.
+ */
+export function createShutdownAdmissionHold(input: {
+  /** Engage the hold. Returns the identity of the drain now active. */
+  engage: () => { startedAt: Date } | null;
+  /** Release a hold this lifecycle engaged. */
+  release: () => void;
+  /** Identity for the hold marker, so concurrent teardowns stay distinct. */
+  lifecycleId?: string;
+  log?: ShutdownLogger;
+}): { hold: () => void; releaseIfHeld: (signal: "SIGINT" | "SIGTERM", exitsProcess: boolean) => void } {
+  // The identity of the drain this lifecycle engaged, or null if it has
+  // engaged none. Compared by timestamp because the real state machine hands
+  // back a fresh `Date` per engage.
+  let engagedSince: number | null = null;
+  const lifecycleId = input.lifecycleId ?? `shutdown-${Math.random().toString(36).slice(2)}`;
+
+  return {
+    hold: () => {
+      if (engagedSince !== null) return;
+      const engaged = input.engage();
+      engagedSince = engaged ? engaged.startedAt.getTime() : null;
+      if (engagedSince !== null) {
+        // Mark the hold as shutdown-owned so the operator route can refuse to
+        // release it while this teardown is still draining.
+        shutdownAdmissionHolds.add(lifecycleId);
+        input.log?.info?.(
+          {},
+          "task drain engaged for the remainder of shutdown",
+        );
+      }
+    },
+    releaseIfHeld: (signal, exitsProcess) => {
+      if (engagedSince === null) return;
+      // The marker is cleared on both paths, not just the non-exiting one. A
+      // signal teardown normally reaches `process.exit(0)`, which discards
+      // process memory anyway — but if the teardown threw on the way there,
+      // that exit never runs and this process can linger. Leaving the marker
+      // behind would then refuse the operator's drain release for the life of
+      // a process that is neither draining nor exiting (KEE-1149, RC5).
+      shutdownAdmissionHolds.delete(lifecycleId);
+      // The drain itself is only released on the non-exiting path: an exiting
+      // process is on its way out, and releasing would drop a drain the
+      // operator may still own.
+      if (exitsProcess) return;
+      engagedSince = null;
+      input.release();
+      input.log?.info?.(
+        { signal },
+        "teardown finished without exiting; releasing the shutdown task drain",
+      );
+    },
   };
 }
