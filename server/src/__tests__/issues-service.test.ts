@@ -3991,6 +3991,7 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
     await db.delete(executionWorkspaces);
     await db.delete(projectWorkspaces);
     await db.delete(projects);
+    await db.delete(heartbeatRuns);
     await db.delete(agents);
     await db.delete(instanceSettings);
     await db.delete(companies);
@@ -4782,6 +4783,240 @@ describeEmbeddedPostgres("issueService blockers and dependency wake readiness", 
           reason: "not_done",
         }],
       },
+    });
+  });
+
+  it("refuses checkout while a binding unblock descriptor is present", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const blockedId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "HeldAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: blockedId,
+      companyId,
+      title: "Waiting for a permit",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId,
+      unblockDescriptor: {
+        owner: "board",
+        action: "Approve the isolation permit",
+      },
+    });
+
+    await expect(
+      svc.checkout(blockedId, assigneeAgentId, ["blocked"], randomUUID()),
+    ).rejects.toMatchObject({
+      status: 409,
+      details: { code: "issue_unblock_hold_active", issueId: blockedId },
+    });
+    expect((await svc.getById(blockedId))?.status).toBe("blocked");
+  });
+
+  it("validates create-time unblock owners while allowing assigned-agent escalation", async () => {
+    const companyId = randomUUID();
+    const creatorAgentId = randomUUID();
+    const otherAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: creatorAgentId,
+        companyId,
+        name: "Creator",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: otherAgentId,
+        companyId,
+        name: "Other agent",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    await expect(
+      svc.create(companyId, {
+        title: "Board approval required",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: creatorAgentId,
+        createdByAgentId: creatorAgentId,
+        unblockDescriptor: {
+          owner: "board",
+          action: "Approve the isolation permit",
+        },
+      }),
+    ).resolves.toMatchObject({
+      status: "blocked",
+      unblockDescriptor: { owner: "board" },
+    });
+
+    await expect(
+      svc.create(companyId, {
+        title: "Invalid peer owner",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: creatorAgentId,
+        createdByAgentId: creatorAgentId,
+        unblockDescriptor: {
+          owner: { agentId: otherAgentId },
+          action: "Ask another agent",
+        },
+      }),
+    ).rejects.toMatchObject({ status: 422 });
+  });
+
+  it("refuses a create-time hold placed by a non-assignee agent", async () => {
+    const companyId = randomUUID();
+    const creatorAgentId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: creatorAgentId,
+        companyId,
+        name: "Delegating creator",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: assigneeAgentId,
+        companyId,
+        name: "Target assignee",
+        role: "engineer",
+        status: "active",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+
+    // Only the assigned agent may set or escalate a hold. This is a
+    // restriction Fix 5 introduced on the create path as well as update: an
+    // agent cannot pre-hold a card it creates for another seat. Pinned here so
+    // the behaviour is deliberate rather than incidental.
+    await expect(
+      svc.create(companyId, {
+        title: "Pre-held for another seat",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId,
+        createdByAgentId: creatorAgentId,
+        unblockDescriptor: {
+          owner: "board",
+          action: "Approve before the assignee starts",
+        },
+      }),
+    ).rejects.toMatchObject({ status: 422 });
+
+    // The same shape without a hold still creates normally, so the guard is
+    // scoped to the descriptor and does not block delegation itself.
+    await expect(
+      svc.create(companyId, {
+        title: "Delegated without a hold",
+        status: "todo",
+        priority: "high",
+        assigneeAgentId,
+        createdByAgentId: creatorAgentId,
+      }),
+    ).resolves.toMatchObject({ assigneeAgentId, status: "todo" });
+  });
+
+  it("records the claiming run for every blocked-to-in_progress checkout", async () => {
+    const companyId = randomUUID();
+    const assigneeAgentId = randomUUID();
+    const blockedId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: assigneeAgentId,
+      companyId,
+      name: "CheckoutAgent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId: assigneeAgentId,
+      status: "running",
+    });
+    await db.insert(issues).values({
+      id: blockedId,
+      companyId,
+      title: "Ready after blocker",
+      status: "blocked",
+      priority: "high",
+      assigneeAgentId,
+    });
+
+    await expect(
+      svc.checkout(blockedId, assigneeAgentId, ["blocked"], runId),
+    ).resolves.toMatchObject({ status: "in_progress", executionRunId: runId });
+    const activity = await db
+      .select()
+      .from(activityLog)
+      .where(eq(activityLog.action, "issue.checkout_claimed"))
+      .then((rows) => rows[0] ?? null);
+    expect(activity).toMatchObject({
+      companyId,
+      agentId: assigneeAgentId,
+      runId,
+      entityId: blockedId,
+      details: expect.objectContaining({
+        previousStatus: "blocked",
+        nextStatus: "in_progress",
+        claimingRunId: runId,
+      }),
     });
   });
 
