@@ -4,7 +4,7 @@ import express from "express";
 import request from "supertest";
 import { WebSocketServer } from "ws";
 import { and, eq, inArray } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   activityLog,
   agentWakeupRequests,
@@ -56,6 +56,84 @@ const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported
   ? describe
   : describe.skip;
+
+// Every `PATCH /api/issues/:id` in this suite dispatches a wakeup fire-and-forget
+// (`void heartbeat.wakeup(...)`), and the route builds its own heartbeat service
+// (`server/src/routes/issues.ts`) from live `process.env` — there is no
+// `runtimeEnv` option on `issueRoutes`, so the test cannot hand that instance a
+// different environment. Left live, each wake reaches
+// `startNextQueuedRunForAgent`, which takes the per-agent start lock
+// (`withAgentStartLock`, `server/src/services/agent-start-lock.ts`) and then
+// dispatches a REAL run. This suite seeds no adapter command, so every one of
+// those runs dies immediately in the process adapter with
+// "Process adapter missing command" — the dispatches are pure noise, never test
+// intent. Measured on this host: 12 such dispatches per whole-file run, on both
+// green and red runs, several within the same second for the same agent.
+//
+// What that noise costs is a teardown budget. `withAgentStartLock` serialises
+// starts per agent and gives up only after
+// `AGENT_START_LOCK_STALE_MS = 30_000`, while this file's `afterEach` has a
+// 30s `hookTimeout` (`server/vitest.config.ts`) and awaits those executions via
+// `drainHeartbeatRunsToQuiescence` -> `drainActiveRunExecutions`. A competing
+// start that finds the lock held therefore spends up to 30s INSIDE the hook, and
+// 30s cannot clear 30s. That is the captured failure: the only `afterEach`
+// breach in the KEE-1020 candidate logs carries
+// `WARN: agent start lock timed out; continuing queued-run start
+// {staleMs: 30000}`, and that line is absent from all three green candidate
+// runs — a 1:1 correlation with the single breach.
+//
+// So correct the test-owned run lifecycle instead of reaching for a budget. The
+// run engine is off by default for these route-regression tests: under
+// suppression `enqueueWakeup` writes a `skipped` request and returns null
+// (`server/src/services/heartbeat.ts`), so there is no run row, no start-lock
+// acquisition, and nothing for the drain to wait on. Nothing in production
+// changes — `resolveHeartbeatSchedulingSuppression` is read per call, so this
+// only redirects the wakeups this test itself dispatches.
+//
+// The ONE test that deliberately exercises the run engine — "redacts
+// quarantined low-trust output from higher-trust wake and continuation
+// contexts" — drives it through its OWN `heartbeatService(db, { runtimeEnv })`
+// instance, which passes an explicit environment with the suppression keys set
+// to "false". That instance is immune to this file's live `process.env`, which
+// the negative control confirmed: with the opt-in deliberately removed, that
+// test still passed (1 passed, 10 skipped). The opt-in below is kept anyway
+// because the same test also drives the ROUTE-dispatched wakeups, which do read
+// the live environment.
+const RUN_ADMISSION_SUPPRESSED_ENVS = [
+  "PAPERCLIP_IN_WORKTREE",
+  "PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS",
+  "PAPERCLIP_RESTORE_IN_PROGRESS",
+] as const;
+
+// Suppression is read per call and never cached, so restoring in `afterEach`
+// bounds it to a single test. Preserve any pre-existing value so this file does
+// not leak a mutated environment into a sibling suite in the same worker.
+const priorRunAdmissionEnv = new Map<string, string | undefined>();
+let allowRunExecutionForThisTest = false;
+
+// Single entry point for the suite's admission state, so the opt-in flag is the
+// only thing a test has to set. `beforeEach` calls this with the flag reset.
+function applyRunAdmissionForTest() {
+  setRunAdmissionSuppressed(!allowRunExecutionForThisTest);
+}
+
+function setRunAdmissionSuppressed(suppressed: boolean) {
+  if (suppressed) {
+    for (const key of RUN_ADMISSION_SUPPRESSED_ENVS) {
+      if (!priorRunAdmissionEnv.has(key)) {
+        priorRunAdmissionEnv.set(key, process.env[key]);
+      }
+      process.env[key] = "true";
+    }
+    return;
+  }
+  for (const key of RUN_ADMISSION_SUPPRESSED_ENVS) {
+    const prior = priorRunAdmissionEnv.get(key);
+    if (prior === undefined) delete process.env[key];
+    else process.env[key] = prior;
+  }
+  priorRunAdmissionEnv.clear();
+}
 
 if (!embeddedPostgresSupport.supported) {
   console.warn(
@@ -1045,7 +1123,23 @@ describeEmbeddedPostgres(
       db = createDb(tempDb.connectionString);
     }, 20_000);
 
+    // Off by default for every test in this suite: a route-dispatched wakeup
+    // must not start a real run, take the per-agent start lock, and leave the
+    // teardown drain waiting out `AGENT_START_LOCK_STALE_MS` against a 30s
+    // hookTimeout. See the RUN_ADMISSION_SUPPRESSED_ENVS block above. The one
+    // test that does drive the run engine opts back in below.
+    beforeEach(() => {
+      allowRunExecutionForThisTest = false;
+      applyRunAdmissionForTest();
+    });
+
     afterEach(async () => {
+      // Restore the live environment BEFORE draining, so the teardown's own
+      // drain observes exactly the admission state the test body ran under, and
+      // so this file leaves no mutated environment behind for a sibling suite
+      // sharing the worker.
+      setRunAdmissionSuppressed(false);
+
       // Settle this suite's own synthetic seed runs first. They are inserted
       // directly and no real execution owns them, so
       // `drainHeartbeatRunsToQuiescence` below can never reach its "nothing is
@@ -2115,6 +2209,16 @@ describeEmbeddedPostgres(
     });
 
     it("redacts quarantined low-trust output from higher-trust wake and continuation contexts", async () => {
+      // This is the one test that deliberately drives the run engine: it points
+      // an agent at a controlled gateway and waits for the woken run to deliver
+      // a payload. Its own `heartbeatService` below passes an explicit
+      // `runtimeEnv` with the suppression keys set to "false", so the run
+      // execution it awaits is unaffected either way. Opt back in anyway
+      // because this test ALSO drives the route-dispatched wakeups, and those
+      // read the live environment.
+      allowRunExecutionForThisTest = true;
+      applyRunAdmissionForTest();
+
       const fixture = await seedLowTrustFixture(db, seededRunIds);
       const lowTrustApp = createApp(db, agentActor(fixture));
       const standardApp = createApp(
