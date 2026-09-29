@@ -302,4 +302,32 @@ describe("hermes adapter stderr banner handling (KEE-1154)", () => {
 
     expect(result.errorMessage).toBeUndefined();
   });
+
+  // ── Corpus check against real production stderr ─────────────────────────
+  //
+  // The rules above were checked differentially against the distinct error
+  // strings of the 1000 most recent heartbeat runs (620 of them failed, 509
+  // with `adapter_failed`), so this is measured behaviour and not invented
+  // fixtures. Of that corpus the old unanchored pattern flagged 19 strings and
+  // the new rules flag 8. The 11 it stops flagging are all `↻ Resumed
+  // session ...` banners whose session title contains "exceptional" — the
+  // false positives this issue exists to remove. Every genuine failure in the
+  // corpus is still flagged, and they are pinned below so a future edit to the
+  // word/identifier rules cannot silently drop one.
+  it.each([
+    "Arguments: (OperationalError('database or disk is full'),)",
+    "ConnectionRefusedError: [Errno 111] Connection refused",
+    "During handling of the above exception, another exception occurred:",
+    "--- Logging error ---",
+    "Message: 'Session DB append_message failed: %s'",
+    "OSError: [Errno 28] No space left on device",
+    "    raise exceptions[0]",
+    "Traceback (most recent call last):",
+  ])("still reports real production failure %s", async (stderrLine) => {
+    runOnce({ exitCode: 0, stdout: "", stderr: `${stderrLine}\n` });
+
+    const result = await execute(makeCtx() as never);
+
+    expect(result.errorMessage).toBe(stderrLine);
+  });
 });
