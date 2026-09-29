@@ -1,5 +1,6 @@
 import { Router, type Response } from "express";
-import type { Db } from "@paperclipai/db";
+import { and, eq } from "drizzle-orm";
+import { agents, companySecretBindings, secretAccessEvents, type Db } from "@paperclipai/db";
 import {
   createSecretProviderConfigSchema,
   createSecretSchema,
@@ -17,10 +18,11 @@ import {
 } from "@paperclipai/shared";
 import { validate } from "../middleware/validate.js";
 import { assertBoard, assertBoardOrAgent, assertCompanyAccess, getAccessibleResource } from "./authz.js";
-import { logActivity, secretService } from "../services/index.js";
+import { logActivity, secretService, agentService, publishActivity, type ActivityPublication } from "../services/index.js";
 import { createSecretProposalsService } from "../services/secret-proposals.js";
+import { getSecretRefAtConfigPath, removeSecretRefAtConfigPath } from "../services/agent-secret-bindings.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
-import { forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
+import { conflict, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 import { authorizationDeniedDetails } from "../services/authorization.js";
 import { accessService } from "../services/access.js";
 import { heartbeatService } from "../services/heartbeat.js";
@@ -1130,6 +1132,125 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       entityId: removed.id,
       details: { name: removed.name },
     });
+
+    res.json({ ok: true });
+  });
+
+  router.delete("/secrets/:secretId/bindings/:bindingId", async (req, res) => {
+    assertBoard(req);
+    const secretId = req.params.secretId as string;
+    const bindingId = req.params.bindingId as string;
+
+    const fetchedSecret = await svc.getById(secretId);
+    const secret = await getAccessibleResource(
+      req,
+      res,
+      fetchedSecret && isCompanyScopedSecret(fetchedSecret) ? fetchedSecret : null,
+      "Secret not found",
+    );
+    if (!secret) return;
+
+    const binding = await db
+      .select()
+      .from(companySecretBindings)
+      .where(
+        and(
+          eq(companySecretBindings.id, bindingId),
+          eq(companySecretBindings.companyId, secret.companyId),
+          eq(companySecretBindings.secretId, secretId),
+        ),
+      )
+      .then((rows) => rows[0] ?? null);
+    if (!binding) {
+      res.status(404).json({ error: "Secret binding not found" });
+      return;
+    }
+
+    if (binding.targetType !== "agent") {
+      res.status(422).json({
+        error: `Revoking a ${binding.targetType} binding is not supported yet`,
+        code: "binding_target_unsupported",
+      });
+      return;
+    }
+
+    const agent = await agentService(db).getById(binding.targetId);
+    if (!agent || agent.companyId !== secret.companyId) {
+      res.status(404).json({ error: "Secret binding not found" });
+      return;
+    }
+
+    // Lock the agent row for the complete revoke transaction. This keeps a
+    // concurrent config update from landing between the stale guard and the
+    // config write. The config revision, binding reconciliation, and both audit
+    // records commit or roll back together. Publish the live activity event only
+    // after that commit.
+    const activityPublications: ActivityPublication[] = [];
+    await db.transaction(async (tx) => {
+      const lockedAgent = await tx
+        .select()
+        .from(agents)
+        .where(eq(agents.id, binding.targetId))
+        .for("update")
+        .then((rows) => rows[0] ?? null);
+      if (!lockedAgent || lockedAgent.companyId !== secret.companyId) {
+        throw notFound("Secret binding not found");
+      }
+
+      const currentRef = getSecretRefAtConfigPath(lockedAgent.adapterConfig, binding.configPath);
+      if (!currentRef || currentRef.secretId !== secretId) {
+        throw conflict("The agent's configuration changed since this binding was read; refresh and retry", {
+          code: "secret_binding_stale",
+        });
+      }
+
+      const nextAdapterConfig = removeSecretRefAtConfigPath(
+        lockedAgent.adapterConfig,
+        binding.configPath,
+      );
+      await agentService(tx as unknown as Db).update(
+        lockedAgent.id,
+        { adapterConfig: nextAdapterConfig },
+        {
+          recordRevision: {
+            createdByUserId: req.actor.userId ?? "board",
+            createdByAgentId: null,
+            source: "secret-binding-revoke",
+          },
+        },
+      ).then((updated) => {
+        if (!updated) throw notFound("Secret binding not found");
+      });
+      await tx.insert(secretAccessEvents).values({
+        companyId: secret.companyId,
+        secretId,
+        secretScope: "company",
+        version: null,
+        provider: secret.provider,
+        responsibleUserId: req.actor.userId ?? null,
+        actorType: "user",
+        actorId: req.actor.userId ?? "board",
+        consumerType: binding.targetType,
+        consumerId: binding.targetId,
+        configPath: binding.configPath,
+        outcome: "revoked",
+      });
+
+      await logActivity(
+        tx as unknown as Db,
+        {
+          companyId: secret.companyId,
+          actorType: "user",
+          actorId: req.actor.userId ?? "board",
+          action: "secret.binding_revoked",
+          entityType: "secret",
+          entityId: secretId,
+          details: { bindingId, targetType: binding.targetType, targetId: binding.targetId, configPath: binding.configPath },
+        },
+        activityPublications,
+      );
+    });
+    for (const publication of activityPublications) publishActivity(publication);
 
     res.json({ ok: true });
   });

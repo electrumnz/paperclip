@@ -701,6 +701,12 @@ export function createSecretProposalsService(db: Db) {
     }
     const updated = await agentSvc.update(target.id, { adapterConfig }, {
       recordRevision: { createdByUserId: resolvedByUserId, source: "patch" },
+      // Guard the read-modify-write above: `adapterConfig` was merged from
+      // `target`, read earlier in this transaction. A config change that
+      // committed after that read (for example a secret-binding revoke) must
+      // not be silently overwritten by this stale merge, which would write the
+      // secret ref straight back and re-derive the revoked binding row.
+      expectedAdapterConfig: target.adapterConfig,
     });
     if (!updated) throw notFound("Target agent not found");
     await logActivity(txDb, {

@@ -3989,10 +3989,19 @@ export function accessRoutes(
           ...existingAdapterConfig,
           ...(joinDefaults.normalized ?? {})
         };
-        const updatedAgent = await agents.update(created.createdAgentId, {
-          adapterType,
-          adapterConfig: nextAdapterConfig
-        });
+        const updatedAgent = await agents.update(
+          created.createdAgentId,
+          {
+            adapterType,
+            adapterConfig: nextAdapterConfig,
+          },
+          {
+            // Guard the read-modify-write above: a config change that committed
+            // after `existingAgent` was read (for example a secret-binding
+            // revoke) must not be silently overwritten by this stale merge.
+            expectedAdapterConfig: existingAgent.adapterConfig,
+          },
+        );
         if (!updatedAgent) {
           throw conflict("Approved join request agent not found");
         }
