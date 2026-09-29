@@ -18,7 +18,17 @@
 //     container step). It only removes a root whose owner is provably gone, so
 //     it cannot race a concurrent test run.
 
-import { existsSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -154,13 +164,60 @@ export function findOrphanedTestRoots({
     .map((entry) => classifyRoot(path.join(parent, entry.name), now, graceMs));
 }
 
+// Test fixtures deliberately make parts of their tree read-only (for example the
+// runtime-context asset bundles are installed 0555 / 0444). rmSync cannot unlink
+// an entry whose parent directory denies write, and its `force` flag only
+// tolerates ENOENT, so a plain recursive remove fails with EACCES partway through
+// and leaves the rest of the root behind. Restore owner write on the directories
+// first, then remove, and never let a cleanup failure escape: a throw here would
+// either abort the sweep mid-loop or turn an exit hook into a crash that masks the
+// real test result.
+const OWNER_RWX = 0o700;
+
+function forceRemovableTree(root) {
+  let entries;
+  try {
+    entries = readdirSync(root, { withFileTypes: true });
+  } catch {
+    entries = [];
+  }
+  for (const entry of entries) {
+    const target = path.join(root, entry.name);
+    // Follow the same rule rmSync uses: never traverse a symlink, because the
+    // link target may lie outside the root we own.
+    if (!entry.isDirectory()) continue;
+    forceRemovableTree(target);
+    try {
+      chmodSync(target, OWNER_RWX);
+    } catch {
+      // Best effort. The remove below is what actually has to succeed.
+    }
+  }
+  try {
+    chmodSync(root, OWNER_RWX);
+  } catch {
+    // Best effort, same reason.
+  }
+}
+
+export function removeTestRoot(root) {
+  forceRemovableTree(root);
+  rmSync(root, { recursive: true, force: true });
+}
+
 export function sweepOrphanedTestRoots(options = {}) {
   const results = findOrphanedTestRoots(options);
   const swept = [];
   for (const result of results) {
     if (!result.reclaimable) continue;
-    rmSync(result.root, { recursive: true, force: true });
-    swept.push(result);
+    try {
+      removeTestRoot(result.root);
+      swept.push(result);
+    } catch (error) {
+      // One unremovable root (a live mount, a foreign-owned leftover) must not
+      // stop the sweep of the others or fail the run that triggered it.
+      swept.push({ ...result, reclaimed: false, error: error?.code ?? String(error) });
+    }
   }
   return swept;
 }
@@ -187,7 +244,13 @@ export function createTestRoot({
     released = true;
     if (onRelease) onRelease(root, reason);
     if (keep) return false;
-    rmSync(root, { recursive: true, force: true });
+    try {
+      removeTestRoot(root);
+    } catch {
+      // Cleanup is best effort. Throwing out of an exit hook would replace the
+      // test result with a removal error and hide the real failure.
+      return false;
+    }
     return true;
   };
 

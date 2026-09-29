@@ -14,7 +14,7 @@
 
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { after, describe, it } from "node:test";
@@ -103,6 +103,45 @@ describe("createTestRoot", () => {
     const handle = createTestRoot({ parent });
     rmSync(handle.root, { recursive: true, force: true });
     assert.equal(handle.release("test"), true);
+  });
+
+  // Real fixtures make parts of the tree read-only: the runtime-context asset
+  // bundles are installed 0555/0444. rmSync cannot unlink an entry under a
+  // directory that denies write, and `force` only covers ENOENT, so before this
+  // case was fixed the release threw EACCES and left most of the root on disk.
+  // That is the same leak the module exists to close, reached by a second route.
+  it("removes a root whose fixtures created read-only directories", (t) => {
+    const parent = tempParent(t);
+    const handle = createTestRoot({ parent });
+    const bundleDir = path.join(handle.root, "h", "instances", "vt-1", "runtime-context-assets", "bundles", "abc123");
+    mkdirSync(bundleDir, { recursive: true });
+    writeFileSync(path.join(bundleDir, "SKILL.md"), "# fixture\n");
+    writeFileSync(path.join(bundleDir, "TOOLS.json"), "{}\n");
+    chmodSync(bundleDir, 0o555);
+    chmodSync(path.join(bundleDir, "SKILL.md"), 0o444);
+    chmodSync(path.join(bundleDir, "TOOLS.json"), 0o444);
+
+    assert.equal(handle.release("test"), true);
+    assert.equal(existsSync(handle.root), false, "a read-only fixture tree must not survive release");
+  });
+
+  it("does not throw out of release when a fixture cannot be removed", (t) => {
+    if (process.getuid && process.getuid() === 0) {
+      t.skip("root bypasses directory write permissions");
+      return;
+    }
+    const parent = tempParent(t);
+    const handle = createTestRoot({ parent });
+    // Deny write on the parent, so the root itself cannot be unlinked no matter
+    // what the cleanup does inside it. This is the shape of a leftover under a
+    // parent this process does not own.
+    chmodSync(parent, 0o500);
+    // Cleanup must degrade to "not removed", never to an exception that would
+    // replace the real test result coming out of the exit hook.
+    assert.equal(handle.release("test"), false);
+    assert.ok(existsSync(handle.root), "an unremovable root is left in place, not half deleted");
+    chmodSync(parent, 0o700);
+    rmSync(handle.root, { recursive: true, force: true });
   });
 });
 
