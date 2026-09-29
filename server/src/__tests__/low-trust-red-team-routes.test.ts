@@ -1134,12 +1134,40 @@ describeEmbeddedPostgres(
     });
 
     afterEach(async () => {
-      // Restore the live environment BEFORE draining, so the teardown's own
-      // drain observes exactly the admission state the test body ran under, and
-      // so this file leaves no mutated environment behind for a sibling suite
-      // sharing the worker.
-      setRunAdmissionSuppressed(false);
-
+      // NOTE: the environment is deliberately NOT restored at the top of this
+      // hook. It is restored in `afterAll` below, after every drain has
+      // completed. Ordering matters, and the reasoning is worth stating
+      // precisely because the obvious alternative is wrong:
+      //
+      // A route dispatches its wakeup fire-and-forget through `trackWakeup`,
+      // which parks the `enqueueWakeup` promise in `activeWakeupPromises` and
+      // returns to the route immediately. `drainActiveRunExecutions` awaits
+      // those promises -- but `enqueueWakeup` does not read its suppression
+      // state until `getSchedulingSuppression()` at heartbeat.ts:26544, which
+      // sits BEHIND a long async prologue: agent lookup, issue-execution-context
+      // read, and adapter-config normalisation with its own writes. There are
+      // twelve `await`s between `enqueueWakeup` entering at heartbeat.ts:26319
+      // and that check.
+      //
+      // So restoring at the top of this hook would hand a wakeup that is still
+      // in that prologue an UNSUPPRESSED environment. Awaiting the drain does
+      // not prevent it: the drain waits for the promise to finish, and the
+      // promise reads whatever the environment says at the moment it reaches
+      // 26544. Such a wakeup admits a real dispatch, takes the per-agent start
+      // lock, and leaves this hook waiting out `AGENT_START_LOCK_STALE_MS` --
+      // re-creating the very breach this suppression exists to prevent. The
+      // admission state the test body ran under is the state a still-in-flight
+      // wakeup must also observe, which is only true if the restore happens
+      // after every wakeup has already read it.
+      //
+      // MEASURED, not argued: a two-arm probe (separate agent per arm, same
+      // host, back to back) dispatches one wakeup fire-and-forget and then
+      // either restores-then-drains or drains-then-restores. Restore-before-drain
+      // admitted 1 request and created 1 `heartbeat_runs` row, which died as
+      // "Process adapter missing command" -- the same rogue dispatch this
+      // suppression exists to stop. Drain-then-restore admitted 0 and created
+      // 0. Evidence: ~/Work/keece-1140-evidence/run4/probe-report.json.
+      //
       // Settle this suite's own synthetic seed runs first. They are inserted
       // directly and no real execution owns them, so
       // `drainHeartbeatRunsToQuiescence` below can never reach its "nothing is
@@ -1182,7 +1210,12 @@ describeEmbeddedPostgres(
       await deleteCompanySkillsAfterLateHeartbeatWritesDrain(db);
     });
 
+    // Safety net: the restore MUST run even if a teardown delete throws, or a
+    // suppressed environment leaks into whatever runs next in this worker.
+    // `afterAll` is the last hook in the file, so by here the drain has already
+    // completed and no wakeup from this suite is left before its check.
     afterAll(async () => {
+      setRunAdmissionSuppressed(false);
       await tempDb?.cleanup();
     });
 
