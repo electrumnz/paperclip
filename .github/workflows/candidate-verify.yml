@@ -1,0 +1,69 @@
+name: Candidate Verify
+
+# Fork-only verification entry point for one frozen candidate SHA.
+#
+# Neither existing lane can verify a specific commit on demand:
+#   - `PR` (pr.yml) fires on pull_request only, and calls the upstream-pinned
+#     pr-trusted.yml, which reads github.event.pull_request throughout and
+#     selects its own checkout from the PR head. It has no ref input and
+#     cannot be dispatched.
+#   - `Release Verify` (release-verify.yml) is workflow_call-only.
+#
+# This is the smallest entry point that closes that gap. It declares no jobs
+# of its own beyond a guard: it calls release-verify.yml whole, so the tests
+# and build run are the existing ones, unmodified.
+#
+# Why release-verify.yml is safe to reuse here:
+#   - it reads no secrets (no `secrets.` reference anywhere in the file)
+#   - it performs no publish, registry upload, image push or release step
+#   - every job holds `permissions: contents: read`
+#   - its self-hosted AWS routing is gated on the upstream repository and id,
+#     so on this fork each job falls back to ubuntu-latest (GitHub-hosted)
+#     and does not touch the TinyPC
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Full 40-character commit SHA to verify. Branches and tags are refused so the tree under test cannot move during the run.
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: candidate-verify-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Confirm fork-only and frozen SHA
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Assert fork-only
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REPOSITORY" != "electrumnz/paperclip" ]]; then
+            echo "::error::Candidate Verify is fork-only; refusing to run in $GITHUB_REPOSITORY"
+            exit 1
+          fi
+
+      - name: Assert the ref is a full commit SHA
+        run: |
+          set -euo pipefail
+          ref="${{ inputs.ref }}"
+          if [[ ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::ref must be a full 40-character lowercase commit SHA so the verified tree is frozen; got '$ref'"
+            exit 1
+          fi
+          echo "Verifying frozen candidate $ref"
+
+  verify:
+    name: Release Verify
+    needs: [gate]
+    uses: ./.github/workflows/release-verify.yml
+    with:
+      ref: ${{ inputs.ref }}
