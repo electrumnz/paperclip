@@ -452,6 +452,99 @@ describe("instance settings routes", () => {
     expect(mockInstanceSettingsService.update).not.toHaveBeenCalled();
   });
 
+  // KEE-1149 RC4: while a shutdown owns the admission hold it is still
+  // draining. Releasing the drain then would reopen run admission while that
+  // teardown is reading and updating the same running rows, so the operator
+  // command is refused with a retryable conflict. These drive the real route
+  // and the real hold helper, not a mock of either.
+  describe("task drain release during a shutdown hold (RC4)", () => {
+    const boardActor = {
+      type: "board",
+      userId: "local-board",
+      source: "local_implicit",
+      isInstanceAdmin: true,
+    } as any;
+
+    async function engageHold(release: () => void) {
+      const { createShutdownAdmissionHold } = await vi.importActual<
+        typeof import("../shutdown.js")
+      >("../shutdown.js");
+      return createShutdownAdmissionHold({
+        engage: () => ({ startedAt: new Date() }),
+        release,
+        lifecycleId: `test-${Math.random().toString(36).slice(2)}`,
+      });
+    }
+
+    it("refuses the release with a retryable 409 while a shutdown owns the drain", async () => {
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue({
+        draining: true,
+        startedAt: new Date(),
+        expiresAt: null,
+        activeRuns: 1,
+        pendingWakes: 0,
+        quiescent: false,
+      });
+      const hold = await engageHold(vi.fn());
+
+      hold.hold();
+      const app = await createApp(boardActor);
+      const res = await request(app).delete("/api/instance/task-drain");
+
+      expect(res.status).toBe(409);
+      expect(res.body.error).toBe("task_drain_owned_by_shutdown");
+      expect(res.body.retryable).toBe(true);
+      // The whole point: the drain must survive the refused request.
+      expect(mockHeartbeatService.stopTaskDrain).not.toHaveBeenCalled();
+
+      hold.releaseIfHeld("SIGTERM", false);
+    });
+
+    it("allows the normal operator release once the shutdown no longer owns it", async () => {
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue({
+        draining: true,
+        startedAt: new Date(),
+        expiresAt: null,
+        activeRuns: 0,
+        pendingWakes: 0,
+        quiescent: true,
+      });
+      mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
+      const hold = await engageHold(vi.fn());
+
+      hold.hold();
+      // Teardown finishes without exiting: the hold releases and stops
+      // claiming ownership, so the operator's own drain is releasable again.
+      hold.releaseIfHeld("SIGTERM", false);
+
+      const app = await createApp(boardActor);
+      const res = await request(app).delete("/api/instance/task-drain");
+
+      expect(res.status).toBe(200);
+      expect(mockHeartbeatService.stopTaskDrain).toHaveBeenCalledTimes(1);
+    });
+
+    it("leaves an operator-only drain releasable with no shutdown involved", async () => {
+      // Ownership, not the mere presence of a drain: this is the pre-existing
+      // operator flow and it must not change.
+      mockHeartbeatService.getTaskDrainStatus.mockReturnValue({
+        draining: true,
+        startedAt: new Date(),
+        expiresAt: new Date(Date.now() + 60_000),
+        activeRuns: 0,
+        pendingWakes: 0,
+        quiescent: true,
+      });
+      mockInstanceSettingsService.listCompanyIds.mockResolvedValue(["company-1"]);
+
+      const app = await createApp(boardActor);
+      const res = await request(app).delete("/api/instance/task-drain");
+
+      expect(res.status).toBe(200);
+      expect(mockHeartbeatService.stopTaskDrain).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it("allows local board users to update guarded dev-server auto-restart", async () => {
     const app = await createApp({
       type: "board",

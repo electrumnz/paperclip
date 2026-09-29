@@ -370,6 +370,27 @@ export function engageShutdownAdmissionHold(input: {
 }
 
 /**
+ * Tracks whether a shutdown currently owns the admission hold, so an operator
+ * drain-release can be refused instead of allowed to reopen admission while a
+ * teardown is still draining (KEE-1149, RC4).
+ *
+ * The hold registers its own identity here when it engages and clears the entry
+ * when it releases. Deriving the route's view from the hold's own lifecycle —
+ * rather than a flag maintained somewhere else — is what keeps the two
+ * consistent, because a separate flag can drift from the hold that actually
+ * governs the drain.
+ *
+ * Keyed by lifecycle id so two concurrent teardowns (a signal and a
+ * programmatic `StartedServer.shutdown`) cannot clear each other's entry.
+ */
+const shutdownAdmissionHolds = new Set<string>();
+
+/** True while any registered shutdown-owned hold is engaged. */
+export function isShutdownAdmissionHoldActive(): boolean {
+  return shutdownAdmissionHolds.size > 0;
+}
+
+/**
  * Own the lifetime of the shutdown admission hold so the release rules are
  * testable without booting a server.
  *
@@ -402,12 +423,15 @@ export function createShutdownAdmissionHold(input: {
   engage: () => { startedAt: Date } | null;
   /** Release a hold this lifecycle engaged. */
   release: () => void;
+  /** Identity for the hold marker, so concurrent teardowns stay distinct. */
+  lifecycleId?: string;
   log?: ShutdownLogger;
 }): { hold: () => void; releaseIfHeld: (signal: "SIGINT" | "SIGTERM", exitsProcess: boolean) => void } {
   // The identity of the drain this lifecycle engaged, or null if it has
   // engaged none. Compared by timestamp because the real state machine hands
   // back a fresh `Date` per engage.
   let engagedSince: number | null = null;
+  const lifecycleId = input.lifecycleId ?? `shutdown-${Math.random().toString(36).slice(2)}`;
 
   return {
     hold: () => {
@@ -415,6 +439,9 @@ export function createShutdownAdmissionHold(input: {
       const engaged = input.engage();
       engagedSince = engaged ? engaged.startedAt.getTime() : null;
       if (engagedSince !== null) {
+        // Mark the hold as shutdown-owned so the operator route can refuse to
+        // release it while this teardown is still draining.
+        shutdownAdmissionHolds.add(lifecycleId);
         input.log?.info?.(
           {},
           "task drain engaged for the remainder of shutdown",
@@ -427,6 +454,11 @@ export function createShutdownAdmissionHold(input: {
       // also drop a drain the operator may still own.
       if (exitsProcess || engagedSince === null) return;
       engagedSince = null;
+      // Clear the marker as soon as this teardown stops owning the hold, so a
+      // stale entry cannot refuse a later operator release in a process that
+      // outlived the teardown. The exiting path needs no marker cleanup: that
+      // process is on its way out.
+      shutdownAdmissionHolds.delete(lifecycleId);
       input.release();
       input.log?.info?.(
         { signal },
