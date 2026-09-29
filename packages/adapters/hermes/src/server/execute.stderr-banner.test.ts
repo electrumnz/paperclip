@@ -151,12 +151,31 @@ describe("hermes adapter stderr banner handling (KEE-1154)", () => {
   });
 
   it("ignores the informational no-messages resume banners", async () => {
+    // Both shapes verbatim from `cli_agent_setup_mixin.py`: the quiet-mode
+    // resume banner (line ~463) and the no-replayable-history line (~469), each
+    // its own `_say()` statement. An earlier draft of this test used a single
+    // hybrid line with an em-dash "— no messages" suffix; that shape is not
+    // produced by Hermes, so it is dropped rather than allow-listed.
     runOnce({
       exitCode: 0,
       stdout: "ok\n\nsession_id: sess-2\n",
+      stderr: "Session sess-2 found but has no messages. Starting fresh.\n",
+    });
+
+    const result = await execute(makeCtx() as never);
+
+    expect(result.errorMessage).toBeUndefined();
+  });
+
+  it("ignores the real resume banner for a title full of error words", async () => {
+    // The Hermes-emitted shape, with a title containing several keywords. The
+    // banner must be recognised as a whole, keywords and all.
+    runOnce({
+      exitCode: 0,
+      stdout: "ok\n\nsession_id: sess-2b\n",
       stderr:
-        '↻ Resumed session sess-2 "Failed deploy rollback" — no messages, starting fresh.\n' +
-        "Session sess-2 found but has no messages. Starting fresh.\n",
+        '↻ Resumed session sess-2b "Fix the failed error handling boundary" (3 user messages, 41 total messages)\n' +
+        "Session sess-2b found but has no messages. Starting fresh.\n",
     });
 
     const result = await execute(makeCtx() as never);
@@ -329,5 +348,109 @@ describe("hermes adapter stderr banner handling (KEE-1154)", () => {
     const result = await execute(makeCtx() as never);
 
     expect(result.errorMessage).toBe(stderrLine);
+  });
+});
+
+/**
+ * Review findings R1, R2 and R4 from the KEE-1155 independent review
+ * (CHANGES REQUESTED). Each of these was reported at head `13faf56d5` and each
+ * is pinned here so a later edit to the failure-word or allow-list rules
+ * cannot silently reintroduce it.
+ */
+describe("hermes adapter stderr findings R1/R2/R4 (KEE-1155 review)", () => {
+  // ── R1: snake_case provider vocabulary must reach the KEE-593 classifier ──
+
+  it("still classifies the snake_case overloaded_error provider failure on exit 0", async () => {
+    // `provider-failure.ts` TRANSIENT_PATTERN matches the literal
+    // `overloaded_error`, but it is only ever called once `errorMessage` is
+    // already set, and a snake_case token is neither a whole word nor a
+    // PascalCase identifier. This exact shape was therefore reported as a
+    // *success* on an exit-0 run that was an upstream outage.
+    runOnce({
+      exitCode: 0,
+      stdout: "",
+      stderr: "HTTP 503: Service Unavailable (overloaded_error)\n",
+    });
+
+    const result = await execute(makeCtx() as never);
+
+    expect(result.errorMessage).toBe("HTTP 503: Service Unavailable (overloaded_error)");
+    expect(result.errorCode).toBe("hermes_transient_upstream");
+    expect(result.errorFamily).toBe("transient_upstream");
+  });
+
+  it("still detects a snake_case provider token with no uppercase in it", async () => {
+    // The second R1 shape: the same snake_case token with no uppercase in it,
+    // outside the `HTTP 503:` line the previous test uses, so the token itself
+    // is what has to be detected rather than the status prefix.
+    runOnce({
+      exitCode: 0,
+      stdout: "",
+      stderr: "gateway reported overloaded_error while calling the provider\n",
+    });
+
+    const result = await execute(makeCtx() as never);
+
+    expect(result.errorMessage).toBe(
+      "gateway reported overloaded_error while calling the provider",
+    );
+    expect(result.errorCode).toBe("hermes_transient_upstream");
+  });
+
+  // ── R2: Hermes' own `errored` / `Erroring` vocabulary ─────────────────────
+
+  it.each([
+    "[hermes] worker errored while calling the provider",
+    "Erroring out: no route to the upstream gateway",
+    "[install] pip install errored for ruff: exit 1",
+    "gateway (local runtime errored)",
+  ])("still reports the Hermes vocabulary line %s", async (stderrLine) => {
+    runOnce({ exitCode: 0, stdout: "", stderr: `${stderrLine}\n` });
+
+    const result = await execute(makeCtx() as never);
+
+    expect(result.errorMessage).toBe(stderrLine);
+  });
+
+  // ── R4: the allow-list must consume the banner, not the whole line ────────
+
+  it("still reports text appended after a resume banner", async () => {
+    // The allow-list matched a *prefix*, so anything after the banner text on
+    // the same line was discarded. In today's Hermes `_say()` each banner is
+    // its own statement, so this is a latent hazard, not a live loss.
+    runOnce({
+      exitCode: 0,
+      stdout: "",
+      stderr: '↻ Resumed session s1 "t" (1 user message) Error: upstream refused the request\n',
+    });
+
+    const result = await execute(makeCtx() as never);
+
+    expect(result.errorMessage).toContain("Error: upstream refused the request");
+  });
+
+  it("still reports a failure appended after a malformed resume banner", async () => {
+    runOnce({
+      exitCode: 0,
+      stdout: "",
+      stderr: "↻ Resumed session s1 RuntimeError: provider call failed\n",
+    });
+
+    const result = await execute(makeCtx() as never);
+
+    expect(result.errorMessage).toContain("RuntimeError: provider call failed");
+  });
+
+  // ── Precision controls: the widened rules must not re-raise false positives ──
+
+  it.each([
+    "the reviewer called the outcome exceptional in both runs",
+    "exceptionally slow startup, still finished",
+  ])("does not report the benign line %s", async (stderrLine) => {
+    runOnce({ exitCode: 0, stdout: "", stderr: `${stderrLine}\n` });
+
+    const result = await execute(makeCtx() as never);
+
+    expect(result.errorMessage).toBeUndefined();
   });
 });
