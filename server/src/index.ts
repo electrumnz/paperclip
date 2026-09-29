@@ -159,14 +159,6 @@ type EmbeddedPostgresCtor = new (opts: {
   onError?: (message: unknown) => void;
 }) => EmbeddedPostgresInstance;
 
-// How long the shutdown path holds the process-wide task drain. It only has to
-// cover the run drain that follows the scheduler quiesce, so this is generous
-// rather than tight. It exists so the drain is never permanent: if the process
-// is SIGKILLed part-way through the teardown, nothing clears this state except
-// an operator route, and a wedged drain would suppress every future run claim.
-const SHUTDOWN_TASK_DRAIN_TTL_MS = 5 * 60_000;
-
-
 export interface StartedServer {
   server: ReturnType<typeof createServer>;
   host: string;
@@ -1942,14 +1934,17 @@ async function startServerWithDatabaseTeardown(
       closeSchedulerAdmission: () => {
         if (!heartbeat) return;
         if (heartbeat.getTaskDrainStatus().draining) return;
-        // Bounded, never permanent. The task drain is process-wide state that
-        // normally only an operator route clears, so a shutdown that is torn
-        // down from the outside (SIGKILL after the stop timeout) must not leave
-        // it wedged if this process ever survives. The TTL covers the whole
-        // remaining teardown with headroom and then releases on its own.
-        heartbeat.startTaskDrain({ ttlMs: SHUTDOWN_TASK_DRAIN_TTL_MS });
+        // No TTL. The drain must outlive the whole teardown, including a run
+        // drain that takes longer than any fixed window: an expiring TTL
+        // re-opens the exact race this closes, because a sweep still in flight
+        // when it lapses can claim a run mid-drain. `taskDrainState` is
+        // module-scope process memory, so this state cannot outlive the
+        // process — a SIGKILL, a crash, or `process.exit(0)` below all clear
+        // it. It therefore needs no expiry, and adding one could only
+        // re-introduce the race.
+        heartbeat.startTaskDrain();
         logger.info(
-          { signal, ttlMs: SHUTDOWN_TASK_DRAIN_TTL_MS },
+          { signal },
           "task drain engaged for the remainder of shutdown",
         );
       },
