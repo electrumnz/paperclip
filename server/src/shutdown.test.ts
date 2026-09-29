@@ -540,9 +540,9 @@ describe("coordinateHeartbeatSchedulerShutdown bounded quiesce", () => {
       // A failing sweep models a real `.catch` on a tracked sweep: the tracked
       // promise settles (with undefined) rather than rejecting.
       const rejected = Promise.reject(new Error("sweep failed"));
-      const waitForHeartbeatSchedulerIdle = vi.fn(() =>
-        Promise.allSettled([healthy, rejected]),
-      );
+      const waitForHeartbeatSchedulerIdle = vi.fn(async () => {
+        await Promise.allSettled([healthy, rejected]);
+      });
 
       const shutdown = coordinateHeartbeatSchedulerShutdown({
         signal: "SIGTERM",
