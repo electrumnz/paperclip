@@ -136,19 +136,16 @@ test("every root vitest project that has test files is also a CI project", () =>
   // server and ui are run by their own dedicated, sharded lanes.
   const laneOwnProjects = new Set(["@paperclipai/server", "@paperclipai/ui"]);
 
-  // Pre-existing gap, found while landing KEE-923 and deliberately NOT fixed
-  // there: these five adapters carry test files that no CI lane has ever run.
-  // They predate this change and each belongs to another adapter's lane, so
-  // adding them is a CI-budget decision, not a transport fix. The allowlist
-  // keeps the gap recorded in the repository where the next owner will see it,
-  // and makes the guard fail the moment a SIXTH package lands this way.
-  const knownMissing = [
-    "@paperclipai/adapter-cursor-cloud",
-    "@paperclipai/adapter-cursor-local",
-    "@paperclipai/adapter-gemini-local",
-    "@paperclipai/adapter-kimi-local",
-    "@paperclipai/adapter-pi-local",
-  ];
+  // Pre-existing gap, found while landing KEE-923 and closed by KEE-930: those
+  // five adapters carried test files that no CI lane ran. They are all in
+  // nonServerProjects now, so the allowlist is empty.
+  //
+  // Keep the array in the file even while empty. A new package that carries
+  // tests but is missing from nonServerProjects must FAIL this guard rather
+  // than be absorbed, and adding a name here to silence it re-creates the
+  // silent-green-build failure mode this guard exists to prevent. If a new
+  // divergence appears, add the package to nonServerProjects instead.
+  const knownMissing = [];
 
   const missing = rootProjects.filter(
     (project) =>
@@ -158,7 +155,7 @@ test("every root vitest project that has test files is also a CI project", () =>
     `these root vitest projects carry tests but are absent from nonServerProjects, ` +
     `so no CI lane runs them and a green build can hide a broken suite: ` +
     `${missing.join(", ")}. Add each to nonServerProjects in ` +
-    `scripts/run-vitest-stable.mjs (KEE-927).`);
+    `scripts/run-vitest-stable.mjs.`);
 
   // Every allowlisted package must still exist and still be a real root project,
   // so the allowlist cannot outlive the gap it records.
