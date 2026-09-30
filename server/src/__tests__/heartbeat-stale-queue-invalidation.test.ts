@@ -385,9 +385,19 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         const [issue] = await db.select().from(issues).where(eq(issues.id, (run.contextSnapshot as { issueId: string }).issueId));
         expect(issue.executionRunId).toBe(run.id);
       }
-      // A same-issue pair must serialize: exactly one run may hold the issue.
+      // A same-issue pair must serialize onto a single issue. Assert the shape
+      // that a broken claim lock actually produces: two runs marked running, both
+      // bound to one issue id. A set of ids collapses that to size 1 and cannot
+      // fail, so assert the multiplicity of that single bound id instead.
       const boundIssueIds = running.map((run) => (run.contextSnapshot as { issueId: string }).issueId);
-      expect(new Set(boundIssueIds).size).toBe(sameIssue ? 1 : boundIssueIds.length);
+      if (sameIssue) {
+        // Exactly one distinct issue, and exactly one run holding it.
+        expect(boundIssueIds).toHaveLength(1);
+        expect(running.filter((run) => (run.contextSnapshot as { issueId: string }).issueId === boundIssueIds[0])).toHaveLength(1);
+      } else {
+        // Unrelated work is not serialized: each run holds its own issue.
+        expect(new Set(boundIssueIds).size).toBe(boundIssueIds.length);
+      }
       // Now let the gated adapter finish and await it, so the run rows this
       // test inspects are settled rather than racing a write in flight.
       release();
