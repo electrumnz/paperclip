@@ -10,6 +10,7 @@ import {
 function counterDb(
   initialCount = 0,
   runOverrides: Record<string, unknown> | null = {},
+  wakeupRequest: { requestedByActorType: string | null } | null = null,
 ) {
   let observedCount = initialCount;
   const inserted: Array<Record<string, unknown>> = [];
@@ -22,6 +23,16 @@ function counterDb(
               then: (resolve: (rows: unknown[]) => unknown) => resolve([{ count: observedCount }]),
             };
           }
+          // KEE-586: the wakeup-request lookup is keyed by its own projection.
+          if (Object.keys(selection).includes("requestedByActorType")) {
+            return {
+              limit: () => ({
+                then: (resolve: (rows: unknown[]) => unknown) => resolve(
+                  wakeupRequest ? [{ requestedByActorType: wakeupRequest.requestedByActorType }] : [],
+                ),
+              }),
+            };
+          }
           return {
             for: () => ({
               then: (resolve: (rows: unknown[]) => unknown) => resolve(runOverrides === null ? [] : [{
@@ -31,6 +42,9 @@ function counterDb(
                 responsibleUserId: "user-1",
                 invocationSource: "on_demand",
                 contextSnapshot: { issueId: "44444444-4444-4444-8444-444444444444" },
+                // No wakeup request unless a test opts in, so the board_dispatch
+                // path is only reachable by naming an initiator explicitly.
+                wakeupRequestId: null,
                 ...runOverrides,
               }]),
             }),
@@ -55,6 +69,12 @@ function counterDb(
     },
   };
 }
+
+const BOARD_WAKE_ID = "66666666-6666-4666-8666-666666666666";
+const COMPANY_ID = "22222222-2222-4222-8222-222222222222";
+const RUN_ID = "11111111-1111-4111-8111-111111111111";
+const AGENT_ID = "33333333-3333-4333-8333-333333333333";
+const TARGET_ISSUE_ID = "55555555-5555-4555-8555-555555555555";
 
 describe("cross-issue influence limit rollout", () => {
   it("logs observations without enforcement during the one-week rollout", () => {
@@ -329,5 +349,166 @@ describe("cross-issue influence limit rollout", () => {
     expect(unanchoredRejection.details.code).not.toBe(missingRunRejection.details.code);
     // The unanchored copy must not claim the header retry works — that is the KEE-567 defect.
     expect(unanchoredRejection.message).not.toContain("X-Paperclip-Run-Id");
+  });
+
+  // KEE-586 — the third unscoped class. The card's acceptance criterion is a pair,
+  // not a single positive: a board-dispatched on_demand wake must be admitted AND
+  // a non-board on_demand wake of the same invocation must still be refused.
+  describe("board-dispatched unscoped wakes (KEE-586)", () => {
+    const boardOnDemandRun = {
+      invocationSource: "on_demand",
+      wakeupRequestId: BOARD_WAKE_ID,
+      contextSnapshot: {
+        wakeSource: "on_demand",
+        wakeTriggerDetail: "manual",
+        triggeredBy: "board",
+        actorId: "local-board",
+        wakeReason: "manual",
+      },
+    };
+
+    it("admits an unanchored on_demand wake dispatched by a user actor", async () => {
+      const fake = counterDb(0, boardOnDemandRun, { requestedByActorType: "user" });
+
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        companyId: COMPANY_ID,
+        runId: RUN_ID,
+        agentId: AGENT_ID,
+        targetIssueId: TARGET_ISSUE_ID,
+        kind: "comment",
+        now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+      })).resolves.toMatchObject({
+        allowed: true,
+        mode: "enforce",
+        count: 1,
+      });
+      // Admitted, but still counted: this is a rate backstop, not a licence.
+      expect(fake.inserted).toEqual([
+        expect.objectContaining({
+          action: "issue.cross_issue_influence_observed",
+          details: expect.objectContaining({
+            sourceKind: "board_dispatch",
+            sourceIssueId: null,
+          }),
+        }),
+      ]);
+    });
+
+    it("still refuses an identical-looking on_demand wake whose initiator is an agent", async () => {
+      const fake = counterDb(0, boardOnDemandRun, { requestedByActorType: "agent" });
+
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        companyId: COMPANY_ID,
+        runId: RUN_ID,
+        agentId: AGENT_ID,
+        targetIssueId: TARGET_ISSUE_ID,
+        kind: "comment",
+      })).rejects.toMatchObject({
+        status: 403,
+        details: { code: "cross_issue_influence_run_not_issue_scoped" },
+      });
+      expect(fake.inserted).toEqual([]);
+    });
+
+    it("still refuses a scheduler-dispatched run that merely claims the board marker", async () => {
+      // The measured case: 285 unscoped runs carry contextSnapshot.triggeredBy
+      // "board" while their wakeup row says "system". The JSON field must not be
+      // authority on its own.
+      const fake = counterDb(0, {
+        ...boardOnDemandRun,
+        invocationSource: "automation",
+        contextSnapshot: { ...boardOnDemandRun.contextSnapshot, wakeSource: "automation" },
+      }, { requestedByActorType: "system" });
+
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        companyId: COMPANY_ID,
+        runId: RUN_ID,
+        agentId: AGENT_ID,
+        targetIssueId: TARGET_ISSUE_ID,
+        kind: "update",
+      })).rejects.toMatchObject({
+        status: 403,
+        details: { code: "cross_issue_influence_run_not_issue_scoped" },
+      });
+      expect(fake.inserted).toEqual([]);
+    });
+
+    it("fails closed when the run has no wakeup request to authenticate an initiator", async () => {
+      // No wakeupRequestId means no service-written initiator of record, so the
+      // board marker in the payload is uncorroborated.
+      const fake = counterDb(0, { ...boardOnDemandRun, wakeupRequestId: null }, null);
+
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        companyId: COMPANY_ID,
+        runId: RUN_ID,
+        agentId: AGENT_ID,
+        targetIssueId: TARGET_ISSUE_ID,
+        kind: "comment",
+      })).rejects.toMatchObject({
+        status: 403,
+        details: { code: "cross_issue_influence_run_not_issue_scoped" },
+      });
+      expect(fake.inserted).toEqual([]);
+    });
+
+    it("fails closed when the wakeup request records no initiator at all", async () => {
+      const fake = counterDb(0, boardOnDemandRun, { requestedByActorType: null });
+
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        companyId: COMPANY_ID,
+        runId: RUN_ID,
+        agentId: AGENT_ID,
+        targetIssueId: TARGET_ISSUE_ID,
+        kind: "comment",
+      })).rejects.toMatchObject({
+        status: 403,
+        details: { code: "cross_issue_influence_run_not_issue_scoped" },
+      });
+      expect(fake.inserted).toEqual([]);
+    });
+
+    it("does not let a user initiator launder a run whose own marker is not the board", async () => {
+      // Belt-and-braces: a user-actor row paired with an agent marker is still not
+      // a board dispatch, and must not become one.
+      const fake = counterDb(0, {
+        ...boardOnDemandRun,
+        contextSnapshot: { ...boardOnDemandRun.contextSnapshot, triggeredBy: "agent" },
+      }, { requestedByActorType: "user" });
+
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        companyId: COMPANY_ID,
+        runId: RUN_ID,
+        agentId: AGENT_ID,
+        targetIssueId: TARGET_ISSUE_ID,
+        kind: "comment",
+      })).rejects.toMatchObject({
+        status: 403,
+        details: { code: "cross_issue_influence_run_not_issue_scoped" },
+      });
+      expect(fake.inserted).toEqual([]);
+    });
+
+    it("keeps the heartbeat timer allowance intact and independent of the initiator column", async () => {
+      // KEE-601's regression guard: the timer class is classified by its own
+      // structural markers and must not be affected by the KEE-586 join.
+      const fake = counterDb(0, {
+        invocationSource: "timer",
+        contextSnapshot: { wakeReason: "heartbeat_timer", wakeSource: "timer" },
+      }, { requestedByActorType: "system" });
+
+      await expect(observeCrossIssueInfluence(fake.db as never, {
+        companyId: COMPANY_ID,
+        runId: RUN_ID,
+        agentId: AGENT_ID,
+        targetIssueId: TARGET_ISSUE_ID,
+        kind: "update",
+        now: CROSS_ISSUE_INFLUENCE_ENFORCE_AT,
+      })).resolves.toMatchObject({ allowed: true, count: 1 });
+      expect(fake.inserted).toEqual([
+        expect.objectContaining({
+          details: expect.objectContaining({ sourceKind: "heartbeat_timer" }),
+        }),
+      ]);
+    });
   });
 });
