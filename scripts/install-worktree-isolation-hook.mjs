@@ -726,11 +726,20 @@ function storedGuardRelation() {
  *
  * The name is the revision being replaced -- the installing lane's HEAD, the
  * lane the operator is standing in, and not necessarily the revision that
- * produced the outgoing file. The timestamp makes each name unique regardless,
- * and what the name is for is to be recognisable to an operator, not to
- * identify a provenance the script cannot establish. This host already carries
- * one from a hand repair -- pre-commit.pre-1023ffe31.20260926T064339Z.bak -- so
- * the convention is the one an operator here will already recognise.
+ * produced the outgoing file. The timestamp narrows it to the second, which is
+ * NOT unique on its own: two writes in one second from one HEAD would collide,
+ * so the name is also probed for a free suffix before use. What the name is for
+ * is to be recognisable to an operator, not to identify a provenance the script
+ * cannot establish. This host already carries one from a hand repair --
+ * pre-commit.pre-1023ffe31.20260926T064339Z.bak -- so the convention is the one
+ * an operator here will already recognise.
+ *
+ * Uniqueness is a correctness property here, not tidiness. Every backup this
+ * writes holds content that exists nowhere else: the working file it came from
+ * is about to be overwritten by a run that exits 0, and an operator's
+ * hand-written guard is frequently never committed at all. A backup silently
+ * overwritten is the same loss as no backup, arrived at more slowly, and it is
+ * worse because the run that wrote it reported success.
  *
  * It is a copy, not a rename: the rename onto the live file is the atomic step
  * that makes the replacement safe, and a failed copy must not take the working
@@ -754,7 +763,22 @@ function backupFileBeforeReplace(file) {
   } catch {
     rev = "unknown-rev";
   }
-  const target = `${file}.pre-${rev}.${stamp}.bak`;
+  // The name carries a second-resolution stamp and the installing lane's HEAD.
+// That is not enough to keep two backups apart: two displacing writes in the
+// same second from the same HEAD compute the identical name, and copyFileSync
+// would overwrite the copy the previous run just told the operator was kept.
+// Measured on KEE-976, an operator iterating on their own guard lost two of
+// three revisions that way, and the run still printed "kept at:" naming a file
+// that no longer held what it promised.
+//
+// So never write over a backup that exists. Probe for a free name instead. This
+// is a copy, so the loop is bounded only by how many backups already sit there;
+// in practice a handful, since an identical rewrite backs up nothing at all.
+const base = `${file}.pre-${rev}.${stamp}`;
+  let target = `${base}.bak`;
+  for (let n = 2; existsSync(target); n++) {
+    target = `${base}-${n}.bak`;
+  }
   try {
     copyFileSync(file, target);
     return target;

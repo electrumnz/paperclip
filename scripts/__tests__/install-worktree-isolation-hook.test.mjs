@@ -2289,3 +2289,61 @@ test("KEE-976: a backup that cannot be written warns loudly and leaves the guard
   }
 });
 
+test("KEE-976: two displacing writes in the same second keep distinct backups", () => {
+  // Found in independent review, and it is the same class of loss this card
+  // exists to remove, one level up. The backup name is built from a
+  // second-resolution stamp and the installing lane's HEAD, so two displacing
+  // writes inside one second from one HEAD compute the identical filename and
+  // copyFileSync() overwrites the copy an operator was just told was kept.
+  //
+  // The operator iterating on their own guard is the ordinary case, not a
+  // contrived one: every --install displaces the last one, and keece-workspace
+  // runs this installer on every lane creation.
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const stored = storedGuardOf(main);
+    const hooksDir = hooksDirOf(main);
+    const fleet = readFileSync(stored, "utf8");
+
+    // Each round is an edit nobody committed, displaced by the next. The
+    // displacement has to be one the rule ALLOWS, or the run correctly
+    // withholds and there is no write to lose. Bumping the checkout's stamp one
+    // version higher makes every round a `newer` write.
+    const edits = ["REV0", "REV1", "REV2"].map((rev) => `${fleet.trimEnd()}\n// KEE-976-SAME-SECOND-${rev}\n`);
+
+    // Three writes, all inside one second, all from one HEAD. Assert the
+    // window rather than trusting the clock: if the run really does straddle a
+    // second boundary this test measures nothing, so skip it instead of
+    // reporting a pass that never happened.
+    const base = versionIn(fleet);
+    const secondsBefore = Date.now();
+    edits.forEach((edited, round) => {
+      // This checkout's guard must be one version HIGHER than what is in force
+      // for the rule to allow the write. What is in force is base+1+round
+      // after the previous round took over, so this round needs base+2+round.
+      writeFileSync(guardInCheckoutOf(main), stampGuardVersion(fleet, base + 2 + round));
+      writeFileSync(stored, edited);
+      const run = installHook(main, ["--install"]);
+      assert.equal(run.status, 0, run.stdout + run.stderr);
+      assert.equal(readFileSync(stored, "utf8"), stampGuardVersion(fleet, base + 2 + round),
+        `fixture is wrong: round ${round} did not displace the stored guard`);
+    });
+    const elapsed = Date.now() - secondsBefore;
+
+    const written = backupsIn(hooksDir);
+    assert.ok(elapsed < 1000,
+      `the three displacing writes spanned ${elapsed}ms, so they were not in the same second and this test measured nothing`);
+
+    // Each displaced revision must still be recoverable on its own. The point
+    // is the COUNT of distinct survivors, not that some backup exists.
+    const survivors = edits.filter((edited) =>
+      written.some((name) => readFileSync(path.join(hooksDir, name), "utf8") === edited));
+    assert.equal(survivors.length, edits.length,
+      `${edits.length} operator revisions were displaced inside one second and ${survivors.length} survived on disk. ` +
+      `Backups written: ${JSON.stringify(written)}. Every displaced revision must keep its own copy.`);
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
