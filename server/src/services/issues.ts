@@ -4299,12 +4299,24 @@ async function listIssueBlockerAttentionMap(
       );
     });
     if (topLevelEdges.length === 0) {
+      // A blocked root with no unresolved blocker edge still genuinely needs
+      // attention — it sits in `blocked` with nothing holding it — so the state
+      // and reason stay. But there is no sampled blocker to point at, and
+      // `terminalBlockerIssueId` means "the sampled blocker that requires
+      // action, rather than the blocked root" (packages/shared IssueBlockerAttention).
+      // Reporting the root's own id contradicts that contract and reads as a
+      // self-referential dependency: `resolveBlockingIssue` already refuses to
+      // render a self-relation, so the attention row would claim the card is
+      // blocked by itself and route any follow-up back to the same card.
+      // Callers already handle null: the attention feed falls back to the issue
+      // itself for the row subject (`terminalBlockerIssueId ?? issue.id`), and
+      // the task-chat blocker links return early when `blockedBy` is empty.
       attentionMap.set(
         root.id,
         createIssueBlockerAttention({
           state: "needs_attention",
           reason: "attention_required",
-          terminalBlockerIssueId: root.id,
+          terminalBlockerIssueId: null,
         }),
       );
       continue;

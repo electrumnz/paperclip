@@ -180,6 +180,64 @@ describeEmbeddedPostgres("issue blocker attention", () => {
     });
   });
 
+  it("keeps a blocked card needing attention without pointing at itself as the blocker", async () => {
+    const { companyId } = await createCompany("PBN");
+    const blockedId = await insertIssue({
+      companyId,
+      identifier: "PBN-1",
+      title: "Blocked with no blocker edge",
+      status: "blocked",
+    });
+
+    const parent = (await svc.list(companyId, { status: "blocked", includeBlockedBy: true }))
+      .find((issue) => issue.id === blockedId);
+
+    // The card still needs a human: it is `blocked` with nothing holding it.
+    // `terminalBlockerIssueId` names "the sampled blocker that requires action,
+    // rather than the blocked root", so with no blocker edge there is nothing to
+    // name and it must be null rather than the card's own id.
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 0,
+      attentionBlockerCount: 0,
+      terminalBlockerIssueId: null,
+      directBlockerIssueId: null,
+      terminalBlocker: null,
+    });
+    expect(parent?.blockerAttention?.terminalBlockerIssueId).not.toBe(blockedId);
+    // No edge exists, so the card is not blocked by anything — not by itself.
+    expect(parent?.blockedBy).toEqual([]);
+  });
+
+  it("keeps a blocked card needing attention when every blocker edge is already done", async () => {
+    const { companyId } = await createCompany("PBNS");
+    const blockedId = await insertIssue({
+      companyId,
+      identifier: "PBNS-1",
+      title: "Blocked by finished work",
+      status: "blocked",
+    });
+    const doneBlockerId = await insertIssue({
+      companyId,
+      identifier: "PBNS-2",
+      title: "Finished blocker",
+      status: "done",
+    });
+    await block({ companyId, blockerIssueId: doneBlockerId, blockedIssueId: blockedId });
+
+    const parent = (await svc.list(companyId, { status: "blocked" })).find((issue) => issue.id === blockedId);
+
+    // A done blocker is filtered out of topLevelEdges, so this reaches the same
+    // no-unresolved-edge branch; it must not report the root as its own blocker.
+    expect(parent?.blockerAttention).toMatchObject({
+      state: "needs_attention",
+      reason: "attention_required",
+      unresolvedBlockerCount: 0,
+      terminalBlockerIssueId: null,
+    });
+  });
+
   it("classifies an assigned backlog blocker leaf without a waiting path as attention-needed", async () => {
     const { companyId, agentId } = await createCompany("PBB");
     const parentId = await insertIssue({ companyId, identifier: "PBB-1", title: "Parent", status: "blocked" });
