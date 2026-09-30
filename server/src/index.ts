@@ -1548,6 +1548,11 @@ async function startServerWithDatabaseTeardown(
           reconciled.continuationRequeued > 0 ||
           reconciled.successfulRunHandoffEscalated > 0 ||
           reconciled.successfulRunHandoffRetried > 0 ||
+          // KEE-1121: a contained per-candidate failure leaves every one of
+          // the counters above at 0, so without this the pass logged nothing
+          // at all. The comment in service.ts promised this warn reports
+          // `failed`; this makes that true.
+          reconciled.failed > 0 ||
           reconciled.escalated > 0
         ) {
           logger.warn(
@@ -1789,6 +1794,9 @@ async function startServerWithDatabaseTeardown(
                 reconciled.continuationRequeued > 0 ||
                 reconciled.successfulRunHandoffEscalated > 0 ||
                 reconciled.successfulRunHandoffRetried > 0 ||
+                // KEE-1121: see the startup guard above. A sweep where every
+                // candidate failed would otherwise log nothing here.
+                reconciled.failed > 0 ||
                 reconciled.escalated > 0
               ) {
                 logger.warn(
