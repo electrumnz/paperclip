@@ -262,6 +262,102 @@ const TOKEN_USAGE_REGEX =
 /** Regex to extract cost from Hermes output. */
 const COST_REGEX = /(?:cost|spent)[:\s]*\$?([\d.]+)/i;
 
+/**
+ * Hermes in quiet mode (`-Q`) deliberately routes its session-resume status
+ * lines to stderr so that stdout stays machine-readable. Those lines are
+ * informational.
+ *
+ * See `hermes_cli/cli_agent_setup_mixin.py` `_say()`: the `_say()` helper prints
+ * to `sys.stderr` in quiet mode, and every successful resume goes through it.
+ * Only the two shapes below are informational, and each is matched in full
+ * rather than by prefix, so a diagnostic that happens to share the line is
+ * still judged on its own words (review finding R4).
+ */
+const RESUME_BANNER_REGEX =
+  /^\s*↻\s*Resumed session\s+\S+(?:\s+".*")?\s*\(\d+ user messages?(?:, \d+ total messages?)?\)\s*$/i;
+
+const RESUME_NO_MESSAGES_REGEX =
+  /^Session\s+\S+\s+found but has no messages\.?\s*Starting fresh\.?$/i;
+
+/**
+ * A single line of stderr is treated as a genuine failure only when it names a
+ * failure word as a whole word.
+ *
+ * The previous pattern was `/error|exception|traceback|failed/i`, unanchored,
+ * so it matched any line that merely *contained* one of those letters
+ * sequences. A resumed session whose title read "Set Sam's exceptional approval
+ * boundaries" contains the substring "exception" inside the word
+ * "exceptional", which made an exit-0 run that had already saved its task
+ * outcome report as `adapter_failed` (live run
+ * ea8f13f4-2c62-461a-a763-2f52d54d9049). Word boundaries fix that class of
+ * false positive without suppressing a real diagnostic: "Error:",
+ * "Exception:", "Traceback" and "call failed" all still match.
+ */
+const STDERR_FAILURE_WORD_REGEX = /\b(?:errors?|exceptions?|tracebacks?|failed|failure)\b/i;
+
+/**
+ * Python exception class names are CamelCase compounds in which the failure
+ * word is glued to a prefix, so `\bError\b` does not match `RuntimeError` or
+ * `ValueError`. Those are genuine failures and must keep being reported, so a
+ * PascalCase identifier that *ends* in a failure word counts too. The leading
+ * capital is what keeps this from re-ignoring lowercase prose such as
+ * "exceptional".
+ */
+const STDERR_FAILURE_IDENTIFIER_REGEX = /\b[A-Z]\w*(?:Error|Exception|Traceback)\b/;
+
+/**
+ * Review finding R1: the typed provider vocabulary is snake_case, so neither
+ * rule above sees it. `overloaded_error` is a literal alternative in
+ * `provider-failure.ts` `TRANSIENT_PATTERN` and the KEE-593 classifier is only
+ * ever called once an `errorMessage` exists, so a run that printed
+ * `HTTP 503: Service Unavailable (overloaded_error)` on exit 0 was recorded as
+ * a *success* while the provider was overloaded. This matches an identifier
+ * token — a run of word characters, optionally joined by `_` — whose final
+ * underscore-separated segment is a failure word. Requiring a word character
+ * immediately before the keyword is what keeps it from re-ignoring "exceptional"
+ * or "exceptionally": the character before `error` must not be a letter.
+ */
+const STDERR_FAILURE_SNAKE_REGEX = /\b\w*(?:[a-z0-9]_)*(?:error|exception|traceback)\b/i;
+
+/**
+ * Review finding R2: `errored` and `Erroring` are Hermes' own vocabulary for a
+ * failed unit of work, not hypothetical English. Real call sites in the
+ * installed tree: `agent/lsp/install.py:155,226` ("install errored for"),
+ * `agent/error_surface.py:9` ("gateway (local runtime errored)") and
+ * `cron/jobs.py:905` ("a job that has been sitting errored").
+ *
+ * These are matched as whole words only. "Errored" is therefore a failure while
+ * "Erroring out:" is one via the trailing form, and neither matches "errored"
+ * embedded in a longer word.
+ */
+const STDERR_FAILURE_INFLECTION_REGEX = /\b(?:errored|Erroring)\b/;
+
+/**
+ * Recognise a known-informational stderr line so it cannot be mistaken for a
+ * runtime failure. Kept deliberately narrow: an allow-list of the exact
+ * informational shapes, not a suppression of stderr as a whole.
+ */
+function isInformationalStderrLine(line: string): boolean {
+  const trimmed = line.trim();
+  if (!trimmed) return true;
+  return RESUME_BANNER_REGEX.test(trimmed) || RESUME_NO_MESSAGES_REGEX.test(trimmed);
+}
+
+/**
+ * True when a stderr line names a genuine runtime or provider failure.
+ *
+ * Order matters only for readability: the informational allow-list is applied by
+ * the caller before this, so a known banner is never judged as a failure.
+ */
+function isFailureStderrLine(line: string): boolean {
+  return (
+    STDERR_FAILURE_WORD_REGEX.test(line) ||
+    STDERR_FAILURE_IDENTIFIER_REGEX.test(line) ||
+    STDERR_FAILURE_SNAKE_REGEX.test(line) ||
+    STDERR_FAILURE_INFLECTION_REGEX.test(line)
+  );
+}
+
 interface ParsedOutput {
   sessionId?: string;
   response?: string;
@@ -348,11 +444,22 @@ function parseHermesOutput(stdout: string, stderr: string): ParsedOutput {
     result.costUsd = parseFloat(costMatch[1]);
   }
 
-  // Check for error patterns in stderr
+  // Check for error patterns in stderr.
+  //
+  // A line counts as a failure only when it names a failure word as a whole
+  // word, and never when it is a known-informational startup/resume banner.
+  // The old unanchored `/error|exception|traceback|failed/i` substring scan
+  // turned a resume banner whose session title contained "exceptional" into a
+  // spurious `adapter_failed` on an exit-0 run (KEE-1154, live run
+  // ea8f13f4-2c62-461a-a763-2f52d54d9049). stderr is still scanned: this is not
+  // a blanket ignore of stderr on exit 0, so a real exit-0 provider failure
+  // keeps producing an errorMessage and keeps reaching the typed
+  // provider-failure classifier below.
   if (stderr.trim()) {
     const errorLines = stderr
       .split("\n")
-      .filter((line) => /error|exception|traceback|failed/i.test(line))
+      .filter((line) => !isInformationalStderrLine(line))
+      .filter((line) => isFailureStderrLine(line))
       .filter((line) => !/INFO|DEBUG|warn/i.test(line)); // skip log-level noise
     if (errorLines.length > 0) {
       result.errorMessage = errorLines.slice(0, 5).join("\n");
