@@ -16122,11 +16122,12 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     // Slack's ingress reorder window (INGRESS_REORDER_WINDOW_MS.slack) is 750ms
     // and the drain deliberately sleeps it so rapid callbacks land in one
     // ordered batch, so the first delivery cannot be ready before ~750ms.
-    // vi.waitFor defaults to a 1000ms budget, which leaves less room than the
-    // reorder window alone consumes, before 8 serial admissions have even
-    // begun. Polling the comment count against that budget read a partially
-    // drained conversation and failed at whatever number the drain happened to
-    // have reached, which is what made this case flake.
+    // vi.waitFor defaults to a 1000ms budget. That is *larger* than the 750ms
+    // reorder window, so the window on its own does not exhaust the budget --
+    // but it leaves only 250ms for the 8 serial admissions that follow, which
+    // is nowhere near enough. Polling the comment count against that budget
+    // read a partially drained conversation and failed at whatever number the
+    // drain happened to have reached, which is what made this case flake.
     //
     // The barrier has to be a condition that is false while the drain is still
     // sleeping and true only once it can admit nothing further. A lease-absent
