@@ -391,33 +391,50 @@ recorded lab unless `--force` is also supplied.
 
 ## Capability drift gates
 
-The capability contract has **four** derived artefacts in two trees, and no single command checks all four:
+The capability contract has **11 derived files across 4 trees**, and no single command checks all of them:
 
-| Artefact                               | Written by                      | Checked by                    |
-| -------------------------------------- | ------------------------------- | ----------------------------- |
-| `generated/capability/*`               | `generate:capability-contract`  | `check:capability-contract`   |
-| `docs/capability-contract.md`          | `generate:capability-inventory` | `check:capability-inventory`  |
-| `spec/capability/*.yaml`               | `generate:capability-inventory` | `check:capability-inventory`  |
-| `src/generated/capability-contract.ts` | `generate:capability-inventory` | `check:capability-inventory`  |
+| Artefact                                       | Files | Written by                      | Checked by                   |
+| ---------------------------------------------- | ----: | ------------------------------- | ---------------------------- |
+| `generated/capability/capabilities.yaml`       | 1     | `generate:capability-contract`  | `check:capability-contract`  |
+| `generated/capability/mcp-tool-map.yaml`       | 1     | `generate:capability-contract`  | `check:capability-contract`  |
+| `generated/capability/eval-traceability.yaml`  | 1     | `generate:capability-contract`  | `check:capability-contract`  |
+| `generated/capability/capability-contract.md`  | 1     | `generate:capability-contract`  | `check:capability-contract`  |
+| `generated/capability/downstream-handoff.md`   | 1     | `generate:capability-contract`  | `check:capability-contract`  |
+| `generated/capability/semantic-tool-contracts.json` | 1 | `generate:semantic-contracts`   | `check:semantic-contracts`   |
+| `spec/capability/*.yaml`                       | 3     | `generate:capability-inventory` | `check:capability-inventory` |
+| `docs/capability-contract.md`                  | 1     | `generate:capability-inventory` | `check:capability-inventory` |
+| `src/generated/capability-contract.ts`         | 1     | `generate:capability-inventory` | `check:capability-inventory` |
 
-`check:capability-contract` is blind to `docs/` and `spec/`, and `check:capability-inventory` is blind to
-`generated/capability/`. That split is deliberate: the two generators have different inputs, and each gate re-renders only
-what its own generator owns. **Run both** to prove the contract is current:
+`check:capability-contract` is blind to `docs/`, `spec/` and `semantic-tool-contracts.json`; `check:capability-inventory` is
+blind to `generated/capability/`. That split is deliberate: the generators have different inputs, and each gate re-renders
+only what its own generator owns. **Run all three** to prove the contract is current:
 
 ```sh
 pnpm check:capability-contract
 pnpm check:capability-inventory
+pnpm check:semantic-contracts
 ```
 
-Both run in CI as part of this package's `build`, so a stale artefact in any of the four fails the required `build` job.
+All three run in CI as part of this package's `build`, so a stale artefact in any of the 11 files fails the required
+`build` job. `check:semantic-contracts` is the slowest of the three because it compiles TypeScript first, and it also
+guards `protocol/manifest.json` and `protocol/fixtures/evals/native-execution-seeded.json`.
 
-This matters most after a rebase that shifts `packages/mcp-server/src/tools.ts` line numbers. Every `sourceAnchor` in
-the contract embeds that line number, so all four artefacts go stale together. `check:capability-inventory` alone will
-report each stale row as `legacyMcpAliases:<id> has stale sourceAnchor`; regenerate rather than hand-editing.
+This matters most after a rebase that shifts `packages/mcp-server/src/tools.ts` line numbers, because every MCP
+`sourceAnchor` embeds that line number. The files go stale in a fixed order:
+
+1. `generated/capability/mcp-tool-map.yaml` (anchors like `tools.ts#L300`) and `spec/capability/mcp-tool-map.yaml`
+   (anchors like `tools.ts:300`). `check:capability-inventory` reports each as `legacyMcpAliases:<id> has stale
+   sourceAnchor`.
+2. `docs/capability-contract.md` next, and only once `spec/` has been regenerated to match — it embeds the anchors that
+   `spec/` supplies, so it is still correct while `spec/` is stale.
+3. `src/generated/capability-contract.ts` never goes stale from a line shift. It carries no `sourceAnchor` and re-renders
+   byte-identical against a shifted source; it can only drift if the inventory schema or row content changes.
+
+Regenerate rather than hand-editing any of these.
 
 To regenerate, note that `generate:capability-inventory` needs the Paperclip Evals corpus, which is a separate
 repository. Set `PAPERCLIP_EVALS_ROOT` to its `paperclip-skill-optimization` directory if it is not checked out
-alongside this one. The two `check:` gates never need it.
+alongside this one. None of the three `check:` gates need it.
 
 ## Navigate
 
