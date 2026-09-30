@@ -192,6 +192,46 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
     });
   }
 
+  it.each(["current", "changed", "removed", "forged", "wrong_agent", "ordinary", "wrong_company", "terminal", "lost_lock"] as const)("rechecks named unblock owner at queued and final dispatch: %s", async scenario => {
+    const { companyId, agentId } = await seedCompanyAndAgent();
+    const authorId = randomUUID(), issueId = randomUUID();
+    await seedAgent({ id: authorId, companyId, name: "Original author" });
+    await seedIssue({ companyId, issueId, status: "blocked", assigneeAgentId: authorId });
+    const descriptor = { owner: { agentId }, action: "Repair this specific blocker" };
+    await db.update(issues).set({ unblockDescriptor: descriptor }).where(eq(issues.id, issueId));
+    const contextSnapshot = { issueId, wakeReason: scenario === "ordinary" ? "issue_assigned" : "issue_unblock_requested",
+      unblockDescriptor: descriptor, isCurrentUnblockOwner: true };
+    const other = scenario === "wrong_company" ? await seedCompanyAndAgent() : null;
+    const runCompanyId = other?.companyId ?? companyId;
+    const runAgentId = other?.agentId ?? (scenario === "wrong_agent" ? authorId : agentId);
+    // Wrong-agent case still has a different original author, so ownership must
+    // come from the descriptor, not ordinary assignee authorization.
+    if (scenario === "wrong_agent") await db.update(issues).set({ assigneeAgentId: null }).where(eq(issues.id, issueId));
+    if (scenario === "forged") await db.update(issues).set({ unblockDescriptor: null }).where(eq(issues.id, issueId));
+    const runId = await seedRun({ companyId: runCompanyId, agentId: runAgentId, contextSnapshot });
+    const adapter = createPostgresRunDispatchAdapter(db);
+    const first = await adapter.cancelStaleQueuedRun({ companyId: runCompanyId, runId, expectedStatus: "queued", now: new Date() });
+    if (["forged", "wrong_agent", "ordinary", "wrong_company"].includes(scenario)) {
+      expect(first).toMatchObject({ outcome: "cancelled", errorCode: scenario === "wrong_company" ? "issue_not_found" : "issue_assignee_changed" });
+      return;
+    }
+    expect(first).toMatchObject({ outcome: "not_stale" });
+    await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, runId));
+    await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    if (scenario === "changed") await db.update(issues).set({ unblockDescriptor: { ...descriptor, owner: { agentId: authorId } } }).where(eq(issues.id, issueId));
+    if (scenario === "removed") await db.update(issues).set({ unblockDescriptor: null }).where(eq(issues.id, issueId));
+    if (scenario === "terminal") await db.update(issues).set({ status: "done" }).where(eq(issues.id, issueId));
+    if (scenario === "lost_lock") {
+      const competingId = await seedRun({ companyId, agentId: authorId, status: "running", contextSnapshot: { issueId } });
+      await db.update(issues).set({ executionRunId: competingId }).where(eq(issues.id, issueId));
+    }
+    const dispatch = vi.fn(async () => undefined);
+    const outcome = await adapter.dispatchResolvedInteractionIfCurrent({ companyId: runCompanyId, runId, expectedStatus: "running", now: new Date(), dispatch });
+    expect(outcome.dispatched).toBe(scenario === "current");
+    expect(dispatch).toHaveBeenCalledTimes(scenario === "current" ? 1 : 0);
+    expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]!.assigneeAgentId).toBe(authorId);
+  });
+
   it.each(["executionRunId", "checkoutRunId"] as const)("suppresses delayed native replacement after another run acquires %s", async (lock) => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();

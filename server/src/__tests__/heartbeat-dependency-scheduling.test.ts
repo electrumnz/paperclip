@@ -486,6 +486,35 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
     expect(mockAdapterExecute).toHaveBeenCalledTimes(1);
   });
 
+  it.each(["current", "changed", "removed", "execution_owned", "checkout_owned"] as const)("rechecks named unblock owner at actual provider launch: %s", async scenario => {
+    const companyId = randomUUID(), agentId = randomUUID(), authorId = randomUUID(), issueId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Unblock launch", issuePrefix: `T${companyId.slice(0, 6).toUpperCase()}`, requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user" });
+    for (const id of [agentId, authorId]) await db.insert(agents).values({ id, companyId, name: id === agentId ? "Unblock owner" : "Original author", role: "engineer", status: "active", adapterType: "codex_local", adapterConfig: {}, runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {} });
+    const descriptor = { owner: { agentId }, action: "Repair the named blocker" };
+    await db.insert(issues).values({ id: issueId, companyId, title: "Held task", status: "blocked", priority: "high", assigneeAgentId: authorId, responsibleUserId: "responsible-user", unblockDescriptor: descriptor });
+    let reachedFinalGate = false;
+    const runner = heartbeatService(db, { beforeResolvedInteractionContinuationDispatchCheck: async () => {
+      reachedFinalGate = true;
+      if (scenario === "changed") await db.update(issues).set({ unblockDescriptor: { ...descriptor, owner: { agentId: authorId } } }).where(eq(issues.id, issueId));
+      if (scenario === "removed") await db.update(issues).set({ unblockDescriptor: null }).where(eq(issues.id, issueId));
+      if (scenario === "execution_owned" || scenario === "checkout_owned") {
+        const competingId = randomUUID();
+        await db.insert(heartbeatRuns).values({ id: competingId, companyId, agentId: authorId, invocationSource: "on_demand", status: "succeeded", contextSnapshot: { issueId } });
+        await db.update(issues).set(scenario === "execution_owned" ? { executionRunId: competingId } : { checkoutRunId: competingId }).where(eq(issues.id, issueId));
+      }
+    } });
+    const run = await runner.wakeup(agentId, { source: "automation", triggerDetail: "system", reason: "issue_unblock_requested", payload: { issueId }, requestedByActorType: "system", requestedByActorId: "issue-unblock-notification", contextSnapshot: { issueId, wakeReason: "issue_unblock_requested" } });
+    expect(run).not.toBeNull();
+    await runner.drainActiveRunExecutions();
+    expect(reachedFinalGate).toBe(true);
+    expect(mockAdapterExecute).toHaveBeenCalledTimes(scenario === "current" ? 1 : 0);
+    const [task] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(task).toMatchObject({ assigneeAgentId: authorId, status: "blocked" });
+    if (scenario !== "checkout_owned") expect(task.checkoutRunId).toBeNull();
+    const [finished] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run!.id));
+    expect(finished.status).toBe(scenario === "current" ? "succeeded" : "cancelled");
+  });
+
   it("keeps blocked descendants idle until their blockers resolve", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();
