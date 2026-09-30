@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
+import { SUPERVISOR_NOTIFY_ENV_KEYS } from "./supervisor-notify-env.js";
 import {
   buildLocalProcessSandboxSpawnTarget,
   type LocalProcessSandboxOptions,
@@ -4893,6 +4894,25 @@ export async function runChildProcess(
       "CLAUDE_CODE_PARENT_SESSION",
     ] as const;
     for (const key of CLAUDE_CODE_NESTING_VARS) {
+      delete rawMerged[key];
+    }
+
+    // Applied here rather than at each call site, because this merge re-spreads
+    // `process.env` and layers the caller's env on top: a call site that
+    // removed NOTIFY_SOCKET from its own env object is silently undone by this
+    // function. Paperclip runs as a `Type=notify` unit with `NotifyAccess=all`,
+    // so an inherited NOTIFY_SOCKET is a write capability on this unit's own
+    // notify socket. A child that sends `STOPPING=1` puts the unit into
+    // deactivating/stop-sigterm without any signal reaching the main process, so
+    // the main process never runs its shutdown path, emits none of its teardown
+    // log lines, and the supervisor SIGKILLs the whole control group at
+    // TimeoutStopSec with every child worker undrained (KEE-1149).
+    //
+    // The caller's value still wins if it names one of these keys: an adapter
+    // that deliberately targets a *different* unit's socket is a real (if
+    // unusual) configuration, and this must not silently override it.
+    for (const key of SUPERVISOR_NOTIFY_ENV_KEYS) {
+      if (opts.env && key in opts.env) continue;
       delete rawMerged[key];
     }
 

@@ -329,12 +329,13 @@ server.listen(${SANDBOX_PROXY_PORT}, "127.0.0.1", () => {
   // process. Inheriting NOTIFY_SOCKET would let it send STOPPING=1 to the parent
   // systemd unit, which stops the unit without ever signalling the main
   // process, and the whole control group is then SIGKILLed undrained
-  // (KEE-1149). Case-insensitive: a Windows spawn target resolves keys
-  // case-insensitively.
+  // (KEE-1149). Case-insensitive, matching withoutSupervisorNotifyEnv: a Windows
+  // spawn target resolves environment keys case-insensitively, so
+  // "Notify_Socket" would name the same variable there.
+  const SUPERVISOR_NOTIFY_ENV_KEYS = ["NOTIFY_SOCKET", "WATCHDOG_PID"];
   const childEnv = { ...process.env };
   for (const key of Object.keys(childEnv)) {
-    if (key === "NOTIFY_SOCKET" || key === "NOTIFY_SOCKET".toUpperCase() ||
-        key === "WATCHDOG_PID" || key === "WATCHDOG_PID".toUpperCase()) {
+    if (SUPERVISOR_NOTIFY_ENV_KEYS.includes(key.toUpperCase())) {
       delete childEnv[key];
     }
   }
