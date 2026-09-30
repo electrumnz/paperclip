@@ -267,6 +267,18 @@ describe("decideScheduledRetryGate", () => {
 });
 
 describe("decideQueuedRunStaleness", () => {
+  it("admits a current named unblock owner without bypassing terminal or execution-lock gates", () => {
+    const facts = { ...baseStalenessFacts(), issueAssigneeAgentId: "author", issueStatus: "blocked",
+      wakeReason: "issue_unblock_requested", isCurrentUnblockOwner: true };
+    expect(decideQueuedRunStaleness(facts, NOW)).toEqual({ stale: false });
+    expect(decideQueuedRunStaleness({ ...facts, isCurrentUnblockOwner: false }, NOW))
+      .toMatchObject({ stale: true, errorCode: "issue_assignee_changed" });
+    expect(decideQueuedRunStaleness({ ...facts, issueStatus: "done" }, NOW))
+      .toMatchObject({ stale: true, errorCode: "issue_terminal_status" });
+    expect(decideQueuedRunStaleness({ ...facts, issueStatus: "in_progress", retryReasonKind: "max_turn_continuation", issueExecutionRunId: "other" }, NOW))
+      .toMatchObject({ stale: true, errorCode: "issue_execution_lock_changed" });
+  });
+
   it("is not stale when every rule passes", () => {
     expect(decideQueuedRunStaleness(baseStalenessFacts(), NOW)).toEqual({
       stale: false,

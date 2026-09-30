@@ -22671,7 +22671,8 @@ export function heartbeatService(
         if (
           !issueId ||
           (!isResolvedInteractionContinuationWakeContext(context) &&
-            run.scheduledRetryReason !== "native_safe_replacement")
+            run.scheduledRetryReason !== "native_safe_replacement" &&
+            readNonEmptyString(context.wakeReason) !== "issue_unblock_requested")
         ) {
           return { dispatched: true, resultPromise: dispatch(() => {}) };
         }

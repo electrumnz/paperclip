@@ -519,6 +519,7 @@ export function createPostgresRunDispatchAdapter(
         executionRunId: issues.executionRunId,
         checkoutRunId: issues.checkoutRunId,
         executionState: issues.executionState,
+        unblockDescriptor: issues.unblockDescriptor,
       })
       .from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, input.companyId)));
@@ -533,6 +534,12 @@ export function createPostgresRunDispatchAdapter(
     );
     const resumeIntent = context.resumeIntent === true || context.followUpRequested === true;
     const wakeReason = readNonEmptyString(context.wakeReason);
+    // The issue is company-scoped and locked at queued/final dispatch. A saved
+    // descriptor in the wake context is only a hint and cannot grant ownership.
+    const unblockOwner = issue?.unblockDescriptor?.owner;
+    const isCurrentUnblockOwner = wakeReason === "issue_unblock_requested" &&
+      unblockOwner != null && typeof unblockOwner === "object" &&
+      "agentId" in unblockOwner && unblockOwner.agentId === input.agentId;
     const retryReason =
       readNonEmptyString(context.retryReason) ?? input.scheduledRetryReason ?? null;
     const interactionResolvedAt = readNonEmptyString(context.interactionResolvedAt);
@@ -605,6 +612,7 @@ export function createPostgresRunDispatchAdapter(
         || context.source === "connection_tools.refreshed",
       isInteractionWake,
       isAuthorizedSourceScopedRecovery,
+      isCurrentUnblockOwner,
       isNonAssigneeWorkspaceBusyRetry: isNonAssigneeWorkspaceBusyRetry(retryReason, context),
       resumeIntent,
       wakeCommentIdPresent: Boolean(wakeCommentId),
@@ -1015,7 +1023,7 @@ export function createPostgresRunDispatchAdapter(
       if (run.status !== input.expectedStatus) {
         return { dispatched: false as const, cancellation: { outcome: "lost_race" as const } };
       }
-      const { issueId, decision: initialDecision } = await decideCurrentRunStaleness(
+      const { issueId, facts, decision: initialDecision } = await decideCurrentRunStaleness(
         tx,
         run,
         input.now,
@@ -1028,7 +1036,12 @@ export function createPostgresRunDispatchAdapter(
               .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
               .then((rows) => rows[0] ?? null)
               .then((issue) =>
-                issue?.executionRunId === run.id
+                // Unblock work deliberately does not check out the held task.
+                // Its current named owner may launch with no issue lease, but
+                // cannot take over another execution or checkout.
+                (facts?.isCurrentUnblockOwner
+                  ? [facts.issueExecutionRunId, facts.issueCheckoutRunId].every(id => id == null || id === run.id)
+                  : issue?.executionRunId === run.id)
                   ? initialDecision
                   : {
                       stale: true as const,

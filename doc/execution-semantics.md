@@ -1465,3 +1465,9 @@ Contracts reference the existing brief and answers instead of copying them again
 Resumed sessions keep the existing message-delta path; fresh sessions receive the
 full covered history. Stable wording and bounded references avoid adding another
 full brief on each comment, but provider cache hits must be measured separately.
+
+A named agent unblock wake (`issue_unblock_requested`) may execute for the current
+unblock descriptor owner without changing the issue assignee. Queued and final
+dispatch derive that ownership from the company-scoped, locked issue row; a saved
+wake descriptor cannot preserve permission after the owner changes or is removed.
+This exception changes only the assignee check, not the remaining dispatch gates.
