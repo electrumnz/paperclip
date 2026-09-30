@@ -61852,20 +61852,60 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     // One root-conversation drain plus one durable-ingress callback per HTTP
     // request is queued. The duplicate delivery callback becomes a no-op.
     expect(deferred).toHaveLength(4);
-    await drainDeferred();
-    await vi.waitFor(async () => {
-      const deliveries = await db
+    // `deferWebhookProcessing` holds each admitted lifecycle callback until the
+    // provider reorder window (`INGRESS_REORDER_WINDOW_MS.github`, 750ms)
+    // elapses: the rows are inserted with `state=received`, `attempts=0` and
+    // `nextAttemptAt = now + 750ms`. A single `drainDeferred()` therefore
+    // deliberately finds nothing ready, and the conversation drain re-arms
+    // itself on a real timer rather than handing control back to the test.
+    // Asserting on a single drain raced that timer, which is why this case
+    // passed or failed by luck.
+    //
+    // Drive it to a settled outcome instead: run every queued callback and
+    // re-drain until the conversation has no open delivery left. This exercises
+    // the real production ordering path (durable root, then edit, then delete)
+    // and keeps the original assertions intact.
+    const deliveriesFor = () =>
+      db
         .select({
-          eventKind: chatDeliveries.eventKind,
+          id: chatDeliveries.id,
           state: chatDeliveries.state,
         })
         .from(chatDeliveries)
         .where(eq(chatDeliveries.endpointId, endpoint.id));
-      expect(deliveries).toHaveLength(3);
-      expect(
-        deliveries.every((delivery) => delivery.state === "processed"),
-      ).toBe(true);
-    });
+    // Settled means every expected delivery exists and none is still open.
+    // Requiring the full set matters: before the durable ingress callbacks
+    // admit the lifecycle rows there is nothing open either, so counting only
+    // open rows would declare success too early.
+    const isSettled = async () => {
+      const rows = await deliveriesFor();
+      return (
+        rows.length === 3 &&
+        rows.every(
+          (row) => !["received", "retry", "processing"].includes(row.state),
+        )
+      );
+    };
+    let settled = false;
+    for (let round = 0; round < 60 && !settled; round += 1) {
+      await drainDeferred();
+      await service.processPendingDeliveries(25);
+      // Let the scheduler's own reorder-window timer fire.
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      settled = await isSettled();
+    }
+    expect(settled).toBe(true);
+    const deliveries = await db
+      .select({
+        eventKind: chatDeliveries.eventKind,
+        state: chatDeliveries.state,
+      })
+      .from(chatDeliveries)
+      .where(eq(chatDeliveries.endpointId, endpoint.id));
+    expect(deliveries).toHaveLength(3);
+    expect(
+      deliveries.every((delivery) => delivery.state === "processed"),
+    ).toBe(true);
 
     const [conversation] = await db
       .select()
