@@ -2168,101 +2168,134 @@ export function recoveryService(
 
     let assigned = 0;
     let skipped = 0;
+    // KEE-1121: candidates whose own work failed. Counted, and kept separate
+    // from `skipped`, so an operator can tell a contained failure apart from a
+    // candidate that was genuinely left alone.
+    let failed = 0;
+    const failedIssueIds: string[] = [];
     const issueIds: string[] = [];
     const seen = new Set<string>();
 
     for (const candidate of candidates) {
-      if (seen.has(candidate.id)) continue;
-      seen.add(candidate.id);
+      // KEE-1121 containment. One orphan-blocker candidate's failure must not
+      // abandon every blocker queued behind it: the assignee write, the
+      // comment, the activity log and the wake enqueue are all real writes and
+      // any of them can reject. A failure is contained, logged with the
+      // candidate's identity, and counted in the result.
+      try {
+        if (seen.has(candidate.id)) continue;
+        seen.add(candidate.id);
 
-      const creatorAgentId = candidate.createdByAgentId;
-      if (!creatorAgentId) {
-        skipped += 1;
-        continue;
-      }
-      const creatorAgent = await getAgent(creatorAgentId);
-      if (
-        !creatorAgent ||
-        creatorAgent.companyId !== candidate.companyId ||
-        !(await isAgentInvokable(creatorAgent))
-      ) {
-        skipped += 1;
-        continue;
-      }
+        const creatorAgentId = candidate.createdByAgentId;
+        if (!creatorAgentId) {
+          skipped += 1;
+          continue;
+        }
+        const creatorAgent = await getAgent(creatorAgentId);
+        if (
+          !creatorAgent ||
+          creatorAgent.companyId !== candidate.companyId ||
+          !(await isAgentInvokable(creatorAgent))
+        ) {
+          skipped += 1;
+          continue;
+        }
 
-      const relations = await issuesSvc.getRelationSummaries(candidate.id);
-      const blockingLinks = formatIssueLinksForComment(relations.blocks);
-      const updated = await issuesSvc.update(candidate.id, {
-        assigneeAgentId: creatorAgent.id,
-        assigneeUserId: null,
-      });
-      if (!updated) {
-        skipped += 1;
-        continue;
-      }
-
-      await issuesSvc.addComment(
-        candidate.id,
-        [
-          "## Assigned Orphan Blocker",
-          "",
-          `Paperclip found this issue is blocking ${blockingLinks} but had no assignee, so no heartbeat could pick it up.`,
-          "",
-          "- Assigned it back to the agent that created the blocker.",
-          "- Next action: resolve this blocker or reassign it to the right owner.",
-        ].join("\n"),
-        {},
-      );
-
-      await logActivity(db, {
-        companyId: candidate.companyId,
-        actorType: "system",
-        actorId: "system",
-        agentId: null,
-        runId: null,
-        action: "issue.updated",
-        entityType: "issue",
-        entityId: candidate.id,
-        details: {
-          identifier: candidate.identifier,
+        const relations = await issuesSvc.getRelationSummaries(candidate.id);
+        const blockingLinks = formatIssueLinksForComment(relations.blocks);
+        const updated = await issuesSvc.update(candidate.id, {
           assigneeAgentId: creatorAgent.id,
-          source: "recovery.reconcile_unassigned_blocking_issue",
-        },
-      });
+          assigneeUserId: null,
+        });
+        if (!updated) {
+          skipped += 1;
+          continue;
+        }
 
-      const queued = await deps.enqueueWakeup(creatorAgent.id, {
-        source: "automation",
-        triggerDetail: "system",
-        reason: "issue_assigned",
-        payload: withRecoveryContext(
-          {
-            issueId: candidate.id,
-            mutation: "unassigned_blocker_recovery",
-          },
-          "normal_model",
-        ),
-        requestedByActorType: "system",
-        requestedByActorId: null,
-        contextSnapshot: withRecoveryContext(
-          {
-            issueId: candidate.id,
-            taskId: candidate.id,
-            wakeReason: "issue_assigned",
-            source: "issue.unassigned_blocker_recovery",
-          },
-          "normal_model",
-        ),
-      });
+        await issuesSvc.addComment(
+          candidate.id,
+          [
+            "## Assigned Orphan Blocker",
+            "",
+            `Paperclip found this issue is blocking ${blockingLinks} but had no assignee, so no heartbeat could pick it up.`,
+            "",
+            "- Assigned it back to the agent that created the blocker.",
+            "- Next action: resolve this blocker or reassign it to the right owner.",
+          ].join("\n"),
+          {},
+        );
 
-      if (queued) {
-        assigned += 1;
-        issueIds.push(candidate.id);
-      } else {
-        skipped += 1;
+        await logActivity(db, {
+          companyId: candidate.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: null,
+          runId: null,
+          action: "issue.updated",
+          entityType: "issue",
+          entityId: candidate.id,
+          details: {
+            identifier: candidate.identifier,
+            assigneeAgentId: creatorAgent.id,
+            source: "recovery.reconcile_unassigned_blocking_issue",
+          },
+        });
+
+        const queued = await deps.enqueueWakeup(creatorAgent.id, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_assigned",
+          payload: withRecoveryContext(
+            {
+              issueId: candidate.id,
+              mutation: "unassigned_blocker_recovery",
+            },
+            "normal_model",
+          ),
+          requestedByActorType: "system",
+          requestedByActorId: null,
+          contextSnapshot: withRecoveryContext(
+            {
+              issueId: candidate.id,
+              taskId: candidate.id,
+              wakeReason: "issue_assigned",
+              source: "issue.unassigned_blocker_recovery",
+            },
+            "normal_model",
+          ),
+        });
+
+        if (queued) {
+          assigned += 1;
+          issueIds.push(candidate.id);
+        } else {
+          skipped += 1;
+        }
+      } catch (error) {
+        // KEE-1121: contain this candidate so the rest of the queue still
+        // gets assigned. The counters stay honest: a failure is never folded
+        // into `assigned` or `skipped`, because either would claim an
+        // outcome this candidate did not reach.
+        //
+        // If the assignee write already landed, the row leaves the candidate
+        // set on the next pass (the query filters `assigneeAgentId is null`),
+        // so nothing here retries that uncertain write. The identity is
+        // reported instead, so an operator can wake it by hand.
+        failed += 1;
+        failedIssueIds.push(candidate.id);
+        logger.error(
+          {
+            err: error,
+            issueId: candidate.id,
+            companyId: candidate.companyId,
+            identifier: candidate.identifier,
+          },
+          "orphan-blocker recovery failed for one candidate; continuing the queue",
+        );
       }
     }
 
-    return { assigned, skipped, issueIds };
+    return { assigned, skipped, failed, failedIssueIds, issueIds };
   }
 
   async function getCompanyIssuePrefix(companyId: string) {
@@ -3498,130 +3531,159 @@ export function recoveryService(
       escalated: 0,
       resolved: 0,
       skipped: 0,
+      // KEE-1121: contained per-row failures, kept separate from `skipped`.
+      failed: 0,
+      failedIssueIds: [] as string[],
       issueIds: [] as string[],
     };
     for (const { action, issue } of rows) {
-      const wakePolicy = parseObject(action.wakePolicy);
-      const wakePolicyType = readNonEmptyString(wakePolicy.type);
-      if (
-        wakePolicyType !== "bounded_recovery_owner" &&
-        wakePolicyType !== "bounded_owner_disposition_repair" &&
-        action.ownerType !== "board"
-      ) {
-        continue;
-      }
-
-      if (issue.status === "done" || issue.status === "cancelled") {
-        const resolved = await recoveryActionsSvc.resolveActiveForIssue({
-          companyId: action.companyId,
-          sourceIssueId: action.sourceIssueId,
-          actionId: action.id,
-          status: "resolved",
-          outcome: "restored",
-          resolutionNote: "source_terminal",
-        });
-        if (resolved) {
-          result.resolved += 1;
-          result.issueIds.push(issue.id);
-        }
-        continue;
-      }
-
-      // A queued comment or healthy child cannot establish what the stopped
-      // provider already did. Only execution reconciliation can clear this hold.
-      if (requiresExecutionReconciliation(action.cause)) {
-        result.skipped += 1;
-        continue;
-      }
-
-      const [sourceState, healthyChildren, hasNewSourcePath] =
-        await Promise.all([
-          collectDispositionRepairSourceState(db, { issue }),
-          healthyOpenChildIssues(issue),
-          sourceHasNewPathOutsideRecoveryAction(action),
-        ]);
-      const durablePathRestored =
-        action.ownerType !== "board" && sourceState.hasDurableWaitingPath;
-      if (
-        durablePathRestored ||
-        healthyChildren.length > 0 ||
-        hasNewSourcePath
-      ) {
-        if (healthyChildren.length > 0 && !sourceState.hasDurableWaitingPath) {
-          const blockerIds = await existingUnresolvedBlockerIssueIds(
-            issue.companyId,
-            issue.id,
-          );
-          await issuesSvc.update(issue.id, {
-            status: "blocked",
-            blockedByIssueIds: [
-              ...new Set([
-                ...blockerIds,
-                ...healthyChildren.map((child) => child.id),
-              ]),
-            ],
-          });
-        }
-        const resolved = await recoveryActionsSvc.resolveActiveForIssue({
-          companyId: action.companyId,
-          sourceIssueId: action.sourceIssueId,
-          actionId: action.id,
-          status: "resolved",
-          outcome: "restored",
-          resolutionNote: durablePathRestored
-            ? `durable_path_restored:${sourceState.durablePathReason ?? "unknown"}`
-            : healthyChildren.length > 0
-              ? "durable_path_restored:healthy_child"
-              : "new_source_execution_path",
-        });
-        if (resolved) {
-          result.resolved += 1;
-          result.issueIds.push(issue.id);
-        }
-        continue;
-      }
-
-      if (wakePolicyType === "bounded_owner_disposition_repair") {
+      // KEE-1121 containment. One recovery action's failure must not abandon
+      // the rest of the pass: this loop resolves actions, updates blockers and
+      // schedules wakes. A failure is contained, logged with the row's
+      // identity, and counted in the result.
+      try {
+        const wakePolicy = parseObject(action.wakePolicy);
+        const wakePolicyType = readNonEmptyString(wakePolicy.type);
         if (
-          await isAutomaticRecoverySuppressedByPauseHold(
-            db,
-            issue.companyId,
-            issue.id,
-            treeControlSvc,
-          )
+          wakePolicyType !== "bounded_recovery_owner" &&
+          wakePolicyType !== "bounded_owner_disposition_repair" &&
+          action.ownerType !== "board"
         ) {
+          continue;
+        }
+
+        if (issue.status === "done" || issue.status === "cancelled") {
+          const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+            companyId: action.companyId,
+            sourceIssueId: action.sourceIssueId,
+            actionId: action.id,
+            status: "resolved",
+            outcome: "restored",
+            resolutionNote: "source_terminal",
+          });
+          if (resolved) {
+            result.resolved += 1;
+            result.issueIds.push(issue.id);
+          }
+          continue;
+        }
+
+        // A queued comment or healthy child cannot establish what the stopped
+        // provider already did. Only execution reconciliation can clear this hold.
+        if (requiresExecutionReconciliation(action.cause)) {
           result.skipped += 1;
           continue;
         }
 
-        const latestRun = await latestRecoveryActionRun(action);
-        const persistedAttempt = Math.max(
-          action.attemptCount,
-          Math.max(
-            0,
-            Math.floor(asNumber(wakePolicy.attempt, action.attemptCount)),
-          ),
-        );
-        const outcome = await reconcileDispositionRepair(issue, latestRun, {
-          historicalAttemptCount: persistedAttempt,
-        });
-        if (outcome === "queued") {
-          result.requeued += 1;
-          result.issueIds.push(issue.id);
-        } else if (outcome === "escalated") {
-          result.escalated += 1;
-          result.issueIds.push(issue.id);
-        } else {
-          result.skipped += 1;
+        const [sourceState, healthyChildren, hasNewSourcePath] =
+          await Promise.all([
+            collectDispositionRepairSourceState(db, { issue }),
+            healthyOpenChildIssues(issue),
+            sourceHasNewPathOutsideRecoveryAction(action),
+          ]);
+        const durablePathRestored =
+          action.ownerType !== "board" && sourceState.hasDurableWaitingPath;
+        if (
+          durablePathRestored ||
+          healthyChildren.length > 0 ||
+          hasNewSourcePath
+        ) {
+          if (healthyChildren.length > 0 && !sourceState.hasDurableWaitingPath) {
+            const blockerIds = await existingUnresolvedBlockerIssueIds(
+              issue.companyId,
+              issue.id,
+            );
+            await issuesSvc.update(issue.id, {
+              status: "blocked",
+              blockedByIssueIds: [
+                ...new Set([
+                  ...blockerIds,
+                  ...healthyChildren.map((child) => child.id),
+                ]),
+              ],
+            });
+          }
+          const resolved = await recoveryActionsSvc.resolveActiveForIssue({
+            companyId: action.companyId,
+            sourceIssueId: action.sourceIssueId,
+            actionId: action.id,
+            status: "resolved",
+            outcome: "restored",
+            resolutionNote: durablePathRestored
+              ? `durable_path_restored:${sourceState.durablePathReason ?? "unknown"}`
+              : healthyChildren.length > 0
+                ? "durable_path_restored:healthy_child"
+                : "new_source_execution_path",
+          });
+          if (resolved) {
+            result.resolved += 1;
+            result.issueIds.push(issue.id);
+          }
+          continue;
         }
-        continue;
+
+        if (wakePolicyType === "bounded_owner_disposition_repair") {
+          if (
+            await isAutomaticRecoverySuppressedByPauseHold(
+              db,
+              issue.companyId,
+              issue.id,
+              treeControlSvc,
+            )
+          ) {
+            result.skipped += 1;
+            continue;
+          }
+
+          const latestRun = await latestRecoveryActionRun(action);
+          const persistedAttempt = Math.max(
+            action.attemptCount,
+            Math.max(
+              0,
+              Math.floor(asNumber(wakePolicy.attempt, action.attemptCount)),
+            ),
+          );
+          const outcome = await reconcileDispositionRepair(issue, latestRun, {
+            historicalAttemptCount: persistedAttempt,
+          });
+          if (outcome === "queued") {
+            result.requeued += 1;
+            result.issueIds.push(issue.id);
+          } else if (outcome === "escalated") {
+            result.escalated += 1;
+            result.issueIds.push(issue.id);
+          } else {
+            result.skipped += 1;
+          }
+          continue;
+        }
+
+        if (action.ownerType === "board") continue;
+
+        // Legacy takeover actions remain readable and resolvable, but recovery no
+        // longer schedules another agent-owned wake for them.
+        result.skipped += 1;
+      } catch (error) {
+      // KEE-1121: contain this action so one bad row cannot abandon the
+      // rest of the pass. The counters stay honest: a failure is counted
+      // as `failed`, never as `skipped`, because `skipped` means the
+      // action was deliberately left alone and this one was not.
+      //
+      // No write is retried here. An action that was left unresolved stays
+      // active and is reconsidered on the next pass, which is the existing
+      // behaviour for a partially applied row.
+      result.failed += 1;
+      result.failedIssueIds.push(issue.id);
+      logger.error(
+        {
+          err: error,
+          issueId: issue.id,
+          companyId: action.companyId,
+          actionId: action.id,
+        },
+        "active recovery action failed for one row; continuing the pass",
+      );
       }
-
-      if (action.ownerType === "board") continue;
-
-      // Legacy takeover actions remain readable and resolvable, but recovery no
-      // longer schedules another agent-owned wake for them.
-      result.skipped += 1;
     }
     return result;
   }
@@ -4538,12 +4600,15 @@ export function recoveryService(
       // The `continue` statements in the body are untouched: they still skip to
       // the next candidate exactly as before.
       //
-      // Scope note: only the per-issue body is contained. The candidate query,
-      // the pre-loop goal-binding query, and the post-loop
-      // `reconcileUnassignedBlockingIssues` / `reconcileActiveRecoveryActions`
-      // passes stay outside on purpose. If those fail there is no honest partial
-      // result to return, so the rejection must reach the caller — where
-      // `trackHeartbeatSchedulerWork` now logs it instead of discarding it.
+      // Scope note: only the per-issue body is contained. The candidate query
+      // and the pre-loop goal-binding query stay outside on purpose. If those
+      // fail there is no honest partial result to return, so the rejection must
+      // reach the caller — where `trackHeartbeatSchedulerWork` now logs it
+      // instead of discarding it.
+      // KEE-1121: the post-loop `reconcileUnassignedBlockingIssues` /
+      // `reconcileActiveRecoveryActions` passes were named here as staying
+      // outside. They are per-row loops in their own right, so they now carry
+      // the same containment and report into these same counters.
       try {
         if (issue.originKind === "chat_channel") {
           await settleSlackConversation(db, issue.companyId, issue.id);
@@ -5752,15 +5817,23 @@ export function recoveryService(
       }
     }
 
+    // KEE-1121: both post-loop passes are per-row loops, so both now contain
+    // their own candidates. Their contained failures are attributed back to
+    // the same `failed` / `failedIssueIds` counters the main loop uses, so all
+    // three passes read the same way to an operator.
     const orphanBlockerRecovery = await reconcileUnassignedBlockingIssues();
     result.orphanBlockersAssigned = orphanBlockerRecovery.assigned;
     result.skipped += orphanBlockerRecovery.skipped;
+    result.failed += orphanBlockerRecovery.failed;
+    result.failedIssueIds.push(...orphanBlockerRecovery.failedIssueIds);
     result.issueIds.push(...orphanBlockerRecovery.issueIds);
 
     const activeRecovery = await reconcileActiveRecoveryActions();
     result.continuationRequeued += activeRecovery.requeued;
     result.escalated += activeRecovery.escalated;
     result.skipped += activeRecovery.skipped;
+    result.failed += activeRecovery.failed;
+    result.failedIssueIds.push(...activeRecovery.failedIssueIds);
     result.issueIds.push(...activeRecovery.issueIds);
     result.issueIds = [...new Set(result.issueIds)];
 
