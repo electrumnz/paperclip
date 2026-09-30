@@ -7,6 +7,7 @@ import { createHash, randomUUID } from "node:crypto";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import type { AdapterRuntimeServiceReport } from "@paperclipai/adapter-utils";
+import { withoutSupervisorNotifyEnv } from "@paperclipai/adapter-utils/supervisor-notify-env";
 import type { Db } from "@paperclipai/db";
 import { executionWorkspaces, issueComments, issues, projectWorkspaces, workspaceRuntimeServices } from "@paperclipai/db";
 import {
@@ -689,7 +690,26 @@ export function sanitizeRuntimeServiceBaseEnv(baseEnv: NodeJS.ProcessEnv): NodeJ
   delete env.DATABASE_URL;
   delete env.npm_config_tailscale_auth;
   delete env.npm_config_authenticated_private;
-  return env;
+  // Strip the unit's own supervisor-notify keys from the inherited base.
+  //
+  // The unit is Type=notify with NotifyAccess=all, so an inherited NOTIFY_SOCKET
+  // is a write capability on this unit's own notify socket. A managed workspace
+  // service is spawned by the main server through `spawn(shell, ["-lc", command])`
+  // — not by a scrubbed agent worker — so it kept that capability even once every
+  // agent ran as Hermes. A service whose tooling calls `systemd-notify` (a dev
+  // runtime, a test, any dependency that shells out) can then send STOPPING=1 and
+  // move the unit into deactivating/stop-sigterm with no signal reaching the main
+  // process: no teardown log lines, no run drain, and a SIGKILL of the whole
+  // control group at TimeoutStopSec that takes undrained workers with it. That is
+  // the KEE-1149 stop-timeout signature.
+  //
+  // This is the inherited base only, which is what keeps explicit configuration
+  // working: every caller merges its configured overrides — adapterEnv, the
+  // rendered service env, auth env — over the result, so a service that names
+  // NOTIFY_SOCKET on purpose still gets it. Unlike the spawn funnel, the adapter
+  // env here is built from stored runtime config rather than from a copy of
+  // process.env, so a key present in an override really is a deliberate choice.
+  return withoutSupervisorNotifyEnv(env);
 }
 
 function stableRuntimeServiceId(input: {

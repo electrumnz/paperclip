@@ -551,6 +551,129 @@ describe("sanitizeRuntimeServiceBaseEnv", () => {
   });
 });
 
+/**
+ * The managed-workspace-service inheritance boundary (KEE-1149).
+ *
+ * A managed workspace service is spawned by the MAIN SERVER through a direct
+ * `spawn(shell, ["-lc", command], { env })` — not through the `runChildProcess`
+ * funnel and not by a scrubbed agent worker. So the funnel strip added in this PR
+ * does not cover it, and even with every agent configured as Hermes the service
+ * kept the unit's notify socket.
+ *
+ * These probe a REAL spawned child, using the same shell and argv shape as
+ * `startRuntimeService`, because the property that matters is what a process can
+ * actually do: with the unit `Type=notify` and `NotifyAccess=all`, a child holding
+ * `NOTIFY_SOCKET` holds a write capability on the parent unit's notify socket, and
+ * `STOPPING=1` from that child moves the unit into deactivating/stop-sigterm with
+ * no signal reaching the main process — so it never runs its own shutdown path,
+ * emits none of its teardown log lines, and gets SIGKILLed with every undrained
+ * child worker at TimeoutStopSec. That is the KEE-1149 signature.
+ *
+ * They deliberately do NOT go through `runChildProcess`: that funnel strips the
+ * same keys itself, so it would pass even with the sanitizer unfixed and prove
+ * nothing. Driving the production spawn keeps these discriminating.
+ */
+describe("managed workspace service child env supervisor-notify inheritance", () => {
+  /** Spawn via the production shape and report what the child can actually see. */
+  async function probeServiceChildEnv(baseEnv: NodeJS.ProcessEnv) {
+    const script =
+      "process.stdout.write(JSON.stringify({ns: process.env.NOTIFY_SOCKET ?? null, wd: process.env.WATCHDOG_PID ?? null}))";
+    const shell = resolveShell();
+    const { stdout } = await execFileAsync(
+      shell,
+      ["-lc", `${process.execPath} -e ${JSON.stringify(script)}`],
+      { env: sanitizeRuntimeServiceBaseEnv(baseEnv) as Record<string, string>, encoding: "utf8" },
+    );
+    return JSON.parse(stdout || "{}") as { ns: string | null; wd: string | null };
+  }
+
+  it("does not hand a spawned workspace service the unit's notify socket", async () => {
+    // The reported gap: the sanitizer cleared PAPERCLIP_*/auth keys but left
+    // NOTIFY_SOCKET, so a service spawned by the main server inherited the
+    // parent unit's notification access. Asserting on the returned object would
+    // be enough for this shape, but the child probe proves the end-to-end effect.
+    const observed = await probeServiceChildEnv({
+      PATH: process.env.PATH,
+      NOTIFY_SOCKET: "/run/user/1000/systemd/notify",
+      WATCHDOG_PID: String(process.pid),
+      HOST: "0.0.0.0",
+    });
+
+    expect(observed).toEqual({ ns: null, wd: null });
+  });
+
+  it("strips case-variant spellings, which resolve the same variable on Windows", () => {
+    // A spawn target on Windows inherits environment keys case-insensitively, so
+    // `Notify_Socket` is the same variable there and must not survive.
+    //
+    // Asserted on the returned object, not through a child probe: on Linux
+    // `Notify_Socket` is simply a different key from `NOTIFY_SOCKET`, so a spawned
+    // child would report null either way and the probe would pass even against
+    // unfixed code. (I verified that: this case passed before and after the fix.)
+    // The returned env is the only place the case-folding property is observable
+    // on this platform.
+    const sanitized = sanitizeRuntimeServiceBaseEnv({
+      PATH: process.env.PATH,
+      Notify_Socket: "/run/user/1000/systemd/notify",
+      Watchdog_Pid: String(process.pid),
+    });
+
+    expect(sanitized.NOTIFY_SOCKET).toBeUndefined();
+    expect(sanitized.Notify_Socket).toBeUndefined();
+    expect(sanitized.Watchdog_Pid).toBeUndefined();
+    expect(sanitized.WATCHDOG_PID).toBeUndefined();
+  });
+
+  it("keeps the rest of the inherited environment intact", async () => {
+    // Guards against a fix that drops the whole environment, or that over-matches
+    // and starts deleting keys it was never asked about.
+    const sanitized = sanitizeRuntimeServiceBaseEnv({
+      PATH: process.env.PATH,
+      NOTIFY_SOCKET: "/run/user/1000/systemd/notify",
+      HOST: "0.0.0.0",
+      SOME_OTHER_VAR: "kept",
+    });
+
+    expect(sanitized.HOST).toBe("0.0.0.0");
+    expect(sanitized.SOME_OTHER_VAR).toBe("kept");
+    expect(sanitized.PATH).toBe(process.env.PATH);
+  });
+
+  it("leaves a deliberately configured notify socket to the caller", async () => {
+    // The reviewer asked that intentional explicit configuration keep working.
+    // startRuntimeService merges its overrides (adapterEnv from stored runtime
+    // config, plus the rendered service env) OVER the sanitized base, so a service
+    // that names NOTIFY_SOCKET on purpose still receives it. Assert the merge
+    // order the production code actually uses, so a future "fix" that scrubs the
+    // merged result cannot silently remove an operator's deliberate configuration.
+    const explicitOverride = "/run/user/1000/systemd/notify-explicit";
+    const merged = {
+      ...sanitizeRuntimeServiceBaseEnv({
+        PATH: process.env.PATH,
+        NOTIFY_SOCKET: "/run/user/1000/systemd/notify",
+      }),
+      ...{ NOTIFY_SOCKET: explicitOverride },
+    } as NodeJS.ProcessEnv;
+
+    expect(merged.NOTIFY_SOCKET).toBe(explicitOverride);
+  });
+
+  it("does not mutate the env object it was given", async () => {
+    // The server's own systemdNotify reads process.env, so the sanitizer must
+    // never strip the live process environment as a side effect.
+    const baseEnv: NodeJS.ProcessEnv = {
+      PATH: process.env.PATH,
+      NOTIFY_SOCKET: "/run/user/1000/systemd/notify",
+    };
+    const originalKeys = Object.keys(baseEnv);
+
+    sanitizeRuntimeServiceBaseEnv(baseEnv);
+
+    expect(Object.keys(baseEnv)).toEqual(originalKeys);
+    expect(baseEnv.NOTIFY_SOCKET).toBe("/run/user/1000/systemd/notify");
+  });
+});
+
 describe("resolveManagedPaperclipRuntimePublicOrigin", () => {
   const baseInput = {
     serviceName: "paperclip-dev",

@@ -42,6 +42,7 @@ import {
   stringifyPaperclipWakePayload,
   isPaperclipRecoveryWakePayload,
 } from "@paperclipai/adapter-utils/server-utils";
+import { withoutSupervisorNotifyEnv } from "@paperclipai/adapter-utils/supervisor-notify-env";
 
 import {
   HERMES_CLI,
@@ -639,12 +640,12 @@ export async function execute(
 
   // ── Build environment ──────────────────────────────────────────────────
   const userEnv = config.env as Record<string, string> | undefined;
-  const env: Record<string, string> = {
+  const env: Record<string, string> = withoutSupervisorNotifyEnv({
     ...(process.env as Record<string, string>),
     ...(userEnv && typeof userEnv === "object" ? userEnv : {}),
     ...buildPaperclipEnv(ctx.agent),
     ...buildRuntimeToolsEnv(ctx.runtimeTools),
-  };
+  });
 
   if (ctx.runId) env.PAPERCLIP_RUN_ID = ctx.runId;
 
