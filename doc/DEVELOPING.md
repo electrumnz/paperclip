@@ -41,6 +41,9 @@ When changing the workflow path or branch, authorize the new reference before
 updating the caller. Retain older authorized SHA references while queued runs or
 supported reruns still use them.
 
+For the fork-side rule on which branch a fork pull request targets, and how to
+measure a base move before making one, see [FORK_BRANCH_BASE_POLICY.md](FORK_BRANCH_BASE_POLICY.md).
+
 ## Start Dev
 
 From repo root:
