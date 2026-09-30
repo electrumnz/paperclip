@@ -7425,19 +7425,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           // KEE-912: await the cancellation, do not race it against a clock.
           //
           // Pausing the agent above makes this run's execution-start gate
-          // (heartbeat.ts:23051-23066) match zero rows, so executeRun aborts
+          // (heartbeat.ts:23119-23133) match zero rows, so executeRun aborts
           // through a multi-await path - setRunStatus, setWakeupStatus,
           // releaseIssueExecutionAndPromote - before it ever reaches the
-          // adapter (heartbeat.ts:24642).  The previous `vi.waitFor(...)` gave
+          // adapter (heartbeat.ts:24710).  The previous `vi.waitFor(...)` gave
           // that whole path vitest's measured 1014ms default budget, and the
           // run was observed still `running` at 1010ms while its two sibling
           // cases settled at 607ms and 608ms.  So this was a wall-clock race,
           // not a slow tail, and a longer timeout would only hide it.
           //
           // drainActiveRunExecutions() is the barrier this file already uses
-          // for exactly this (31 call sites, e.g. test:2645, 2679, 5397): it
-          // loops until the module-level wakeup and run-execution promise sets
-          // are both empty (heartbeat.ts:20244-20256).  That makes the
+          // for exactly this (29 call expressions on fork master 8d9627696,
+          // e.g. test:2645, 2679, 5397): it loops until the module-level
+          // wakeup and run-execution promise sets are both empty
+          // (heartbeat.ts:20311-20324).  That makes the
           // assertion below deterministic instead of timing-dependent.
           //
           // It is bounded through drainActiveRunExecutionsBounded(), because
