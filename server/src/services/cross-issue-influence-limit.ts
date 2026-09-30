@@ -1,6 +1,6 @@
 import { and, count, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, heartbeatRuns } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -55,16 +55,64 @@ function readRunSourceIssueId(contextSnapshot: unknown) {
   return null;
 }
 
-function isUnscopedHeartbeatTimerRun(input: {
+/**
+ * Classifies a run that carries no issue anchor.
+ *
+ * Two wake classes legitimately have no source issue: the scheduler's own timer
+ * wake, and the board dispatching an idle agent to go find work. Both are
+ * dispatched by the control plane rather than by an agent, so attribution
+ * (company, agent, run) is still intact and the cap still counts per run — the
+ * only thing missing is a source issue, which never existed for either.
+ *
+ * Returns null for anything else, so the guard stays fail-closed by default.
+ */
+function readUnscopedRunSourceKind(input: {
   invocationSource: string;
   contextSnapshot: unknown;
-}) {
-  if (input.invocationSource !== "timer") return false;
+  /** Authoritative initiator from agent_wakeup_requests, not the JSON blob. */
+  requestedByActorType: string | null;
+}): "heartbeat_timer" | "board_dispatch" | null {
   if (!input.contextSnapshot || typeof input.contextSnapshot !== "object" || Array.isArray(input.contextSnapshot)) {
-    return false;
+    return null;
   }
   const context = input.contextSnapshot as Record<string, unknown>;
-  return context.wakeReason === "heartbeat_timer" && context.wakeSource === "timer";
+
+  if (
+    input.invocationSource === "timer" &&
+    context.wakeReason === "heartbeat_timer" &&
+    context.wakeSource === "timer"
+  ) {
+    return "heartbeat_timer";
+  }
+
+  // Board-dispatched idle wakes ("idle with actionable work…") carry a free-text
+  // wakeReason, so there is no reason string to match on. KEE-586: the same
+  // argument covers `on_demand` board wakes, which are the class a human or an
+  // operator tool triggers directly.
+  //
+  // The discriminator is the *initiator*, and it is deliberately read from
+  // `agent_wakeup_requests.requested_by_actor_type` rather than from
+  // `contextSnapshot.triggeredBy`:
+  //
+  //  - `requested_by_actor_type` is written by the service from the
+  //    authenticated actor (heartbeat.enqueueWakeup), never from a wake payload,
+  //    and the wake routes refuse a manual user wake that is not user-actor
+  //    (enqueueWakeup throws 403 for requestedByActorType !== "user").
+  //  - `contextSnapshot.triggeredBy` is a JSON field with no integrity
+  //    guarantee on the read path: it is copied wholesale through the deferred
+  //    wake queue (`payload._paperclipWakeContext` is re-seeded verbatim on
+  //    promotion), and it conflates `user` with `system` — 285 unscoped runs
+  //    carry triggeredBy "board" while their wakeup row says `system`.
+  //
+  // Requiring "user" therefore admits exactly the operator-dispatched wakes and
+  // keeps every agent-dispatched and every scheduler-dispatched denial in place.
+  // An agent cannot reach this branch: no agent-dispatched run has a user actor
+  // type, and a run with no wakeup request at all is null here and fails closed.
+  if (input.requestedByActorType === "user" && context.triggeredBy === "board") {
+    return "board_dispatch";
+  }
+
+  return null;
 }
 
 export function evaluateCrossIssueInfluenceLimit(input: {
@@ -117,6 +165,7 @@ export async function observeCrossIssueInfluence(
         responsibleUserId: heartbeatRuns.responsibleUserId,
         invocationSource: heartbeatRuns.invocationSource,
         contextSnapshot: heartbeatRuns.contextSnapshot,
+        wakeupRequestId: heartbeatRuns.wakeupRequestId,
       })
       .from(heartbeatRuns)
       .where(and(
@@ -134,6 +183,22 @@ export async function observeCrossIssueInfluence(
       throw crossIssueInfluenceRunContextError();
     }
 
+    // KEE-586: the initiator of record is the wakeup request row, not a field in
+    // the run's own JSON context. Scoped to this run's own request and company so
+    // the lookup can never be steered at another run's initiator. A run with no
+    // wakeup request has no authenticated initiator and fails closed below.
+    const requestedByActorType = run.wakeupRequestId
+      ? await tx
+          .select({ requestedByActorType: agentWakeupRequests.requestedByActorType })
+          .from(agentWakeupRequests)
+          .where(and(
+            eq(agentWakeupRequests.id, run.wakeupRequestId),
+            eq(agentWakeupRequests.companyId, input.companyId),
+          ))
+          .limit(1)
+          .then((rows) => rows[0]?.requestedByActorType ?? null)
+      : null;
+
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
     // KEE-159: an unscoped but verified timer run is a legitimate third
     // sourceKind and is allowed through. Only a null sourceKind — a run that
@@ -141,9 +206,7 @@ export async function observeCrossIssueInfluence(
     // unfixable by a header, so only that case takes the new KEE-567 code.
     const sourceKind = sourceIssueId
       ? "issue"
-      : isUnscopedHeartbeatTimerRun(run)
-        ? "heartbeat_timer"
-        : null;
+      : readUnscopedRunSourceKind({ ...run, requestedByActorType });
     if (!sourceKind) throw crossIssueInfluenceRunNotIssueScopedError();
     if (
       sourceIssueId && (
