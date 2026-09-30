@@ -315,6 +315,45 @@ async function waitForRunToSettle(
   return heartbeat.getRun(runId);
 }
 
+/**
+ * Bounded wait for `drainActiveRunExecutions()` to finish.
+ *
+ * `drainActiveRunExecutions()` is a true barrier, not a poll: it loops until the
+ * module-level wakeup and run-execution promise sets are both empty and, unlike
+ * a `vi.waitFor` budget, it is not itself bounded - if an execution in the set
+ * never settles it awaits forever. In a test that turns a stall into a bare
+ * `Test timed out in 15000ms`, which says nothing about which barrier stalled.
+ *
+ * So keep the barrier, but give it a deadline and a message that names it. On
+ * expiry the drain state is reported so the failure identifies the in-flight
+ * work rather than the symptom. KEE-912.
+ */
+async function drainActiveRunExecutionsBounded(
+  heartbeat: ReturnType<typeof heartbeatService>,
+  timeoutMs = 10_000,
+) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const outcome = await Promise.race([
+      heartbeat.drainActiveRunExecutions().then(() => "drained" as const),
+      new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), timeoutMs);
+      }),
+    ]);
+    if (outcome === "drained") return;
+  } finally {
+    // The barrier normally wins the race, and an uncleared timer would outlive
+    // the test on this serial shard. Never let the safety net become the stall.
+    if (timer) clearTimeout(timer);
+  }
+  const { activeRuns, pendingWakes, quiescent } = heartbeat.getTaskDrainStatus();
+  throw new Error(
+    `drainActiveRunExecutions() did not settle within ${timeoutMs}ms ` +
+      `(activeRuns=${activeRuns}, pendingWakes=${pendingWakes}, ` +
+      `quiescent=${quiescent}). The drain barrier is stuck, not the assertion.`,
+  );
+}
+
 async function waitForValue<T>(
   read: () => Promise<T | null | undefined>,
   timeoutMs = 3_000,
@@ -7382,12 +7421,32 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           .set({ status: "paused" })
           .where(eq(agents.id, agentId));
         release();
-        if (next!)
-          await vi.waitFor(async () =>
-            expect((await heartbeat.getRun(next!.id))?.status).not.toBe(
-              "running",
-            ),
-          );
+        if (next!) {
+          // KEE-912: await the cancellation, do not race it against a clock.
+          //
+          // Pausing the agent above makes this run's execution-start gate
+          // (heartbeat.ts:23051-23066) match zero rows, so executeRun aborts
+          // through a multi-await path - setRunStatus, setWakeupStatus,
+          // releaseIssueExecutionAndPromote - before it ever reaches the
+          // adapter (heartbeat.ts:24642).  The previous `vi.waitFor(...)` gave
+          // that whole path vitest's measured 1014ms default budget, and the
+          // run was observed still `running` at 1010ms while its two sibling
+          // cases settled at 607ms and 608ms.  So this was a wall-clock race,
+          // not a slow tail, and a longer timeout would only hide it.
+          //
+          // drainActiveRunExecutions() is the barrier this file already uses
+          // for exactly this (31 call sites, e.g. test:2645, 2679, 5397): it
+          // loops until the module-level wakeup and run-execution promise sets
+          // are both empty (heartbeat.ts:20244-20256).  That makes the
+          // assertion below deterministic instead of timing-dependent.
+          //
+          // It is bounded through drainActiveRunExecutionsBounded(), because
+          // the barrier itself has no timeout: an execution that never settles
+          // would otherwise hang to the suite's 15s testTimeout and report a
+          // bare timeout instead of naming the stall.
+          await drainActiveRunExecutionsBounded(heartbeat);
+          expect((await heartbeat.getRun(next!.id))?.status).not.toBe("running");
+        }
       }
     },
   );
