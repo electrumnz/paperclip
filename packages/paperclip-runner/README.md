@@ -377,7 +377,7 @@ recorded lab unless `--force` is also supplied.
 | `test:sdk`                                              | Run targeted browser-client, reducer-projection, and React component contract tests.                                                        |
 | `test:browser:sdk`                                      | Exercise both consumers with the fake driver, keyboard/a11y checks, reconnect/replay, measurements, and screenshots.                        |
 | `record:sdk:codex`                                      | Run both public consumers against a safe real Codex session and capture live screenshots.                                                   |
-| `check:capability-contract`                             | Verify the generated capability, legacy MCP, and eval traceability contract.                                                                |
+| `check:capability-contract`                             | Verify the `generated/capability/` contract, legacy MCP, and eval traceability outputs. See [Capability drift gates](#capability-drift-gates) for the gate that covers `docs/` and `spec/`. |
 | `check:semantic-contracts`                              | Verify the provider-neutral semantic tool contract is current.                                                                              |
 | `trace:live-runner`                                     | Run the real runnerd/Codex semantic loop against the mock control plane.                                                                    |
 | `demo:scenarios`                                        | Start the Capability scenario explorer over the mock control plane on `127.0.0.1:4183`.                                                     |
@@ -388,6 +388,36 @@ recorded lab unless `--force` is also supplied.
 | `test:browser`                                          | Exercise static replay and live scenarios, then capture temporary screenshots under ignored test output.                                    |
 | `verify`                                                | Run the complete deterministic Conformance through SDK acceptance sequence.                                                                 |
 | `verify:rootless`                                       | Extract Debian/Ubuntu browser libraries without root, then run `verify`.                                                                    |
+
+## Capability drift gates
+
+The capability contract has **four** derived artefacts in two trees, and no single command checks all four:
+
+| Artefact                               | Written by                      | Checked by                    |
+| -------------------------------------- | ------------------------------- | ----------------------------- |
+| `generated/capability/*`               | `generate:capability-contract`  | `check:capability-contract`   |
+| `docs/capability-contract.md`          | `generate:capability-inventory` | `check:capability-inventory`  |
+| `spec/capability/*.yaml`               | `generate:capability-inventory` | `check:capability-inventory`  |
+| `src/generated/capability-contract.ts` | `generate:capability-inventory` | `check:capability-inventory`  |
+
+`check:capability-contract` is blind to `docs/` and `spec/`, and `check:capability-inventory` is blind to
+`generated/capability/`. That split is deliberate: the two generators have different inputs, and each gate re-renders only
+what its own generator owns. **Run both** to prove the contract is current:
+
+```sh
+pnpm check:capability-contract
+pnpm check:capability-inventory
+```
+
+Both run in CI as part of this package's `build`, so a stale artefact in any of the four fails the required `build` job.
+
+This matters most after a rebase that shifts `packages/mcp-server/src/tools.ts` line numbers. Every `sourceAnchor` in
+the contract embeds that line number, so all four artefacts go stale together. `check:capability-inventory` alone will
+report each stale row as `legacyMcpAliases:<id> has stale sourceAnchor`; regenerate rather than hand-editing.
+
+To regenerate, note that `generate:capability-inventory` needs the Paperclip Evals corpus, which is a separate
+repository. Set `PAPERCLIP_EVALS_ROOT` to its `paperclip-skill-optimization` directory if it is not checked out
+alongside this one. The two `check:` gates never need it.
 
 ## Navigate
 
