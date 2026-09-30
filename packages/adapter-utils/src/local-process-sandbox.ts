@@ -325,7 +325,20 @@ const server = net.createServer((client) => {
   upstream.on("error", close);
 });
 server.listen(${SANDBOX_PROXY_PORT}, "127.0.0.1", () => {
-  const child = spawn(executable, args, { stdio: "inherit", env: process.env });
+  // Strip this unit's supervisor-notification keys before spawning the wrapped
+  // process. Inheriting NOTIFY_SOCKET would let it send STOPPING=1 to the parent
+  // systemd unit, which stops the unit without ever signalling the main
+  // process, and the whole control group is then SIGKILLed undrained
+  // (KEE-1149). Case-insensitive: a Windows spawn target resolves keys
+  // case-insensitively.
+  const childEnv = { ...process.env };
+  for (const key of Object.keys(childEnv)) {
+    if (key === "NOTIFY_SOCKET" || key === "NOTIFY_SOCKET".toUpperCase() ||
+        key === "WATCHDOG_PID" || key === "WATCHDOG_PID".toUpperCase()) {
+      delete childEnv[key];
+    }
+  }
+  const child = spawn(executable, args, { stdio: "inherit", env: childEnv });
   const forward = (signal) => { if (!child.killed) child.kill(signal); };
   process.on("SIGTERM", () => forward("SIGTERM"));
   process.on("SIGINT", () => forward("SIGINT"));

@@ -130,6 +130,12 @@ describe("acpx identity split and launch environment", () => {
       PAPERCLIP_ACPX_CODEX_AUTH_JSON_SECRET: "managed-auth-host-secret",
       UNRELATED_SECRET: "unrelated-host-secret",
       NODE_OPTIONS: "--require /tmp/host-hook.cjs",
+      // KEE-1149: the ACPX host projection is an allowlist, so these are already
+      // excluded. They are in the input here so that stays true deliberately —
+      // a child that inherits NOTIFY_SOCKET could send STOPPING=1 to this
+      // process's own systemd unit and stop it without signalling it.
+      NOTIFY_SOCKET: "/run/user/1000/systemd/notify",
+      WATCHDOG_PID: "4242",
     };
 
     expect(projectAcpxInheritedHostEnvironment(inherited, "codex", true)).toEqual({
