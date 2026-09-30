@@ -5,6 +5,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Db } from "@paperclipai/db";
 import type { DeploymentMode } from "@paperclipai/shared";
+import { withoutSupervisorNotifyEnv } from "@paperclipai/adapter-utils/supervisor-notify-env";
 import { instanceSettingsService, issueService } from "../services/index.js";
 import { assertCompanyAccess, getActorInfo } from "./authz.js";
 
@@ -250,11 +251,11 @@ export function boardChatRoutes(
     const proc = spawn("claude", args, {
       stdio: ["pipe", "pipe", "pipe"],
       cwd: "/tmp",
-      env: {
+      env: withoutSupervisorNotifyEnv({
         ...process.env,
         PAPERCLIP_API_URL: apiUrl,
         PAPERCLIP_COMPANY_ID: companyId,
-      },
+      }),
     });
 
     let fullResponse = "";

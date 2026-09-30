@@ -6,6 +6,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { withoutSupervisorNotifyEnv } from "@paperclipai/adapter-utils/supervisor-notify-env";
 import {
   connectionGrants,
   smokeRuns,
@@ -985,7 +986,11 @@ export function smokeLabService(db: Db, options: {
     const fixturePath = smokeLabFixturePath("http-fixture.mjs");
     const port = await allocateFetchAllowedLoopbackPort();
     const child = spawn(process.execPath, [fixturePath], {
-      env: { ...process.env, HOST: "127.0.0.1", PORT: String(port) },
+      env: withoutSupervisorNotifyEnv({
+        ...process.env,
+        HOST: "127.0.0.1",
+        PORT: String(port),
+      }),
       stdio: ["ignore", "pipe", "pipe"],
       detached: process.platform !== "win32",
     });
