@@ -6,7 +6,14 @@ import { runChildProcess } from "@paperclipai/adapter-utils/server-utils";
 import { execute } from "@paperclipai/adapter-cursor-local/server";
 
 async function writeFakeCursorCommand(commandPath: string): Promise<void> {
-  const script = `#!/usr/bin/env node
+  // Bind the interpreter to the node binary running this test rather than
+  // relying on `env` resolving `node` through PATH. Remote sandbox children get
+  // a managed PATH built from `defaultPathForPlatform()`, which on a
+  // workstation that installs node through a version-manager shim contains no
+  // `node` at all, so an `#!/usr/bin/env node` fixture cannot resolve its
+  // interpreter and the child exits 127. (CI has a real node on PATH, so it
+  // never saw this; it is host-dependent, not lane-specific.)
+  const script = `#!${process.execPath}
 const fs = require("node:fs");
 
 const capturePath = process.env.PAPERCLIP_TEST_CAPTURE_PATH;
@@ -42,7 +49,9 @@ console.log(JSON.stringify({
 }
 
 async function writeFakeSandboxCursorAgent(commandPath: string, capturePath: string): Promise<void> {
-  const script = `#!/usr/bin/env node
+  // See writeFakeCursorCommand: bind the interpreter to the running node binary
+  // so the fixture does not depend on `env` resolving `node` via PATH.
+  const script = `#!${process.execPath}
 const fs = require("node:fs");
 
 const payload = {
