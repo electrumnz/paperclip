@@ -369,7 +369,14 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     });
     try {
       await heartbeat.resumeQueuedRuns();
-      expect(await waitForCondition(() => Promise.resolve(mockAdapterExecute.mock.calls.length > 0))).toBe(true);
+      // Synchronize on the claim this test actually asserts, not on the
+      // adapter call. startNextQueuedRunForAgent commits the claim (the run
+      // becomes `running` and the issue's executionRunId is bound) before
+      // resumeQueuedRuns resolves, but it dispatches executeRun fire-and-forget
+      // and does not await it. Polling for an adapter call therefore raced a
+      // side effect that is not part of the subject under test, and that race
+      // was decided by a 3s wall-clock budget rather than by the claim. Read
+      // the committed rows directly; this needs no deadline at all.
       const runs = await db.select().from(heartbeatRuns);
       const running = runs.filter((run) => run.status === "running");
       expect(running).toHaveLength(sameIssue ? 1 : 2);
@@ -378,6 +385,14 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
         const [issue] = await db.select().from(issues).where(eq(issues.id, (run.contextSnapshot as { issueId: string }).issueId));
         expect(issue.executionRunId).toBe(run.id);
       }
+      // A same-issue pair must serialize: exactly one run may hold the issue.
+      const boundIssueIds = running.map((run) => (run.contextSnapshot as { issueId: string }).issueId);
+      expect(new Set(boundIssueIds).size).toBe(sameIssue ? 1 : boundIssueIds.length);
+      // Now let the gated adapter finish and await it, so the run rows this
+      // test inspects are settled rather than racing a write in flight.
+      release();
+      await heartbeat.drainActiveRunExecutions();
+      expect(mockAdapterExecute.mock.calls.length).toBeGreaterThan(0);
     } finally {
       release();
       await heartbeat.drainActiveRunExecutions();
