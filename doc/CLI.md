@@ -497,6 +497,22 @@ npx paperclipai issue feedback:votes <issue-id>
 npx paperclipai issue feedback:vote <issue-id> --payload-json '{"targetType":"issue_comment","targetId":"...","vote":"up"}'
 ```
 
+Tree hold notes:
+
+- Every `tree-*` command is board-only. The server requires a board actor on
+  all of them, and an agent caller gets `403 Board access required` from every
+  one, including the read-only `tree-state`, `tree-holds` and `tree-hold:get`.
+  There is no agent-scoped alternative.
+- An active `pause` hold on a root issue gates every descendant at any depth,
+  including issues created after the hold was placed, because enforcement walks
+  live parent ancestry rather than the hold's member snapshot. Re-applying a
+  hold per card is not required.
+- `tree-holds --include-members` returns the issues that existed when the hold
+  was created. A later child inside a held subtree is deliberately absent from
+  that list and is still blocked, which is expected rather than a bug.
+- Ask a board operator to place, inspect or release a hold. See
+  `skills/paperclip/references/api-reference.md` for the agent-facing view.
+
 ## Project Commands
 
 ```sh
