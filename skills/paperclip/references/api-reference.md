@@ -366,6 +366,60 @@ Security and bounds:
 - Low-trust or boundary-scoped callers that cannot read company scope receive `null` for internal wake `agentId`/`runId` and activity `agentId`/`runId`/`holdId`.
 - The subtree walk is capped to depth 8 and 100 nodes with a cycle guard. Per-node blockers, wake requests, and activity records are also capped. Any cap hit sets `truncated: true` and the relevant `truncatedSections` flag.
 
+### Subtree Holds Are Board-Only, And An Active Pause Hold Covers Later Children
+
+If you are an agent and you need a whole strand of work paused, you cannot do it yourself. Ask the board operator. Read this before you place, inspect or release a hold, because every route in this section returns `403` for an agent caller.
+
+**What an agent cannot do.** These routes are board-operator-only, including the read-only ones:
+
+| Route | Purpose | Agent result |
+| --- | --- | --- |
+| `POST /api/issues/:issueId/tree-holds` | Create a subtree hold | `403 Board access required` |
+| `POST /api/issues/:issueId/tree-control/preview` | Preview the affected issues | `403 Board access required` |
+| `GET /api/issues/:issueId/tree-holds` | List holds on a subtree | `403 Board access required` |
+| `GET /api/issues/:issueId/tree-holds/:holdId` | Read one hold | `403 Board access required` |
+| `POST /api/issues/:issueId/tree-holds/:holdId/release` | Release a hold | `403 Board access required` |
+| `GET /api/issues/:issueId/tree-control/state` | Read the active pause gate | `403 Board access required` |
+
+The server enforces this with `assertBoard` on each route. There is no agent-scoped alternative route, and no agent grant that opens these.
+
+**What an agent can do instead.** Put the request on the issue as a comment or an interaction naming the root issue and the mode you want. The board operator then places the hold through the composer UI or the board-authenticated CLI. Do not try to approximate a subtree pause by creating placeholder issues; that does not stop work and it pollutes the tree.
+
+**The supported operator route.** A board operator runs one of:
+
+```sh
+# Preview first. Always preview before you commit an interruption.
+npx paperclipai issue tree-preview <issue-id> --payload-json '{"mode":"pause"}'
+
+# Place the pause on the root issue of the strand.
+npx paperclipai issue tree-hold:create <issue-id> --payload-json '{"mode":"pause","reason":"review"}'
+
+# Inspect what the hold currently covers.
+npx paperclipai issue tree-holds <issue-id> --status active --include-members
+
+# Lift it when the work may resume.
+npx paperclipai issue tree-hold:release <issue-id> <hold-id> --payload-json '{"reason":"review complete"}'
+```
+
+**You do not need to re-apply a hold per card.** This is the part that surprises agents, so it is worth stating precisely.
+
+An active `pause` hold on a root issue gates **every descendant at any depth, including issues created after the hold was placed.** Enforcement resolves ancestry live: for each issue being checked, the server walks that issue's `parentId` chain upward and stops at the first ancestor with an active `pause` hold. The lookup is re-run on each attempt rather than reading the hold's stored member list.
+
+Two separate objects are involved, and they behave differently:
+
+- **Enforcement** is live and ancestor-based. It inherits by later children. Depth is bounded at 100 ancestor hops.
+- **The hold's member list** is a snapshot frozen when the hold was created. It records the issues that existed at that moment, and it is used for preview, release and status-restore bookkeeping. It is *not* the gate, so a child created after the hold is absent from the snapshot and still blocked.
+
+So when you see a hold whose member list does not contain a card you know is inside the held strand, that is expected. Ask the operator to check the ancestor rather than assuming the card is free.
+
+**How you will notice you are gated.** The gate is applied at the point work would start, so you normally learn about it from a refusal rather than silence:
+
+- Checkout returns `409` with `Issue checkout blocked by active subtree pause hold`.
+- A wake or claim is cancelled with `Cancelled because issue is held by an active subtree pause hold`.
+- Run dispatch and wake-queue admission both refuse the issue.
+
+If a card you own is held by an ancestor hold that you cannot see, because the hold endpoints are board-only, comment on the card and name the hold you believe is active. The operator can confirm it in one call.
+
 ### Execution Policy Fields On An Issue
 
 When an issue has review or approval gates, `GET /api/issues/:issueId` can also include `executionPolicy` and `executionState`:

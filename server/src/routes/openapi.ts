@@ -7450,8 +7450,10 @@ registry.registerPath({
   path: "/api/issues/{id}/tree-control/state",
   tags: ["issues"],
   summary: "Get issue tree control state",
+  description:
+    "Board-only. Returns the active subtree pause hold that currently gates this issue, if any. The gate is resolved by walking live parent ancestry, so it also covers descendants created after the hold was placed. An agent caller receives 403 Board access required, including on this read-only route.",
   request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -7459,11 +7461,13 @@ registry.registerPath({
   path: "/api/issues/{id}/tree-control/preview",
   tags: ["issues"],
   summary: "Preview issue tree control changes",
+  description:
+    "Board-only. Previews the issues a subtree operation would affect without changing any status. An agent caller receives 403 Board access required.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(previewIssueTreeControlSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -7471,8 +7475,10 @@ registry.registerPath({
   path: "/api/issues/{id}/tree-holds",
   tags: ["issues"],
   summary: "List issue tree holds",
+  description:
+    "Board-only. With includeMembers, the member list is a snapshot of the issues that existed when each hold was created; a descendant created later is absent from that list but is still gated by the active hold. An agent caller receives 403 Board access required.",
   request: { params: z.object({ id: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -7480,11 +7486,13 @@ registry.registerPath({
   path: "/api/issues/{id}/tree-holds",
   tags: ["issues"],
   summary: "Create an issue tree hold",
+  description:
+    "Board-only. An active pause hold gates every descendant at any depth, including issues created after the hold is placed, because enforcement re-walks live parent ancestry rather than trusting the stored member snapshot. An agent caller receives 403 Board access required and must ask a board operator.",
   request: {
     params: z.object({ id: z.string() }),
     body: jsonBody(createIssueTreeHoldSchema),
   },
-  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized },
+  responses: { 200: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden },
 });
 
 registry.registerPath({
@@ -7492,8 +7500,9 @@ registry.registerPath({
   path: "/api/issues/{id}/tree-holds/{holdId}",
   tags: ["issues"],
   summary: "Get an issue tree hold",
+  description: "Board-only. An agent caller receives 403 Board access required.",
   request: { params: z.object({ id: z.string(), holdId: z.string() }) },
-  responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
 });
 
 registry.registerPath({
@@ -7501,11 +7510,13 @@ registry.registerPath({
   path: "/api/issues/{id}/tree-holds/{holdId}/release",
   tags: ["issues"],
   summary: "Release an issue tree hold",
+  description:
+    "Board-only. Releases a hold and optionally wakes affected agents. An agent caller receives 403 Board access required.",
   request: {
     params: z.object({ id: z.string(), holdId: z.string() }),
     body: jsonBody(releaseIssueTreeHoldSchema),
   },
-  responses: { 200: r.ok(), 401: r.unauthorized },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden },
 });
 
 // ─── Attachments ──────────────────────────────────────────────────────────────
