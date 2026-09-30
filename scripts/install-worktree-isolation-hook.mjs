@@ -371,12 +371,78 @@ function shimBlock(onDisk) {
  * were doing the same two lines by hand and the refusal path needs the same
  * guarantee: a copy that is interrupted must not leave a truncated guard that
  * node fails to parse, which is a guard that errors rather than one that runs.
+ *
+ * THE OUTGOING GUARD IS BACKED UP FIRST (KEE-976). This is the write that
+ * replaces the file every commit in every linked worktree of the repository
+ * runs, and it used to discard the previous contents with no record at all:
+ * a bare copyFileSync + renameSync. That was defensible while an older guard
+ * was refused rather than written, because the only write in practice was our
+ * own copy over itself. The KEE-966 ruling added --force as a supported route
+ * for an operator to install their OWN guard, which makes the loss reachable by
+ * an ordinary documented command -- and then an ordinary, correct `newer` write
+ * can still displace a hand-edited guard that was never committed.
+ *
+ * backupHook() already did this for the hook, with the same naming convention
+ * and the same warn-loudly-on-failure behaviour, and the comment on it records
+ * this exact failure measured on the hook: "an operator's check inserted inside
+ * our block, one --force run, zero copies of it left anywhere". It backs up the
+ * shim, though, and the shim is not what runs -- it execs this file. So the one
+ * irreversible step in this script had its recovery on the wrong file.
+ *
+ * Measured on fork/master f3003d3adc, throwaway fleets only, an operator's
+ * distinctive unstamped guard forced in and then displaced by a later ordinary
+ * --install from the shipped lane:
+ *
+ *   files still containing the operator's guard : ["<lane>/scripts/check-worktree-isolation.mjs"]
+ *   hook backups taken                          : []
+ *   any *.bak anywhere under the fleet root     : (none)
+ *
+ * The content survived only in the working copy of the lane it was written in.
+ *
+ * WHEN IT FIRES: only when this write CHANGES the bytes in force. A `same`
+ * relation rewrites the file with content byte-identical to what is already
+ * there, so nothing is lost, and backing that up on every --install would pile
+ * up identical copies forever in a directory nobody prunes. An absent guard has
+ * nothing to preserve. So the outgoing bytes are compared first and an
+ * identical rewrite skips the backup. Everything else that writes -- `newer`,
+ * and all three `-forced` relations -- displaces bytes somebody may have written
+ * by hand, and each one leaves a copy.
+ *
+ * The backup is a copy and the rename still follows it, so a backup that cannot
+ * be written leaves the working guard in place rather than destroying it. The
+ * run then continues -- refusing an install the operator asked for would be a
+ * worse outcome than an unbacked-up one -- and says loudly on stderr that the
+ * replacement is not reversible.
  */
 function refreshStoredGuard() {
   const staging = `${storedGuardPath}.tmp-${process.pid}`;
   try {
+    // The displaced guard, if this write actually displaces one.
+    let kept = null;
+    if (existsSync(storedGuardPath)) {
+      let outgoing;
+      try {
+        outgoing = readFileSync(storedGuardPath, "utf8");
+      } catch {
+        outgoing = null;
+      }
+      if (outgoing === null || outgoing !== readFileSync(guardPath, "utf8")) {
+        kept = backupFileBeforeReplace(storedGuardPath);
+      }
+    }
     copyFileSync(guardPath, staging);
     renameSync(staging, storedGuardPath);
+    // Say where the displaced guard went. The refreshed line below is printed
+    // by the caller, which does not know whether this write destroyed content,
+    // so printing it here is what keeps "refreshed at ..." from being the last
+    // word on a run that discarded a hand-written guard.
+    if (kept) {
+      process.stderr.write(
+        `install-worktree-isolation-hook: the guard that was in force has been kept at:\n` +
+          `  ${kept}\n` +
+          `Anything hand-edited into it is being discarded, and it is in that copy.\n`,
+      );
+    }
   } catch (error) {
     rmSync(staging, { force: true });
     throw error;
@@ -649,32 +715,33 @@ function storedGuardRelation() {
 }
 
 /**
- * Copy the hook that is about to be replaced to a timestamped sibling, so
- * replacing it is reversible.
+ * Copy a file this script is about to replace to a timestamped sibling beside
+ * it, and say where it went.
  *
- * --force overwrites a hook this script did not write in a state it cannot
- * verify, and it used to do that with no record of the previous content. The
- * operator is told "anything hand-edited into that file is being discarded",
- * which is accurate and useless: the edit is gone, it was never shown, and
- * there is no way to get it back. Measured: an operator's check inserted
- * inside our block, one --force run, zero copies of it left anywhere.
+ * ONE definition for both things this script overwrites -- the hook and the
+ * stored guard -- because they are the same operation with the same failure
+ * mode: content the script cannot reconstruct, discarded by a run that exits 0.
+ * The two callers decide WHAT is being replaced and whether it is worth
+ * replacing at all; this decides how it is preserved and how loudly.
  *
- * The backup is a plain file next to the hook, in the same directory, named for
- * the revision being replaced -- which is the installing lane's HEAD, the lane the
- * operator is standing in, and not necessarily the revision that produced the
- * outgoing hook. The timestamp makes each name unique regardless, and what the
- * name is for is to be recognisable to an operator, not to identify a
- * provenance the script cannot actually establish. This host already carries
- * one from a hand repair -- pre-commit.pre-1023ffe31.20260926T064339Z.bak --
- * so the convention is the one an operator here will already recognise.
+ * The name is the revision being replaced -- the installing lane's HEAD, the
+ * lane the operator is standing in, and not necessarily the revision that
+ * produced the outgoing file. The timestamp makes each name unique regardless,
+ * and what the name is for is to be recognisable to an operator, not to
+ * identify a provenance the script cannot establish. This host already carries
+ * one from a hand repair -- pre-commit.pre-1023ffe31.20260926T064339Z.bak -- so
+ * the convention is the one an operator here will already recognise.
  *
- * It is a copy, not a rename: the rename onto the live hook is the atomic step
+ * It is a copy, not a rename: the rename onto the live file is the atomic step
  * that makes the replacement safe, and a failed copy must not take the working
- * hook with it. A missing hook means there is nothing to preserve, so there is
+ * file with it. A missing file means there is nothing to preserve, so there is
  * nothing to back up.
+ *
+ * Measured, both for the hook and for the guard: an operator's check inserted,
+ * one --force run, zero copies of it left anywhere under the fleet root.
  */
-function backupHook() {
-  if (!existsSync(hookPath)) return null;
+function backupFileBeforeReplace(file) {
+  if (!existsSync(file)) return null;
   let stamp;
   let rev;
   try {
@@ -687,9 +754,9 @@ function backupHook() {
   } catch {
     rev = "unknown-rev";
   }
-  const target = `${hookPath}.pre-${rev}.${stamp}.bak`;
+  const target = `${file}.pre-${rev}.${stamp}.bak`;
   try {
-    copyFileSync(hookPath, target);
+    copyFileSync(file, target);
     return target;
   } catch (error) {
     // A backup that cannot be written is not a reason to refuse an install the
@@ -697,12 +764,30 @@ function backupHook() {
     // is about to become irreversible, and silence about that is the defect
     // this function exists to remove.
     process.stderr.write(
-      `install-worktree-isolation-hook: WARNING: could not back up ${hookPath} to ${target}\n` +
+      `install-worktree-isolation-hook: WARNING: could not back up ${file} to ${target}\n` +
         `  (${error.message})\n` +
         `  The replacement below is still going ahead, and will not be reversible.\n`,
     );
     return null;
   }
+}
+
+/**
+ * Copy the hook that is about to be replaced to a timestamped sibling, so
+ * replacing it is reversible.
+ *
+ * --force overwrites a hook this script did not write in a state it cannot
+ * verify, and it used to do that with no record of the previous content. The
+ * operator is told "anything hand-edited into that file is being discarded",
+ * which is accurate and useless: the edit is gone, it was never shown, and
+ * there is no way to get it back.
+ *
+ * It is the thin wrapper around backupFileBeforeReplace() that names the hook.
+ * The copying, the naming convention and the loud-on-failure behaviour are
+ * that function's, and are now shared with the stored guard below.
+ */
+function backupHook() {
+  return backupFileBeforeReplace(hookPath);
 }
 
 if (mode === "--check") {
