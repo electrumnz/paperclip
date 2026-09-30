@@ -1980,3 +1980,370 @@ test("a withheld fresh install does not also claim the guard was stored", () => 
   }
 });
 
+// ---------------------------------------------------------------------------
+// KEE-976: the stored guard was replaced with no backup.
+//
+// backupHook() exists so that "replacing it is reversible" is true of this
+// script. It backed up the HOOK and not the STORED GUARD -- and the stored guard
+// is the file that actually runs on every commit in every linked worktree. The
+// hook is a shim that execs it. So the one irreversible step this script takes
+// had its recovery on the wrong file.
+//
+// The KEE-966 ruling made it reachable by a supported command: --force installs
+// an operator's own guard, and an ordinary, correct `newer` write then displaces
+// it. Measured on fork/master f3003d3adc with throwaway fleets only:
+//
+//   1. operator's guard forced in via --force          : true
+//   2. later plain --install from the shipped lane    : exit 0, stored guard is the shipped one
+//   3. files still containing the operator's guard    : ["<lane>/scripts/check-worktree-isolation.mjs"]
+//      hook backups taken                              : []
+//      any *.bak anywhere under the fleet root        : (none)
+//   4. the operator's own lane still holds it         : true
+//
+// The content survived only in the working copy of the lane it was written in.
+// If that lane is discarded, or the file was hand-edited and never committed,
+// it is gone -- on a run whose only output was "refreshed at ...".
+//
+// FIXTURE RULES, from the KEE-962 cross-check, which recorded what these shapes
+// do when they are wrong:
+//   - Every fixture asserts its precondition before measuring. A guard that is
+//     byte-identical to the one in force makes a rewrite indistinguishable from
+//     a downgrade, and a rewrite is NOT what any test below is about.
+//   - The guard's version is READ, never hardcoded, so the suite does not break
+//     on the next bump and fail on its own fixture instead of on the product.
+//   - The state under test is SET UP by writing files directly, not by asking
+//     the installer to perform it -- otherwise a fixture can fail on its own
+//     setup precondition and read as a broken product.
+//   - Reason-assertions match whitespace-collapsed output, because the installer
+//     hard-wraps its prose and where the wrap falls is an accident of the text.
+
+/** The hooks directory of the fleet: where the stored guard and its backups live. */
+function hooksDirOf(main) {
+  return path.join(main, ".git", "hooks");
+}
+const storedGuardOf = (main) => path.join(hooksDirOf(main), "worktree-isolation-guard.mjs");
+const guardInCheckoutOf = (main) => path.join(main, "scripts", "check-worktree-isolation.mjs");
+const backupsIn = (dir) => readdirSync(dir).filter((f) => f.endsWith(".bak"));
+
+/**
+ * Every file under the fleet root still holding this exact text.
+ *
+ * The acceptance criterion is "a search of the fleet root finds at least one
+ * copy of the displaced content on disk", so the measurement has to be a search
+ * of the whole tree, not a readdir of the hooks directory. A fix that wrote the
+ * copy somewhere else would satisfy the directory check and fail this one -- and
+ * so would a fix that wrote it into the operator's own lane, which is the state
+ * that already existed and is the defect.
+ */
+function filesHolding(root, needle, skip = []) {
+  const hits = [];
+  const walk = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, entry.name);
+      if (skip.some((s) => p.startsWith(path.join(root, s)))) continue;
+      if (entry.isDirectory()) walk(p);
+      else if (entry.isFile()) {
+        let text;
+        try {
+          text = readFileSync(p, "utf8");
+        } catch {
+          continue; // A binary or unreadable file is not a copy of the guard.
+        }
+        if (text.includes(needle)) hits.push(path.relative(root, p));
+      }
+    }
+  };
+  walk(root);
+  return hits;
+}
+
+/**
+ * The acceptance scenario, end to end, as one reusable setup.
+ *
+ * An operator lane writes a distinctive unstamped guard and forces it in. Then a
+ * later ORDINARY --install runs from the lane carrying the shipped guard, which
+ * is a `newer` write (the shipped guard declares a version, the operator's does
+ * not) and therefore correct and expected to happen -- nothing here is testing
+ * the version rule, only what that write leaves behind.
+ *
+ * Returns the operator's bytes and the lane they were written in, so a test can
+ * assert against the content and can exclude the lane from its search.
+ */
+function operatorGuardDisplaced(root, main) {
+  const hooksDir = hooksDirOf(main);
+  const stored = storedGuardOf(main);
+  const shipped = readFileSync(stored, "utf8");
+  const operatorMarker = "KEE-976-OPERATOR-MARKER-8f41c2";
+
+  const lane = path.join(root, "operator-lane");
+  git(["worktree", "add", "-q", "-b", "operator", lane], main);
+  // Unstamped, and carrying a marker no shipped guard has, so the search below
+  // can tell an operator's copy from ours without trusting the version line.
+  const operatorGuard =
+    `${unstampGuard(shipped).trimEnd()}\n// ${operatorMarker} hand-written by the operator\n`;
+  writeFileSync(guardInCheckoutOf(lane), operatorGuard);
+  git(["-C", lane, "commit", "-q", "--no-verify", "-a", "-m", "operator: own guard"], lane);
+
+  const forced = installHook(lane, ["--install", "--force"]);
+  assert.equal(forced.status, 0, "fixture is wrong: the operator's --force did not run: " + forced.stderr);
+  const inForce = readFileSync(stored, "utf8");
+  assert.ok(inForce.includes(operatorMarker),
+    "fixture is wrong: the operator's guard is not the one in force after --force");
+  // Precondition for the displacement itself: the lanes must differ in content,
+  // or the later write is a no-op rewrite and proves nothing.
+  assert.notEqual(inForce, shipped, "fixture is wrong: nothing is displaced, the guards are identical");
+
+  // The later ordinary install, from the lane that carries the shipped guard.
+  const later = installHook(main, ["--install"]);
+  assert.equal(later.status, 0, "fixture is wrong: the later ordinary --install failed: " + later.stderr);
+  assert.equal(readFileSync(stored, "utf8"), shipped,
+    "fixture is wrong: the later --install did not displace the operator's guard");
+
+  return { operatorMarker, operatorGuard, laneName: "operator-lane", hooksDir, later, shipped };
+}
+
+test("KEE-976: a displaced stored guard is recoverable on disk, and the run says where", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const { operatorMarker, hooksDir, later } = operatorGuardDisplaced(root, main);
+
+    // The acceptance criterion: the displaced content is on disk somewhere, not
+    // only in the working copy of the lane it was written in.
+    const copies = filesHolding(root, operatorMarker, ["operator-lane"]);
+    assert.ok(copies.length > 0,
+      "KEE-976 UNFIXED: the displaced stored guard exists nowhere under the fleet root once " +
+      "a later ordinary --install replaces it. It survives only in the operator's own lane, " +
+      "which may be discarded, and the run said only 'refreshed at ...'.");
+    // And it is genuinely the content that was discarded, not a file that merely
+    // mentions it.
+    const recovered = readFileSync(path.join(root, copies[0]), "utf8");
+    assert.match(recovered, new RegExp(operatorMarker));
+    assert.doesNotMatch(recovered, /worktree-isolation-guard-version/,
+      "the backup is not the operator's unstamped guard: it still carries a version stamp");
+
+    // The convention matches the hook's, so an operator here already knows it.
+    const name = copies[0].split(path.sep).pop();
+    assert.match(name, /^worktree-isolation-guard\.mjs\.pre-[0-9a-z]+\.\d{8}T\d{6}Z\.bak$/,
+      `unexpected backup name: ${name}`);
+
+    // And the run said where it went. Silence about the loss is half the defect.
+    const output = `${later.stdout}${later.stderr}`;
+    assert.match(output, /kept at|backup/i,
+      "the run that displaced the guard did not say where the outgoing one went");
+    assert.ok(output.includes(name),
+      `the run did not name the backup it wrote. It said: ${JSON.stringify(output)}`);
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("KEE-976: --force backs up the guard it displaces, before replacing it", () => {
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const stored = storedGuardOf(main);
+    const hooksDir = hooksDirOf(main);
+    const fleet = readFileSync(stored, "utf8");
+
+    // An operator's hand-written guard, hand-written directly into the common
+    // git dir: this is the copy that is in force, and --force is about to
+    // replace it. Set up by writing, not by asking the installer to do it.
+    const operatorMarker = "KEE-976-HAND-WRITTEN-5b2e77";
+    const handWritten = `${unstampGuard(fleet).trimEnd()}\n// ${operatorMarker}\n`;
+    assert.notEqual(handWritten, fleet, "fixture is wrong: the hand-written guard is identical to the fleet's");
+    writeFileSync(stored, handWritten);
+
+    const before = backupsIn(hooksDir);
+    const forced = installHook(main, ["--install", "--force"]);
+    assert.equal(forced.status, 0, forced.stdout + forced.stderr);
+
+    // --force did replace it -- otherwise this test would pass on a fixture
+    // that never reached the state under test.
+    assert.equal(readFileSync(stored, "utf8"), fleet, "fixture is wrong: --force did not install this checkout's guard");
+    const after = backupsIn(hooksDir);
+    const added = after.filter((f) => !before.includes(f));
+    assert.equal(added.length, 1, "--force left no backup of the guard it replaced");
+    assert.equal(readFileSync(path.join(hooksDir, added[0]), "utf8"), handWritten,
+      "the backup is not the file that was actually replaced");
+    assert.match(`${forced.stdout}${forced.stderr}`, new RegExp(added[0].replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+      "--force did not say where the outgoing guard went");
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("KEE-976: an identical rewrite takes no backup, so --install does not pile copies up", () => {
+  // The counterweight, and the reason the fix is not "back up on every write".
+  // A `same` relation rewrites the stored guard with bytes identical to what is
+  // already in force: nothing is lost, and a backup per run would fill a
+  // directory in .git that nothing prunes. The positive control below proves the
+  // file is really being written on this path, so "no backup" is a decision and
+  // not a path that silently stopped running.
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const hooksDir = hooksDirOf(main);
+    const before = backupsIn(hooksDir);
+    assert.deepEqual(before, [], "fixture is wrong: the first install left a backup of a guard that did not exist");
+
+    for (let i = 0; i < 3; i++) {
+      const again = installHook(main, ["--install"]);
+      assert.equal(again.status, 0, again.stdout + again.stderr);
+    }
+    assert.deepEqual(backupsIn(hooksDir), before,
+      "three re-installs that changed nothing left three identical copies of the guard in force");
+
+    // Positive control: a write that DOES change the bytes must back up. If
+    // neither arm does anything, the assertion above is vacuous.
+    //
+    // The displacement has to be one the rule actually ALLOWS, or the run
+    // correctly withholds and there is no write to back up. An `older` or
+    // `differs` lane cannot take the fleet, so the checkout's guard is stamped
+    // one version higher than the copy in force and the copy in force carries
+    // an edit nobody committed. That is `newer`: the write happens, and the
+    // hand-edited bytes are what it displaces.
+    const stored = storedGuardOf(main);
+    const fleet = readFileSync(stored, "utf8");
+    const edited = `${fleet.trimEnd()}\n// KEE-976-EDITED-IN-PLACE\n`;
+    writeFileSync(stored, edited);
+    writeFileSync(guardInCheckoutOf(main), stampGuardVersion(fleet, versionIn(fleet) + 1));
+    const changing = installHook(main, ["--install"]);
+    assert.equal(changing.status, 0, changing.stdout + changing.stderr);
+    assert.equal(readFileSync(stored, "utf8"), stampGuardVersion(fleet, versionIn(fleet) + 1),
+      "fixture is wrong: a newer guard did not take over, so nothing was displaced to back up");
+    const added = backupsIn(hooksDir).filter((f) => !before.includes(f));
+    assert.equal(added.length, 1, "a write that replaced the bytes in force left no backup of them");
+    assert.equal(readFileSync(path.join(hooksDir, added[0]), "utf8"), edited,
+      "the backup is not the content that was displaced");
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("KEE-976: a withheld install displaces nothing and backs up nothing", () => {
+  // The rule must not change: an `older` lane still cannot move the fleet, and
+  // a run that wrote nothing must not also leave a backup implying it did.
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const stored = storedGuardOf(main);
+    const hooksDir = hooksDirOf(main);
+    const fleet = readFileSync(stored, "utf8");
+    writeFileSync(guardInCheckoutOf(main), stampGuardVersion(fleet, versionIn(fleet) - 1));
+
+    const before = backupsIn(hooksDir);
+    const withheld = installHook(main, ["--install"]);
+    assert.equal(withheld.status, 0, withheld.stdout + withheld.stderr);
+    assert.equal(readFileSync(stored, "utf8"), fleet, "fixture is wrong: an older lane displaced the fleet guard");
+    assert.deepEqual(backupsIn(hooksDir), before,
+      "a run that withheld the guard write still left a backup, implying it replaced one");
+    assert.match(withheld.stdout, /NOT replaced/, "the run did not report the withholding");
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("KEE-976: a backup that cannot be written warns loudly and leaves the guard in force", () => {
+  // The failure mode backupFileBeforeReplace() promises. Making the hooks
+  // directory read-only fails the copy; the rename into that directory then
+  // fails too, so this asserts the loud warning AND that the guard in force is
+  // still readable afterwards -- a failed backup must never be the thing that
+  // destroys the working guard.
+  const { root, main } = makeFleet();
+  if (process.getuid && process.getuid() === 0) {
+    // Root ignores the mode bits this fixture depends on, so it would measure
+    // nothing. Skipped rather than failed: it is a property of who is running,
+    // not of the product.
+    return;
+  }
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const stored = storedGuardOf(main);
+    const hooksDir = hooksDirOf(main);
+    const fleet = readFileSync(stored, "utf8");
+    // Something for the run to displace, so the backup is actually attempted.
+    writeFileSync(stored, `${fleet.trimEnd()}\n// KEE-976-DISPLACED\n`);
+    const displaced = readFileSync(stored, "utf8");
+
+    chmodSync(hooksDir, 0o500);
+    try {
+      const run = installHook(main, ["--install", "--force"]);
+      const output = `${run.stdout}${run.stderr}`;
+      assert.match(output, /could not back up|WARNING/i,
+        `a backup that could not be written was silent, so the operator believes the replacement is reversible. It said: ${JSON.stringify(output)}`);
+      assert.match(output, /not be reversible/i,
+        "the warning does not say the replacement is not going to be reversible");
+    } finally {
+      chmodSync(hooksDir, 0o755);
+    }
+
+    // Whatever else happened, the guard that was in force is still a readable,
+    // parseable file. A backup attempt must never take the working guard with it.
+    assert.ok(existsSync(stored), "a failed backup destroyed the guard that was in force");
+    const after = readFileSync(stored, "utf8");
+    assert.ok(after === displaced || after === fleet,
+      `the stored guard is neither the copy that was in force nor the one being installed: ${JSON.stringify(after.slice(0, 200))}`);
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
+test("KEE-976: two displacing writes in the same second keep distinct backups", () => {
+  // Found in independent review, and it is the same class of loss this card
+  // exists to remove, one level up. The backup name is built from a
+  // second-resolution stamp and the installing lane's HEAD, so two displacing
+  // writes inside one second from one HEAD compute the identical filename and
+  // copyFileSync() overwrites the copy an operator was just told was kept.
+  //
+  // The operator iterating on their own guard is the ordinary case, not a
+  // contrived one: every --install displaces the last one, and keece-workspace
+  // runs this installer on every lane creation.
+  const { root, main } = makeFleet();
+  try {
+    assert.equal(installHook(main, ["--install"]).status, 0, "fixture is wrong: install did not run");
+    const stored = storedGuardOf(main);
+    const hooksDir = hooksDirOf(main);
+    const fleet = readFileSync(stored, "utf8");
+
+    // Each round is an edit nobody committed, displaced by the next. The
+    // displacement has to be one the rule ALLOWS, or the run correctly
+    // withholds and there is no write to lose. Bumping the checkout's stamp one
+    // version higher makes every round a `newer` write.
+    const edits = ["REV0", "REV1", "REV2"].map((rev) => `${fleet.trimEnd()}\n// KEE-976-SAME-SECOND-${rev}\n`);
+
+    // Three writes, all inside one second, all from one HEAD. Assert the
+    // window rather than trusting the clock: if the run really does straddle a
+    // second boundary this test measures nothing, so skip it instead of
+    // reporting a pass that never happened.
+    const base = versionIn(fleet);
+    const secondsBefore = Date.now();
+    edits.forEach((edited, round) => {
+      // This checkout's guard must be one version HIGHER than what is in force
+      // for the rule to allow the write. What is in force is base+1+round
+      // after the previous round took over, so this round needs base+2+round.
+      writeFileSync(guardInCheckoutOf(main), stampGuardVersion(fleet, base + 2 + round));
+      writeFileSync(stored, edited);
+      const run = installHook(main, ["--install"]);
+      assert.equal(run.status, 0, run.stdout + run.stderr);
+      assert.equal(readFileSync(stored, "utf8"), stampGuardVersion(fleet, base + 2 + round),
+        `fixture is wrong: round ${round} did not displace the stored guard`);
+    });
+    const elapsed = Date.now() - secondsBefore;
+
+    const written = backupsIn(hooksDir);
+    assert.ok(elapsed < 1000,
+      `the three displacing writes spanned ${elapsed}ms, so they were not in the same second and this test measured nothing`);
+
+    // Each displaced revision must still be recoverable on its own. The point
+    // is the COUNT of distinct survivors, not that some backup exists.
+    const survivors = edits.filter((edited) =>
+      written.some((name) => readFileSync(path.join(hooksDir, name), "utf8") === edited));
+    assert.equal(survivors.length, edits.length,
+      `${edits.length} operator revisions were displaced inside one second and ${survivors.length} survived on disk. ` +
+      `Backups written: ${JSON.stringify(written)}. Every displaced revision must keep its own copy.`);
+  } finally {
+    rmSync(root, { force: true, recursive: true });
+  }
+});
+
