@@ -33,6 +33,7 @@ export async function validateExecutionReconciliation(input: {
   agentId: string | null;
   sourceRunId: unknown;
   decision: ExecutionReconciliation | undefined;
+  preservePendingReview?: boolean;
 }) {
   const { db, companyId, issueId, agentId, decision } = input;
   if (!decision || decision.runId !== input.sourceRunId || !agentId) {
@@ -54,11 +55,12 @@ export async function validateExecutionReconciliation(input: {
     .from(issues)
     .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)));
   const review =
-    task?.status === "in_review"
+    (task?.status === "in_review" || (input.preservePendingReview && task?.status === "blocked"))
       ? parseIssueExecutionState(task.executionState)
       : null;
   const isCurrentReviewer =
     review?.status === "pending" &&
+    (task?.status === "in_review" || review.currentStageType === "review") &&
     review.currentParticipant?.type === "agent" &&
     review.currentParticipant.agentId === run?.agentId;
   if (
@@ -144,6 +146,7 @@ export async function markExecutionReconciliation(
   decision: ExecutionReconciliation,
   actorId: string,
   deliveryOwner?: { kind: "chat_failed_run_retry"; actionId: string },
+  options: { preservePendingReview?: boolean } = {},
 ) {
   if (deliveryOwner) {
     const [retry] = await db
@@ -189,7 +192,7 @@ export async function markExecutionReconciliation(
           actorId,
           recordedAt: new Date().toISOString(),
         },
-        continuationDelivery: deliveryOwner ? "delegated" : "pending",
+        continuationDelivery: options.preservePendingReview ? "not_required" : deliveryOwner ? "delegated" : "pending",
         ...(deliveryOwner ? { continuationDeliveryOwner: deliveryOwner } : {}),
       },
     })

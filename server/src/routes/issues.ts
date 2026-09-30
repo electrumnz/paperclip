@@ -9249,6 +9249,19 @@ export function issueRoutes(
           .then((rows) => rows[0] ?? null);
         if (!lockedIssue) throw notFound("Issue not found");
 
+        // Restore the existing review without replaying the author or deciding it.
+        const pendingReview = parseIssueExecutionState(lockedIssue.executionState);
+        const preservePendingReview = sourceIssueStatus === "in_review" &&
+          outcome === "restored" && executionReconciliation != null &&
+          ["blocked", "in_review"].includes(lockedIssue.status) &&
+          pendingReview?.status === "pending" &&
+          pendingReview.currentStageType === "review" &&
+          pendingReview.currentStageId != null &&
+          pendingReview.currentParticipant != null;
+        if (preservePendingReview && (lockedIssue.checkoutRunId || lockedIssue.executionRunId)) {
+          throw conflict("Review recovery is locked by another checkout or execution.");
+        }
+
         let activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(
           lockedIssue.companyId,
           lockedIssue.id,
@@ -9284,7 +9297,7 @@ export function issueRoutes(
               assertBoard(req);
               if (
                 activeRecoveryAction ||
-                sourceIssueStatus !== "todo" ||
+                (sourceIssueStatus !== "todo" && !preservePendingReview) ||
                 outcome !== "restored"
               ) {
                 throw conflict(
@@ -9379,7 +9392,7 @@ export function issueRoutes(
         }
 
         if (
-          sourceIssueStatus === "todo" &&
+          (sourceIssueStatus === "todo" || preservePendingReview) &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
         ) {
           assertBoard(req);
@@ -9392,6 +9405,7 @@ export function issueRoutes(
               activeRecoveryAction.evidence.runId ??
               activeRecoveryAction.evidence.sourceRunId,
             decision: executionReconciliation,
+            preservePendingReview,
           });
         } else if (executionReconciliation) {
           throw conflict(
@@ -9455,6 +9469,7 @@ export function issueRoutes(
             chatRetry
               ? { kind: "chat_failed_run_retry", actionId: chatRetry.actionId }
               : undefined,
+            { preservePendingReview },
           );
         }
         let issue = lockedIssue;
@@ -9513,7 +9528,7 @@ export function issueRoutes(
           const updateFields: Record<string, unknown> = {
             status: sourceIssueStatus,
           };
-          if (!safeHandBack) {
+          if (!safeHandBack && !preservePendingReview) {
             await assertInReviewReviewPath({
               existing: lockedIssue,
               updateFields,
