@@ -357,6 +357,11 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     if (status === "in_progress") {
       expect(blockedIssue.blockedTransitionAt).not.toBeNull();
       expect(entries[0]).toMatchObject({ action: "issue.updated", details: { status: "blocked", previousStatus: "in_progress" } });
+      // A `blocked` card with no first-class blocker and no unblockDescriptor is
+      // invisible to every view and owner queue. This path creates the block, so it
+      // must attach a board-owned descriptor in the same update.
+      expect(blockedIssue.unblockDescriptor).toMatchObject({ owner: "board" });
+      expect(typeof blockedIssue.unblockDescriptor?.action).toBe("string");
     } else expect(entries).toHaveLength(0);
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)))[0].status).toBe("deferred_issue_execution");
     const action = (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))[0];
@@ -444,6 +449,61 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     await db.update(issueRecoveryActions).set({ evidence: {} }).where(eq(issueRecoveryActions.id, hold!.id));
     await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, drain);
     expect(drainCalls).toBe(1);
+  });
+
+  it("treats a binding unblock descriptor as a deferred-wake pause hold", async () => {
+    const companyId = await seedCompany();
+    const agentId = await seedAgent({ companyId });
+    const issueId = await seedIssue({
+      companyId,
+      assigneeAgentId: agentId,
+      status: "blocked",
+    });
+    const runId = await seedRun({
+      companyId,
+      agentId,
+      contextSnapshot: { issueId },
+      status: "succeeded",
+    });
+    await db
+      .update(issues)
+      .set({
+        executionRunId: runId,
+        unblockDescriptor: {
+          owner: "board",
+          action: "Approve the isolation permit",
+        },
+      })
+      .where(eq(issues.id, issueId));
+
+    const adapter = createPostgresWakeQueueAdapter(db, stubDeps);
+    await adapter.withIssueExecutionLock(
+      { companyId, runId, now: new Date() },
+      async (_locked, ports) => {
+        await expect(
+          ports.transaction.getPauseHoldFacts({
+            companyId,
+            issueId,
+            wakeAgentId: agentId,
+            deferredContextSeed: {
+              issueId,
+              wakeReason: "issue_commented",
+            },
+            requestedByActorType: "user",
+            requestedByActorId: "responsible-user",
+          }),
+        ).resolves.toMatchObject({
+          activePauseHold: true,
+          treeHoldInteractionWake: false,
+          holdId: `unblock-descriptor:${issueId}`,
+          rootIssueId: issueId,
+          mode: "unblock_descriptor",
+          reason: "Approve the isolation permit",
+          releasePolicy: "board",
+        });
+        return { outcome: { kind: "released" as const }, postCommitEffects: [] };
+      },
+    );
   });
 
   // Review test (a): a foreign-company agent id produces the current failed

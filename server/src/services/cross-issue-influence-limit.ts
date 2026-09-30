@@ -34,6 +34,18 @@ export function crossIssueInfluenceRunContextError() {
   return forbidden(body.error, body.details);
 }
 
+/**
+ * Distinct from `crossIssueInfluenceRunContextError`: that one fires when the
+ * run id header itself is missing, malformed, or doesn't resolve to this
+ * actor's own run — sending the header fixes it. This one fires when the run
+ * id is genuinely correct but the run's own context was never anchored to an
+ * issue, so no header on a retry can ever supply the missing source issue.
+ */
+export function crossIssueInfluenceRunNotIssueScopedError() {
+  const { body } = issueWriteDenialResponse("cross_issue_influence_run_not_issue_scoped");
+  return forbidden(body.error, body.details);
+}
+
 function readRunSourceIssueId(contextSnapshot: unknown) {
   if (!contextSnapshot || typeof contextSnapshot !== "object" || Array.isArray(contextSnapshot)) return null;
   const context = contextSnapshot as Record<string, unknown>;
@@ -41,6 +53,18 @@ function readRunSourceIssueId(contextSnapshot: unknown) {
     if (typeof candidate === "string" && candidate.trim()) return candidate.trim();
   }
   return null;
+}
+
+function isUnscopedHeartbeatTimerRun(input: {
+  invocationSource: string;
+  contextSnapshot: unknown;
+}) {
+  if (input.invocationSource !== "timer") return false;
+  if (!input.contextSnapshot || typeof input.contextSnapshot !== "object" || Array.isArray(input.contextSnapshot)) {
+    return false;
+  }
+  const context = input.contextSnapshot as Record<string, unknown>;
+  return context.wakeReason === "heartbeat_timer" && context.wakeSource === "timer";
 }
 
 export function evaluateCrossIssueInfluenceLimit(input: {
@@ -91,6 +115,7 @@ export async function observeCrossIssueInfluence(
         companyId: heartbeatRuns.companyId,
         agentId: heartbeatRuns.agentId,
         responsibleUserId: heartbeatRuns.responsibleUserId,
+        invocationSource: heartbeatRuns.invocationSource,
         contextSnapshot: heartbeatRuns.contextSnapshot,
       })
       .from(heartbeatRuns)
@@ -110,10 +135,21 @@ export async function observeCrossIssueInfluence(
     }
 
     const sourceIssueId = readRunSourceIssueId(run.contextSnapshot);
-    if (!sourceIssueId) throw crossIssueInfluenceRunContextError();
+    // KEE-159: an unscoped but verified timer run is a legitimate third
+    // sourceKind and is allowed through. Only a null sourceKind — a run that
+    // is neither issue-anchored nor a heartbeat timer — is permanently
+    // unfixable by a header, so only that case takes the new KEE-567 code.
+    const sourceKind = sourceIssueId
+      ? "issue"
+      : isUnscopedHeartbeatTimerRun(run)
+        ? "heartbeat_timer"
+        : null;
+    if (!sourceKind) throw crossIssueInfluenceRunNotIssueScopedError();
     if (
-      sourceIssueId === input.targetIssueId ||
-      (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      sourceIssueId && (
+        sourceIssueId === input.targetIssueId ||
+        (input.targetIssueIdentifier && sourceIssueId.toUpperCase() === input.targetIssueIdentifier.toUpperCase())
+      )
     ) {
       return null;
     }
@@ -143,6 +179,7 @@ export async function observeCrossIssueInfluence(
       entityId: input.targetIssueId,
       details: {
         kind: input.kind,
+        sourceKind,
         sourceIssueId,
         targetIssueId: input.targetIssueId,
         targetIssueIdentifier: input.targetIssueIdentifier ?? null,
@@ -159,6 +196,7 @@ export async function observeCrossIssueInfluence(
       companyId: input.companyId,
       runId: input.runId,
       agentId: input.agentId,
+      sourceKind,
       sourceIssueId,
       targetIssueId: input.targetIssueId,
       kind: input.kind,

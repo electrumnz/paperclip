@@ -1,6 +1,6 @@
 import { and, asc, desc, eq, inArray, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import type { CreateIssueThreadInteraction } from "@paperclipai/shared";
+import type { CreateIssueThreadInteraction, IssueUnblockDescriptor } from "@paperclipai/shared";
 import {
   agentWakeupRequests,
   agents,
@@ -41,7 +41,7 @@ import {
 import { issueService } from "../issues.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
-import { buildIssueBlockersResolvedWakeIdempotencyKey } from "../issue-dependency-wakeups.js";
+import { buildIssueBlockersResolvedResolutionEventKey } from "../issue-dependency-wakeups.js";
 import {
   persistActivity,
   publishActivity,
@@ -749,10 +749,28 @@ async function materializeDecisionEffect(input: {
   }
   if (effect.kind === "bind_blocker") {
     failAt("blocker_materialization", input.failpoint);
+    // Never displace an unblock path this commit did not create. The card may
+    // already be `blocked` with a valid agent- or user-owned descriptor, and
+    // `deliverAgentUnblockNotification` only wakes agent-owned descriptors, so
+    // overwriting one severs the wake route to whoever is already responsible.
+    const boundDescriptor = unblockDescriptorForStatusCommit({
+      existing: input.issue.unblockDescriptor,
+      proposed: { owner: effect.owner, action: effect.action },
+    });
+    // The wake and the recorded effect must name the owner the card *ends up*
+    // with, not the owner this effect proposed. When the guard above kept a
+    // board- or user-owned descriptor, waking `effect.owner.agentId` would ask
+    // an agent to handle a block the card assigns to somebody else, while
+    // later unblock notifications keep following the stored descriptor. Card,
+    // wake and payload then disagree about who owns the block.
+    const retained = retainedUnblockDescriptorForBindBlocker({
+      existing: input.issue.unblockDescriptor,
+      proposed: { owner: effect.owner, action: effect.action },
+    });
     const [bound] = await input.tx
       .update(issues)
       .set({
-        unblockDescriptor: { owner: effect.owner, action: effect.action },
+        ...(boundDescriptor ? { unblockDescriptor: boundDescriptor } : {}),
         updatedAt: new Date(),
       })
       .where(
@@ -763,18 +781,35 @@ async function materializeDecisionEffect(input: {
       )
       .returning({ id: issues.id });
     if (!bound) throw new Error("native_blocker_binding_not_persisted");
+    // `retained.descriptor.owner` is what the card ends up blaming, and
+    // `effect.owner` is what this decision proposed. The wake is issued only
+    // when BOTH agree that an agent owns the block.
+    //
+    // Both halves are load-bearing. Requiring the retained owner alone means a
+    // `current_track` decision — which deliberately proposes a board-owned
+    // blocker to avoid waking the same agent to repeat blocked work — would
+    // still wake an agent that a pre-existing descriptor happens to name.
+    // Requiring the proposed owner alone reintroduces the divergence the
+    // retained owner exists to prevent, where the card stores one owner while
+    // the effect wakes another. See `status-arbiter.ts`, where the current-track
+    // branch binds `owner: "board"` precisely so no agent is woken.
+    const blockerOwner = retained.descriptor.owner;
     let wakeId: string | null = null;
-    if (effect.owner !== "board") {
+    if (
+      effect.owner !== "board" &&
+      blockerOwner !== "board" &&
+      "agentId" in blockerOwner
+    ) {
       wakeId = await enqueueWake({
         tx: input.tx,
         companyId: input.companyId,
         issueId: input.issue.id,
-        agentId: effect.owner.agentId,
+        agentId: blockerOwner.agentId,
         reason: "issue_status_changed",
         idempotencyKey: `native-status:${input.decisionId}:blocker-owner`,
         payload: {
           nativeDecisionId: input.decisionId,
-          unblockAction: effect.action,
+          unblockAction: retained.descriptor.action,
         },
       });
     }
@@ -782,7 +817,16 @@ async function materializeDecisionEffect(input: {
       effectKind: effect.kind,
       targetType: "issue_unblock_descriptor",
       targetId: bound.id,
-      payload: { owner: effect.owner, action: effect.action, wakeId },
+      payload: {
+        owner: blockerOwner,
+        action: retained.descriptor.action,
+        wakeId,
+        // Whether the stored descriptor is the one this effect proposed or a
+        // pre-existing one that was kept. Recorded so the effect log shows
+        // which of the two happened instead of hiding it behind an identical
+        // owner/action pair.
+        descriptorSource: retained.source,
+      },
     };
   }
   if (effect.kind === "schedule_retry") {
@@ -1521,6 +1565,77 @@ async function materializeDecisionEffect(input: {
   return assertNeverEffect(effect);
 }
 
+/**
+ * A status commit that moves a card to `blocked` must attach an unblock
+ * descriptor, but must never *displace* a block it did not create.
+ *
+ * `issueService.update` stamps `blockedTransitionAt` only on a real
+ * `not blocked -> blocked` transition, and `assertTransition` returns early
+ * when `from === to`, so a card that is already `blocked` accepts this write
+ * unconditionally. If the card already carries a valid descriptor, writing over
+ * it severs the wake route to whoever is already responsible:
+ * `deliverAgentUnblockNotification` only wakes agent-owned descriptors.
+ *
+ * The descriptor proposed by the decision keeps its own owner. An
+ * agent-owned `bind_blocker` must not be rewritten as board-owned, or the
+ * agent that is being given the block would stop being woken for it.
+ *
+ * Kept local to the committer on purpose: the equivalent
+ * `boardDescriptorForBlock` helper in `services/recovery/blocked-descriptor.ts`
+ * ships on the KEE-250 branch, which is not merged into `origin/master`. This
+ * mirrors its contract for the board-owned case and additionally preserves a
+ * proposed agent owner; when KEE-250 lands this function should be deleted and
+ * `boardDescriptorForBlock` used at the board-owned call site.
+ *
+ * Returns the descriptor to write, or `null` to leave the existing value
+ * untouched.
+ */
+export function unblockDescriptorForStatusCommit(input: {
+  existing: IssueUnblockDescriptor | null | undefined;
+  proposed: { owner: { agentId: string } | "board"; action: string } | null | undefined;
+}): IssueUnblockDescriptor | null {
+  if (input.existing && input.existing.action.trim()) {
+    // A real unblock path already exists. Keep its owner and its action.
+    return null;
+  }
+  const action = input.proposed?.action?.trim();
+  if (!action) return null;
+  return { owner: input.proposed!.owner, action } satisfies IssueUnblockDescriptor;
+}
+
+/**
+ * Which unblock descriptor a `bind_blocker` actually leaves on the card, and
+ * where it came from.
+ *
+ * `unblockDescriptorForStatusCommit` deliberately returns only the descriptor to
+ * *write*, so `null` means two different things: "an existing descriptor was
+ * kept" and "nothing could be attached at all". A caller that treats `null` as
+ * "use the proposed owner" will wake and report an agent the card does not
+ * actually blame. Resolving the retained descriptor here keeps the write, the
+ * wake target and the recorded effect payload describing the same party.
+ */
+export function retainedUnblockDescriptorForBindBlocker(input: {
+  existing: IssueUnblockDescriptor | null | undefined;
+  proposed: { owner: { agentId: string } | "board"; action: string };
+}): { descriptor: IssueUnblockDescriptor; source: "proposed" | "existing" } {
+  const attached = unblockDescriptorForStatusCommit({
+    existing: input.existing,
+    proposed: input.proposed,
+  });
+  if (attached) return { descriptor: attached, source: "proposed" };
+  // `null` here means a valid existing descriptor was preserved. Its owner is
+  // the party responsible for the block, and the only one a wake may name.
+  if (input.existing && input.existing.action.trim())
+    return { descriptor: input.existing, source: "existing" };
+  // Neither side carries a usable action, so the card ends up with no
+  // descriptor to disagree with. Report the proposal rather than inventing an
+  // owner that is not recorded anywhere.
+  return {
+    descriptor: { owner: input.proposed.owner, action: input.proposed.action.trim() },
+    source: "proposed",
+  };
+}
+
 export async function commitNativeStatusDecision(input: {
   db: Db;
   companyId: string;
@@ -1873,13 +1988,75 @@ export async function commitNativeStatusDecision(input: {
       if (!updated) throw new NativeStatusRaceError();
     } else {
       failAt("status_projection", input.failpoint);
+      // A native status decision writes `unblockDescriptor` with a null actor,
+      // which skips every owner check in `assertValidUnblockDescriptorOwner`.
+      // Resolve the completing run's agent here and enforce descriptor
+      // ownership, so an in-flight run cannot clear or replace a hold that a
+      // board user or another agent placed.
+      //
+      // This guard applies to every non-`blocked` status action: it is the
+      // "a run may not clear or rewrite someone else's hold" invariant. It
+      // deliberately does NOT run for a `blocked` decision - see the KEE-916
+      // projection below, which is the policy for binding a new blocker, and
+      // which this guard would otherwise reject for every agent-owned
+      // `bind_blocker` on a card that already carries a hold.
+      if (input.decision.statusAction !== "blocked") {
+        const completingRun = await tx
+          .select({ agentId: heartbeatRuns.agentId })
+          .from(heartbeatRuns)
+          .where(eq(heartbeatRuns.id, input.runId))
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (completingRun) {
+          const existingDescriptor = (
+            issue as typeof issues.$inferSelect | null
+          )?.unblockDescriptor;
+          if (existingDescriptor) {
+            const existingOwner = existingDescriptor.owner;
+            const ownedByCompletingRun =
+              typeof existingOwner === "object" &&
+              "agentId" in existingOwner &&
+              existingOwner.agentId === completingRun.agentId;
+            const changingDescriptor =
+              input.decision.unblockDescriptor !== undefined &&
+              JSON.stringify(input.decision.unblockDescriptor) !==
+                JSON.stringify(existingDescriptor);
+            if (!ownedByCompletingRun && changingDescriptor) {
+              throw new NativeStatusRaceError();
+            }
+          }
+        }
+      }
+
+      // A status commit must never *displace* a block it did not create. This
+      // projection runs even when the card is already `blocked`
+      // (`assertTransition` returns early when `from === to`), so an existing
+      // valid descriptor keeps its owner. `deliverAgentUnblockNotification`
+      // only wakes agent-owned descriptors, so overwriting one with a
+      // board-owned descriptor severs the wake route to whoever is already
+      // responsible. Same rule as the KEE-250 recovery paths.
+      //
+      // Upstream from KEE-916; retained verbatim when KEE-593 was replayed onto
+      // this master. It is a narrowing rule layered on the guard above: a run
+      // that is not the descriptor's owner has already been rejected, so here
+      // the only remaining case is "keep a valid existing descriptor, otherwise
+      // attach the proposed one".
+      const projectedUnblockDescriptor =
+        input.decision.statusAction === "blocked"
+          ? unblockDescriptorForStatusCommit({
+              existing: issue.unblockDescriptor,
+              proposed: input.decision.unblockDescriptor,
+            })
+          : null;
       const projected = await issueService(tx as unknown as Db).update(
         input.issueId,
         {
           status: input.decision.toStatus,
           statusVersion: input.priorStatusVersion + 1,
           lastStatusDecisionId: decisionRow.id,
-          unblockDescriptor: input.decision.unblockDescriptor,
+          ...(projectedUnblockDescriptor
+            ? { unblockDescriptor: projectedUnblockDescriptor }
+            : {}),
           actorAgentId: null,
           actorUserId: null,
         },
@@ -1934,9 +2111,10 @@ export async function commitNativeStatusDecision(input: {
         const isCompletedChildParent = parent?.id === dependent.id;
         const idempotencyKey = isCompletedChildParent
           ? `issue_children_completed:${dependent.id}:${input.issueId}`
-          : buildIssueBlockersResolvedWakeIdempotencyKey({
+          : buildIssueBlockersResolvedResolutionEventKey({
               dependentIssueId: dependent.id,
               resolvedBlockerIssueId: input.issueId,
+              blockerStatusVersion: updated.statusVersion,
             });
         const childCompletionContext =
           isCompletedChildParent && parent

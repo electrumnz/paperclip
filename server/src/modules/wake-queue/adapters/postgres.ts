@@ -28,6 +28,7 @@ import { HttpError } from "../../../errors.js";
 import { evaluateAgentInvokabilityFromDb } from "../../../services/agent-invokability.js";
 import { issueTreeControlService, isVerifiedIssueTreeControlInteractionWake } from "../../../services/issue-tree-control.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "../../../services/recovery/pause-hold-guard.js";
+import { boardDescriptorForBlock } from "../../../services/recovery/blocked-descriptor.js";
 import { classifyContinuationFailure } from "../../../services/recovery/service.js";
 import { issueService } from "../../../services/issues.js";
 import { issueRecoveryActionService } from "../../../services/issue-recovery-actions.js";
@@ -114,6 +115,7 @@ function toIssueSnapshot(row: IssueRow): IssueSnapshot {
     originKind: row.originKind,
     monitorNextCheckAt: row.monitorNextCheckAt,
     executionState: (row.executionState as Record<string, unknown> | null) ?? null,
+    unblockDescriptor: row.unblockDescriptor,
     responsibleUserId: row.responsibleUserId,
     parentId: row.parentId,
     originId: row.originId,
@@ -338,6 +340,22 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
     async getPauseHoldFacts({ companyId, issueId, wakeAgentId, deferredContextSeed, requestedByActorType, requestedByActorId }) {
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(companyId, issueId);
       if (!activePauseHold) {
+        const bindingIssue = await tx
+          .select({ unblockDescriptor: issues.unblockDescriptor })
+          .from(issues)
+          .where(and(eq(issues.companyId, companyId), eq(issues.id, issueId)))
+          .then((rows) => rows[0] ?? null);
+        if (bindingIssue?.unblockDescriptor) {
+          return {
+            activePauseHold: true,
+            treeHoldInteractionWake: false,
+            holdId: `unblock-descriptor:${issueId}`,
+            rootIssueId: issueId,
+            mode: "unblock_descriptor",
+            reason: bindingIssue.unblockDescriptor.action,
+            releasePolicy: bindingIssue.unblockDescriptor.owner,
+          };
+        }
         return {
           activePauseHold: false,
           treeHoldInteractionWake: false,
@@ -721,7 +739,11 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
   if (!applies || isAcknowledgedNativeStop(run) || isAcknowledgedNativeReassignmentStop(run)) return false;
 
   const existing = await tx
-    .select({ id: issueRecoveryActions.id, evidence: issueRecoveryActions.evidence })
+    .select({
+      id: issueRecoveryActions.id,
+      nextAction: issueRecoveryActions.nextAction,
+      evidence: issueRecoveryActions.evidence,
+    })
     .from(issueRecoveryActions)
     .where(
       and(
@@ -736,7 +758,31 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: HeartbeatRunRow
     .limit(1);
   let nativeFailureBlock: { runId: string; statusVersion: number } | undefined;
   if (issue.status !== "blocked") {
-    const projected = await issueService(tx).update(issue.id, { status: "blocked" }, tx);
+    // Only reuse an action that belongs to *this* run. The query above also
+    // admits any other active action on the issue, and putting that action's
+    // next step on this card would send the board to a different failure.
+    // Recovery evidence records the run in a few places depending on the
+    // writer, so accept any of them rather than trusting one shape.
+    const evidence = existing[0]?.evidence as
+      | { runId?: string; automaticRecovery?: { runId?: string } }
+      | undefined;
+    const ownerRunId = evidence?.automaticRecovery?.runId ?? evidence?.runId;
+    const runScopedAction = ownerRunId === run.id ? existing[0] : undefined;
+    const unblockAction =
+      runScopedAction?.nextAction?.trim() ||
+      "Inspect the original failure and reconcile the previous execution before continuing. Automatic recovery cannot start another incident.";
+    const unblockDescriptor = boardDescriptorForBlock({
+      existing: issue.unblockDescriptor,
+      action: unblockAction,
+    });
+    const projected = await issueService(tx).update(
+      issue.id,
+      {
+        status: "blocked",
+        ...(unblockDescriptor ? { unblockDescriptor } : {}),
+      },
+      tx,
+    );
     if (projected) {
       nativeFailureBlock = { runId: run.id, statusVersion: projected.statusVersion };
       await tx.insert(activityLog).values({

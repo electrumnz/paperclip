@@ -20,16 +20,16 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Setup pnpm
-        uses: pnpm/action-setup@v6
+        uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 9.15.4
           run_install: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v7
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7
         with:
           node-version: 24
           # Resolution-only installs do not populate the package store. Do not
@@ -52,11 +52,85 @@ jobs:
             exit 1
           fi
 
-      - name: Create or update pull request
-        id: upsert-pr
+      - name: Claim the refresh branch or refuse
+        id: branch-claim
         env:
           GH_TOKEN: ${{ github.token }}
           REPO_OWNER: ${{ github.repository_owner }}
+        run: |
+          # This step must never fail the job. It is scheduled on every merge to
+          # master, and a red run here looks like a broken refresh loop rather
+          # than the refusal it actually is.
+          #
+          # The step declares no `shell:`, so Actions runs `bash -e`, where any
+          # command that exits non-zero kills the step immediately. That applies
+          # to a bare assignment whose command substitution fails, which is how
+          # both `gh pr list` and the ownership script are called. `set -e` is
+          # therefore disabled for the whole step and each fallible call is
+          # checked explicitly. Every command below is accounted for:
+          #   - the branch name: a missing script is a real setup error
+          #   - `gh pr list`: a rate limit or 5xx must not red the job
+          #   - the ownership script: exit 2 (unreadable) and 3 (conflict)
+          #   - `jq`: a missing jq must not red the job
+          #   - `git ls-remote`: a failed lookup must not red the job
+          set +e
+
+          # The branch name is a shared, unguarded string: a human can open a PR
+          # on it, and the manual lockfile exemption uses the plain name. Decide
+          # ownership before touching the ref, so a collision stops the run here
+          # instead of destroying someone else's commits further down.
+          BRANCH="$(node .github/scripts/refresh-lockfile-branch.mjs --print-branch)"
+          if [ -z "$BRANCH" ]; then
+            echo "::error title=Lockfile refresh::Could not resolve the refresh branch name. Nothing was pushed."
+            echo "branch=" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          # A PR opened by a fork cannot collide with a push to this repository.
+          # If this call fails there is no way to know who owns the branch, so
+          # fail closed: claim nothing and let the next run retry.
+          prs="$(
+            gh pr list --state open --head "$BRANCH" --json url,headRefName,author,headRepositoryOwner
+          )"
+          list_rc=$?
+          if [ "$list_rc" -ne 0 ]; then
+            echo "::warning title=Lockfile refresh::Could not list pull requests for $BRANCH. Nothing was pushed. The next run will retry."
+            echo "branch=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Exits 3 when a pull request on this branch belongs to someone else,
+          # and 2 when the pull request list could not be read at all. Both fail
+          # closed: `branch` is never emitted, so the step below is skipped and
+          # no push, adoption, or delete can happen. The reason differs, so the
+          # two exit codes are reported separately instead of as one notice.
+          plan="$(printf '%s' "$prs" | node .github/scripts/refresh-lockfile-branch.mjs)"
+          claim_rc=$?
+          if [ "$claim_rc" -ne 0 ]; then
+            if [ "$claim_rc" -eq 3 ]; then
+              echo "::notice title=Lockfile refresh::Branch $BRANCH has a non-bot pull request. Nothing was pushed."
+            else
+              echo "::warning title=Lockfile refresh::Could not read the pull request list for $BRANCH. Nothing was pushed."
+            fi
+            echo "branch=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "pr_url=$(printf '%s' "$plan" | jq -r '.prUrl')" >> "$GITHUB_OUTPUT"
+
+          # Record where the branch is right now. The push below uses this as a
+          # lease, so a commit that appeared after this point (a human pushing
+          # with no pull request open is invisible to the list above) makes the
+          # push fail instead of overwriting it. Empty means the branch does not
+          # exist yet, which leases the push to its creation.
+          expected="$(git ls-remote origin "refs/heads/$BRANCH" | cut -f1)"
+          echo "expected=$expected" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update pull request
+        id: upsert-pr
+        if: steps.branch-claim.outputs.branch != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           if git diff --quiet -- pnpm-lock.yaml; then
             echo "Lockfile unchanged, nothing to do."
@@ -64,21 +138,21 @@ jobs:
             exit 0
           fi
 
-          BRANCH="chore/refresh-lockfile"
+          BRANCH="${{ steps.branch-claim.outputs.branch }}"
           git config user.name "lockfile-bot"
           git config user.email "lockfile-bot@users.noreply.github.com"
 
           git checkout -B "$BRANCH"
           git add pnpm-lock.yaml
           git commit -m "chore(lockfile): refresh pnpm-lock.yaml"
-          git push --force origin "$BRANCH"
+          # --force-with-lease, not --force. The claim step proved every open
+          # pull request on this branch belongs to the bot, and the lease stops
+          # the push if the ref moved since that step, so a commit that appeared
+          # in between is never overwritten. A stale lease fails the push loudly
+          # instead of losing work.
+          git push --force-with-lease="refs/heads/$BRANCH:${{ steps.branch-claim.outputs.expected }}" origin "$BRANCH"
 
-          # Only reuse an open PR from this repository owner, not a fork with the same branch name.
-          pr_url="$(
-            gh pr list --state open --head "$BRANCH" --json url,headRepositoryOwner \
-              --jq ".[] | select(.headRepositoryOwner.login == \"$REPO_OWNER\") | .url" |
-            head -n 1
-          )"
+          pr_url="${{ steps.branch-claim.outputs.pr_url }}"
           if [ -z "$pr_url" ]; then
             pr_url="$(gh pr create \
               --head "$BRANCH" \

@@ -315,6 +315,45 @@ async function waitForRunToSettle(
   return heartbeat.getRun(runId);
 }
 
+/**
+ * Bounded wait for `drainActiveRunExecutions()` to finish.
+ *
+ * `drainActiveRunExecutions()` is a true barrier, not a poll: it loops until the
+ * module-level wakeup and run-execution promise sets are both empty and, unlike
+ * a `vi.waitFor` budget, it is not itself bounded - if an execution in the set
+ * never settles it awaits forever. In a test that turns a stall into a bare
+ * `Test timed out in 15000ms`, which says nothing about which barrier stalled.
+ *
+ * So keep the barrier, but give it a deadline and a message that names it. On
+ * expiry the drain state is reported so the failure identifies the in-flight
+ * work rather than the symptom. KEE-912.
+ */
+async function drainActiveRunExecutionsBounded(
+  heartbeat: ReturnType<typeof heartbeatService>,
+  timeoutMs = 10_000,
+) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const outcome = await Promise.race([
+      heartbeat.drainActiveRunExecutions().then(() => "drained" as const),
+      new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), timeoutMs);
+      }),
+    ]);
+    if (outcome === "drained") return;
+  } finally {
+    // The barrier normally wins the race, and an uncleared timer would outlive
+    // the test on this serial shard. Never let the safety net become the stall.
+    if (timer) clearTimeout(timer);
+  }
+  const { activeRuns, pendingWakes, quiescent } = heartbeat.getTaskDrainStatus();
+  throw new Error(
+    `drainActiveRunExecutions() did not settle within ${timeoutMs}ms ` +
+      `(activeRuns=${activeRuns}, pendingWakes=${pendingWakes}, ` +
+      `quiescent=${quiescent}). The drain barrier is stuck, not the assertion.`,
+  );
+}
+
 async function waitForValue<T>(
   read: () => Promise<T | null | undefined>,
   timeoutMs = 3_000,
@@ -1339,6 +1378,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     if (input.cause === "execution_review_participant_recovery") {
       expect(action.nextAction).toContain("failed review participant path");
+    } else if (input.cause === "cleared_monitor_missing_wake_path") {
+      expect(action.nextAction).toContain("schedule a new monitor");
     } else if (input.cause === "process_lost") {
       expect(action.nextAction).toContain(
         "explicitly retry the original owner",
@@ -7380,12 +7421,33 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           .set({ status: "paused" })
           .where(eq(agents.id, agentId));
         release();
-        if (next!)
-          await vi.waitFor(async () =>
-            expect((await heartbeat.getRun(next!.id))?.status).not.toBe(
-              "running",
-            ),
-          );
+        if (next!) {
+          // KEE-912: await the cancellation, do not race it against a clock.
+          //
+          // Pausing the agent above makes this run's execution-start gate
+          // (heartbeat.ts:23119-23133) match zero rows, so executeRun aborts
+          // through a multi-await path - setRunStatus, setWakeupStatus,
+          // releaseIssueExecutionAndPromote - before it ever reaches the
+          // adapter (heartbeat.ts:24710).  The previous `vi.waitFor(...)` gave
+          // that whole path vitest's measured 1014ms default budget, and the
+          // run was observed still `running` at 1010ms while its two sibling
+          // cases settled at 607ms and 608ms.  So this was a wall-clock race,
+          // not a slow tail, and a longer timeout would only hide it.
+          //
+          // drainActiveRunExecutions() is the barrier this file already uses
+          // for exactly this (29 call expressions on fork master 8d9627696,
+          // e.g. test:2645, 2679, 5397): it loops until the module-level
+          // wakeup and run-execution promise sets are both empty
+          // (heartbeat.ts:20311-20324).  That makes the
+          // assertion below deterministic instead of timing-dependent.
+          //
+          // It is bounded through drainActiveRunExecutionsBounded(), because
+          // the barrier itself has no timeout: an execution that never settles
+          // would otherwise hang to the suite's 15s testTimeout and report a
+          // bare timeout instead of naming the stall.
+          await drainActiveRunExecutionsBounded(heartbeat);
+          expect((await heartbeat.getRun(next!.id))?.status).not.toBe("running");
+        }
       }
     },
   );
@@ -7487,28 +7549,51 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         },
       );
       try {
-        await vi.waitFor(async () => {
-          const [row] = await db.execute<{ count: number }>(sql`
+        // Everything between issuing the Stop and releaseRow() below runs while
+        // the Stop is blocked on the row lock this transaction holds. The Stop's
+        // terminalization runs under a 1s lock_timeout
+        // (terminalizeLegacyExecution, legacy-execution-recovery.ts), so the
+        // cumulative wall clock of these polls must stay well under 1s or
+        // Postgres abandons the update with 55P03 before the test releases it.
+        // Both waits are therefore explicitly bounded and tightly polled: the
+        // previous default 1000ms each could sum past the production budget on a
+        // loaded host. The assertions below still prove the Stop is genuinely
+        // blocked at the moment of release, so nothing is weakened.
+        await vi.waitFor(
+          async () => {
+            const [row] = await db.execute<{ count: number }>(sql`
           select count(*)::int as count from pg_stat_activity
           where datname = current_database() and ${pid} = any(pg_blocking_pids(pid))
             and query ilike '%update%heartbeat_runs%'
         `);
-          expect(row!.count).toBeGreaterThan(0);
-        });
+            expect(row!.count).toBeGreaterThan(0);
+          },
+          { timeout: 500, interval: 20 },
+        );
         releaseRegistration();
-        await vi.waitFor(() => expect(registrationAttempted).toBe(true));
+        await vi.waitFor(() => expect(registrationAttempted).toBe(true), {
+          timeout: 300,
+          interval: 10,
+        });
         // Readiness must remain behind the earlier Stop, without publishing a
         // joinable owner that would deadlock a duplicate Stop on this barrier.
         expect(adapterExecutionControls.has(runId)).toBe(false);
         expect(registered).toBe(false);
         expect(providerStarts).toBe(0);
         expect(stopReturned).toBe(false);
+        // Release the row lock the Stop is blocked on. This is the contract: the
+        // assertions above prove the Stop is still blocked at this instant, so
+        // the terminalization update must now win. The follow-up wait gets an
+        // explicit budget because the adapter still has to unblock and
+        // register after the lock drops.
         releaseRow();
         await lock;
         const result = await stopping;
         expect(result.error).toBeNull();
         expect(result.run).toMatchObject({ status: "cancelled" });
-        await vi.waitFor(() => expect(registered).toBe(true));
+        await vi.waitFor(() => expect(registered).toBe(true), {
+          timeout: 5_000,
+        });
         expect(context.signal?.aborted).toBe(true);
         expect(providerStarts).toBe(0);
         releaseAdapter();
@@ -13580,6 +13665,233 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(recoveryIssues).toHaveLength(0);
   });
 
+  it("blocks a cleared in-progress monitor instead of manufacturing an issue-bound continuation", async () => {
+    const { companyId, agentId, issueId, runId } =
+      await seedStrandedIssueFixture({
+        status: "in_progress",
+        runStatus: "succeeded",
+        livenessState: "advanced",
+      });
+    await db
+      .update(issues)
+      .set({
+        monitorNextCheckAt: null,
+        executionPolicy: null,
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: {
+            status: "cleared",
+            nextCheckAt: null,
+            lastTriggeredAt: "2026-03-19T00:00:00.000Z",
+            attemptCount: 1,
+            notes: null,
+            scheduledBy: "assignee",
+            kind: null,
+            serviceName: null,
+            externalRef: null,
+            timeoutAt: null,
+            maxAttempts: null,
+            recoveryPolicy: null,
+            clearedAt: "2026-03-19T00:05:00.000Z",
+            clearReason: "invalid_status",
+          },
+        },
+      })
+      .where(eq(issues.id, issueId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({
+      continuationRequeued: 0,
+      escalated: 1,
+      issueIds: [issueId],
+    });
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId))).toHaveLength(1);
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(updatedIssue).toMatchObject({ status: "blocked", assigneeAgentId: agentId });
+    await expectSourceScopedStrandedRecoveryAction({
+      companyId,
+      agentId,
+      issueId,
+      runId,
+      previousStatus: "in_progress",
+      cause: "cleared_monitor_missing_wake_path",
+    });
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("monitor was cleared");
+    expect(comments[0]?.presentation).toMatchObject({
+      kind: "system_notice",
+      title: "Cleared monitor has no wake path",
+    });
+  });
+
+  it("keeps a scheduled in-progress monitor eligible and does not escalate it", async () => {
+    const monitorNextCheckAt = new Date("2026-03-20T00:00:00.000Z");
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+      monitorNextCheckAt,
+      resultJson: {
+        summary: "Waiting for the scheduled monitor.",
+        externalWait: { kind: "issue_monitor", durable: true },
+      },
+    });
+    await db
+      .update(issues)
+      .set({
+        executionPolicy: {
+          mode: "normal",
+          commentRequired: true,
+          stages: [],
+          monitor: {
+            nextCheckAt: monitorNextCheckAt.toISOString(),
+            notes: null,
+            scheduledBy: "assignee",
+            kind: null,
+            serviceName: null,
+            externalRef: null,
+            timeoutAt: null,
+            maxAttempts: null,
+            recoveryPolicy: null,
+          },
+        },
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: {
+            status: "scheduled",
+            nextCheckAt: monitorNextCheckAt.toISOString(),
+            lastTriggeredAt: null,
+            attemptCount: 0,
+            notes: null,
+            scheduledBy: "assignee",
+            kind: null,
+            serviceName: null,
+            externalRef: null,
+            timeoutAt: null,
+            maxAttempts: null,
+            recoveryPolicy: null,
+            clearedAt: null,
+            clearReason: null,
+          },
+        },
+      })
+      .where(eq(issues.id, issueId));
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({
+      continuationRequeued: 0,
+      escalated: 0,
+      skipped: 1,
+    });
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(updatedIssue).toMatchObject({
+      status: "in_progress",
+      companyId,
+      assigneeAgentId: agentId,
+      monitorNextCheckAt,
+    });
+  });
+
+  it("preserves a pending blocker on a cleared in-progress monitor for the owner", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    await db
+      .update(issues)
+      .set({
+        monitorNextCheckAt: null,
+        executionPolicy: null,
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: {
+            status: "cleared",
+            nextCheckAt: null,
+            lastTriggeredAt: "2026-03-19T00:00:00.000Z",
+            attemptCount: 1,
+            notes: null,
+            scheduledBy: "assignee",
+            kind: null,
+            serviceName: null,
+            externalRef: null,
+            timeoutAt: null,
+            maxAttempts: null,
+            recoveryPolicy: null,
+            clearedAt: "2026-03-19T00:05:00.000Z",
+            clearReason: "invalid_status",
+          },
+        },
+      })
+      .where(eq(issues.id, issueId));
+    const blockerIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      parentId: issueId,
+      title: "Pending blocker",
+      status: "todo",
+      priority: "medium",
+      assigneeUserId: "external-owner",
+      responsibleUserId: "responsible-user",
+      issueNumber: 2,
+      identifier: "PAP-2",
+    });
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: issueId,
+      type: "blocks",
+    });
+
+    const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+
+    expect(result).toMatchObject({
+      continuationRequeued: 0,
+      escalated: 0,
+      skipped: 1,
+    });
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId))).toHaveLength(0);
+    const [updatedIssue] = await db.select().from(issues).where(eq(issues.id, issueId));
+    expect(updatedIssue).toMatchObject({
+      status: "in_progress",
+      companyId,
+      assigneeAgentId: agentId,
+    });
+  });
+
   it("preserves a delegated blocker edge as the durable external-wait path", async () => {
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
@@ -15154,20 +15466,28 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await db.execute(
       sql`create trigger test_native_blocked_wait_fault before insert on issue_comments for each row execute function test_native_blocked_wait_fault()`,
     );
+    let failed: number;
+    let failedIssueIds: string[];
     try {
-      await expect(
-        heartbeatService(db).reconcileStrandedAssignedIssues(),
-      ).rejects.toMatchObject({
-        cause: expect.objectContaining({
-          message: "native_blocked_wait_fixture_fault",
-        }),
-      });
+      // KEE-1095: this used to assert that the whole call *rejects*. The
+      // per-issue containment in `reconcileStrandedAssignedIssues` now catches
+      // this failure and continues the sweep, which is the point of that change,
+      // so propagation out of the sweep is no longer the observable. What this
+      // test is actually about — the rollback — is unchanged and still asserted
+      // in full below. The pass now reports the failure instead of throwing it.
+      const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
+      failed = result.failed;
+      failedIssueIds = result.failedIssueIds;
     } finally {
       await db.execute(
         sql`drop trigger test_native_blocked_wait_fault on issue_comments`,
       );
       await db.execute(sql`drop function test_native_blocked_wait_fault()`);
     }
+    // The failure is contained per issue and attributed to the issue that caused
+    // it, not silently dropped and not attributed to the whole sweep.
+    expect(failed).toBe(1);
+    expect(failedIssueIds).toEqual([issueId]);
     expect(
       await db.select().from(issues).where(eq(issues.id, issueId)),
     ).toEqual(before);

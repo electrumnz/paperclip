@@ -13,6 +13,7 @@ import {
   flipCurrentAtomic,
   payloadPathFor,
   pruneInstallPayloads,
+  migrateManagedSkillLinks,
   readInstallManifest,
   resolveInstallStorePaths,
   withInstallStoreLock,
@@ -36,6 +37,74 @@ export type CommandRunner = (
 ) => Promise<{ stdout: string; stderr: string }>;
 
 type ReleasePackageEntry = { dir: string; name: string };
+
+// Every released package that ships a "skills" entry in files[] needs the
+// repo-root skills/ directory copied into it before packing, because a fresh
+// checkout has no skills/ there. This was a hard-coded list copied from
+// scripts/release.sh, and it had already drifted: cursor-local, gemini-local and
+// opencode-local all declare "skills" in files[] and were staged without one, and
+// `pnpm pack` omits a missing files[] entry without failing, so those adapters
+// shipped with no skills at all. Derive the set from the same release manifest
+// this function already reads, so it cannot drift again.
+export function resolveGitInstallSkillPackageDirs(checkoutPath: string): string[] {
+  return resolveGitInstallWorkspacePackages(checkoutPath)
+    .filter((entry) => {
+      try {
+        const manifest = JSON.parse(fs.readFileSync(path.join(checkoutPath, entry.dir, "package.json"), "utf8")) as { files?: string[] };
+        return (manifest.files ?? []).includes("skills");
+      } catch {
+        // A manifest we cannot read cannot ship skills; staging will fail loudly
+        // on the package itself rather than silently dropping the entry.
+        return false;
+      }
+    })
+    .map((entry) => entry.dir);
+}
+
+// Confirms the staged workspace tarball for a bundled package really carries the
+// entries the running control plane needs. The UI check matters most: with
+// uiMode=static, server/src/app.ts only serves the board from <pkg>/ui-dist, so a
+// tarball without it installs cleanly and then serves an API with no UI.
+export function describePackagedWorkspaceEntries(payloadPath: string, packageName: string, entries: string[]): Record<string, boolean> {
+  const present: Record<string, boolean> = {};
+  for (const entry of entries) {
+    present[entry] = fs.existsSync(path.join(payloadPath, "node_modules", packageName, entry));
+  }
+  return present;
+}
+
+// prepare-bundled-package.mjs reports the files[] entries it had to skip on
+// stdout. The install path runs it as a subprocess with piped stdio, so without
+// this the report is discarded and a silently under-staged package looks like a
+// clean install.
+export function formatSkippedFilesReport(reports: { packageName: string; missing: string[] }[]): string[] {
+  return reports
+    .filter((report) => report.missing.length > 0)
+    .map((report) => `  -> Warning: ${report.packageName} staged without files[] entries missing from this checkout: ${report.missing.join(", ")}`);
+}
+
+// Reads the --json report prepare-bundled-package.mjs writes to stdout. Anything
+// unparseable is reported as a skipped entry for every declared files[] value
+// rather than being dropped, so a change to the script's output shape can only
+// make this noisier, never quieter than the package really is.
+export function parseStagedPackageReport(stdout: string, fallbackName: string | undefined, declaredEntries: string[] = []): { packageName: string; missing: string[] } {
+  const packageName = fallbackName ?? "workspace package";
+  for (const line of stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) continue;
+    try {
+      const parsed = JSON.parse(trimmed) as { name?: unknown; missing?: unknown };
+      if (!Array.isArray(parsed.missing)) continue;
+      return {
+        packageName: typeof parsed.name === "string" && parsed.name ? parsed.name : packageName,
+        missing: parsed.missing.filter((entry): entry is string => typeof entry === "string"),
+      };
+    } catch {
+      continue;
+    }
+  }
+  return { packageName, missing: declaredEntries };
+}
 
 export async function runCommandWithDiagnostics(
   file: string,
@@ -278,20 +347,62 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
     await runCommand("corepack", ["pnpm", "install", "--frozen-lockfile"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("bash", ["scripts/build-npm.sh", "--skip-checks", "--skip-typecheck"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
     await runCommand("corepack", ["pnpm", "-r", "--filter", "@paperclipai/server...", "--if-present", "run", "build"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-    const metadata = JSON.parse(fs.readFileSync(path.join(checkoutPath, "cli", "package.json"), "utf8")) as { version: string };
+    // The server build above never touches ui/, so server/ui-dist does not exist
+    // yet. scripts/release.sh prepares it (and copies skills/ into the packages
+    // that ship it) before packaging; without the same step here, a staged
+    // @paperclipai/server has no UI and no skills, and the installed control
+    // plane serves an API with no board. The package set is derived from the
+    // release manifest rather than listed by hand, because a package that
+    // declares "skills" in files[] and is missed here ships without skills and
+    // `pnpm pack` does not fail on the omission. Existing directories are left
+    // alone so a package with committed skills keeps its own copy.
+    await runCommand("bash", ["scripts/prepare-server-ui-dist.sh"], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
+    for (const pkgDir of resolveGitInstallSkillPackageDirs(checkoutPath)) {
+      const skillsSource = path.join(checkoutPath, "skills");
+      const skillsTarget = path.join(checkoutPath, pkgDir, "skills");
+      if (!fs.existsSync(skillsSource) || fs.existsSync(skillsTarget)) continue;
+      fs.cpSync(skillsSource, skillsTarget, { recursive: true });
+    }
+    // scripts/release.sh does this in "Step 3/7: Rewriting workspace versions",
+    // after the build and before packaging, and a git install had no equivalent.
+    // prepare-bundled-package.mjs expands `workspace:*` to the *containing*
+    // package's version, so with the repo's real versions the staged server
+    // declared @paperclipai/plugin-sdk@<server version> while the staged
+    // plugin-sdk tarball carried its own version, and the payload install died
+    // with `npm error code ETARGET No matching version found`. Pinning the
+    // checkout to the CLI's own version makes every staged package agree.
+    const cliPackageJsonPath = path.join(checkoutPath, "cli", "package.json");
+    const checkoutVersion = (JSON.parse(fs.readFileSync(cliPackageJsonPath, "utf8")) as { version: string }).version;
+    await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "release-package-map.mjs"), "set-version", checkoutVersion], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 4 * 1024 * 1024 });
+    const metadata = JSON.parse(fs.readFileSync(cliPackageJsonPath, "utf8")) as { version: string };
     const workspacePackages = resolveGitInstallWorkspacePackages(checkoutPath);
+    const skippedFilesReports: { packageName: string; missing: string[] }[] = [];
     for (const [index, workspacePackage] of workspacePackages.entries()) {
       const packageDir = path.join(checkoutPath, workspacePackage.dir);
-      const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { bundleDependencies?: string[]; bundledDependencies?: string[] };
+      const packageJson = JSON.parse(fs.readFileSync(path.join(packageDir, "package.json"), "utf8")) as { name?: string; files?: string[]; bundleDependencies?: string[]; bundledDependencies?: string[] };
       const bundledDependencies = packageJson.bundleDependencies ?? packageJson.bundledDependencies ?? [];
       if (bundledDependencies.length > 0) {
         const stagedPackage = path.join(stagingRoot, `workspace-package-${index}`);
-        await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
-        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
+        // --ignore-scripts matches scripts/release.sh: the staged package is a
+        // build output, and its prepack/postpack reference repo-relative scripts
+        // (../scripts/...) that staging never copies, so running them here fails
+        // with exit 127 instead of producing a tarball. It also stops the
+        // server's `postpack: rm -rf ui-dist` from deleting the artifact back out
+        // of the staging directory, which is what makes the presence check below
+        // meaningful.
+        //
+        // --json is captured rather than discarded: the staged package can be
+        // missing a files[] entry, and an install that quietly shipped a
+        // package without a declared file is the failure mode this whole change
+        // exists to prevent.
+        const prepareResult = await runCommand(process.execPath, [path.join(checkoutPath, "scripts", "prepare-bundled-package.mjs"), packageDir, stagedPackage, "--json"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 32 * 1024 * 1024 });
+        skippedFilesReports.push(parseStagedPackageReport(prepareResult.stdout, packageJson.name, packageJson.files ?? []));
+        await runCommand("npm", ["pack", stagedPackage, "--pack-destination", stagingRoot, "--ignore-scripts"], { cwd: checkoutPath, env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
       } else {
         await runCommand("corepack", ["pnpm", "--dir", workspacePackage.dir, "pack", "--pack-destination", stagingRoot], { cwd: checkoutPath, env: buildEnv({ PAPERCLIP_RELEASE_REUSE_UI_DIST: "1" }), maxBuffer: 32 * 1024 * 1024 });
       }
     }
+    for (const line of formatSkippedFilesReport(skippedFilesReports)) console.log(line);
     await runCommand("npm", ["pack", "--pack-destination", stagingRoot], { cwd: path.join(checkoutPath, "cli"), env: buildEnv(), maxBuffer: 16 * 1024 * 1024 });
     const tarballs = fs.readdirSync(stagingRoot).filter((entry) => entry.endsWith(".tgz"));
     const cliTarball = tarballs.find((entry) => entry === `paperclipai-${metadata.version}.tgz`);
@@ -300,6 +411,20 @@ export async function installGitPayload(repo: string, sha: string, runCommand: C
       throw new Error(`Git install packaging produced ${workspaceTarballs.length} workspace tarballs; expected ${workspacePackages.length}.`);
     }
     await runCommand("npm", ["install", "--prefix", stagedPayload, path.join(stagingRoot, cliTarball), ...workspaceTarballs.map((entry) => path.join(stagingRoot, entry)), "--no-audit", "--no-fund"], { cwd: stagingRoot, maxBuffer: 32 * 1024 * 1024 });
+    // @paperclipai/server is the only package with bundleDependencies, so it is
+    // the only one that takes the prepare-bundled-package branch. Report that
+    // branch explicitly and refuse to publish a payload whose server package has
+    // no ui-dist: the install would succeed and then serve an API with no board,
+    // which is a worse failure than the crash this replaced.
+    const serverEntries = describePackagedWorkspaceEntries(stagedPayload, "@paperclipai/server", ["ui-dist", "skills"]);
+    console.log(
+      `  -> @paperclipai/server staged via prepare-bundled-package (bundleDependencies): ui-dist=${serverEntries["ui-dist"] ? "present" : "MISSING"}, skills=${serverEntries.skills ? "present" : "MISSING"}`,
+    );
+    if (!serverEntries["ui-dist"]) {
+      throw new Error(
+        "Staged @paperclipai/server has no ui-dist, so the installed control plane would serve no UI. This is a packaging defect, not an install error.",
+      );
+    }
     await smokePayload(stagedPayload, metadata.version, runCommand);
     fs.renameSync(stagedPayload, payloadPath);
     return { payloadPath, reused: false, version: metadata.version };
@@ -375,7 +500,7 @@ export async function installCommand(
       const oldTarget = fs.existsSync(paths.currentPath) ? fs.readlinkSync(paths.currentPath) : null;
       flipCurrentAtomic(payload.payloadPath, paths);
       try { writeInstallManifestAtomic(nextManifest, paths); } catch (error) { if (oldTarget) flipCurrentAtomic(path.resolve(paths.cliRoot, oldTarget), paths); else fs.rmSync(paths.currentPath, { force: true }); throw error; }
-      writeManagedShim(paths); pruneInstallPayloads(nextManifest, paths); return payload;
+      writeManagedShim(paths); migrateManagedSkillLinks(nextManifest, paths); pruneInstallPayloads(nextManifest, paths); return payload;
     }, paths);
     await ensureShimOnPath(options);
     console.log(pc.green(`${installed.reused ? "Activated cached" : "Installed"} paperclipai git payload ${sha.slice(0, 12)}.`));
@@ -409,6 +534,7 @@ export async function installCommand(
       throw error;
     }
     writeManagedShim(paths);
+    migrateManagedSkillLinks(nextManifest, paths);
     pruneInstallPayloads(nextManifest, paths);
     return payload;
   }, paths);

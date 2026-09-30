@@ -62,4 +62,27 @@ describe("heartbeat task drain", () => {
     expect(status.quiescent).toBe(true);
   });
 
+  // Regression for the shutdown admission close (KEE-1149). The shutdown path
+  // engages this drain with no TTL and must keep it for the whole teardown. A
+  // TTL here would lift the drain in the middle of a long run drain and let a
+  // still-in-flight scheduler sweep claim a run that is in neither the
+  // shutdown snapshot nor the drain's selected set, which is the exact race
+  // the drain exists to prevent. The state is process memory, so it cannot
+  // outlive the process and needs no expiry.
+  it("a_shutdown_drain_never_expires_mid_drain", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"));
+    startTaskDrain();
+    expect(getTaskDrainStatus().expiresAt).toBeNull();
+
+    // Well past the 5 minutes the old fix allowed, and past a plausible
+    // worst-case drain, admission must still be held.
+    vi.setSystemTime(new Date("2026-01-01T00:30:00.000Z"));
+    expect(resolveHeartbeatSchedulingSuppression({})).toEqual({
+      suppressed: true,
+      reason: "task_drain",
+    });
+    expect(getTaskDrainStatus().draining).toBe(true);
+  });
+
 });

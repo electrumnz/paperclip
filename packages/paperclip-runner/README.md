@@ -56,6 +56,19 @@ stdin/stdout bridge admits the pinned Claude and Codex ACPX profiles. It
 validates the exact model, session identity, tool catalog, structured input,
 and terminal settlement at the process boundary. Pi remains unavailable.
 
+Remote Codex sessions relay assigned app tools through the server's configured
+gateway. Small catalogs are sent directly. When a catalog would exceed the
+runner's 256-operation or 768 KiB contract limit, the server exposes
+`paperclip_search_assigned_tools` and `paperclip_call_assigned_tool` instead.
+Search returns bounded pages of names, descriptions, and input schemas. Each
+page intersects the session's pinned assignments with current gateway grants.
+An individual schema that exceeds a page returns an `inputSchemaRef`. The same
+search tool retrieves that schema in chunks via `schemaTool` and
+`schemaOffset`; discovery can continue past the large tool.
+Calls retain task ownership, work-mode restrictions, gateway authorization,
+approvals, and audit. Core task tools and the runner's completion tools keep
+their reserved space; no assigned tools are silently removed to fit the limit.
+
 Native Claude skill assignments travel in the runtime-context snapshot through
 runnerd to the ACPX sidecar. After acquiring the provider lifetime lease, the
 host materializes the assigned bundles under the isolated Claude home's
@@ -364,7 +377,7 @@ recorded lab unless `--force` is also supplied.
 | `test:sdk`                                              | Run targeted browser-client, reducer-projection, and React component contract tests.                                                        |
 | `test:browser:sdk`                                      | Exercise both consumers with the fake driver, keyboard/a11y checks, reconnect/replay, measurements, and screenshots.                        |
 | `record:sdk:codex`                                      | Run both public consumers against a safe real Codex session and capture live screenshots.                                                   |
-| `check:capability-contract`                             | Verify the generated capability, legacy MCP, and eval traceability contract.                                                                |
+| `check:capability-contract`                             | Verify the `generated/capability/` contract, legacy MCP, and eval traceability outputs. See [Capability drift gates](#capability-drift-gates) for the gate that covers `docs/` and `spec/`. |
 | `check:semantic-contracts`                              | Verify the provider-neutral semantic tool contract is current.                                                                              |
 | `trace:live-runner`                                     | Run the real runnerd/Codex semantic loop against the mock control plane.                                                                    |
 | `demo:scenarios`                                        | Start the Capability scenario explorer over the mock control plane on `127.0.0.1:4183`.                                                     |
@@ -375,6 +388,53 @@ recorded lab unless `--force` is also supplied.
 | `test:browser`                                          | Exercise static replay and live scenarios, then capture temporary screenshots under ignored test output.                                    |
 | `verify`                                                | Run the complete deterministic Conformance through SDK acceptance sequence.                                                                 |
 | `verify:rootless`                                       | Extract Debian/Ubuntu browser libraries without root, then run `verify`.                                                                    |
+
+## Capability drift gates
+
+The capability contract has **11 derived files across 4 trees**, and no single command checks all of them:
+
+| Artefact                                       | Files | Written by                      | Checked by                   |
+| ---------------------------------------------- | ----: | ------------------------------- | ---------------------------- |
+| `generated/capability/capabilities.yaml`       | 1     | `generate:capability-contract`  | `check:capability-contract`  |
+| `generated/capability/mcp-tool-map.yaml`       | 1     | `generate:capability-contract`  | `check:capability-contract`  |
+| `generated/capability/eval-traceability.yaml`  | 1     | `generate:capability-contract`  | `check:capability-contract`  |
+| `generated/capability/capability-contract.md`  | 1     | `generate:capability-contract`  | `check:capability-contract`  |
+| `generated/capability/downstream-handoff.md`   | 1     | `generate:capability-contract`  | `check:capability-contract`  |
+| `generated/capability/semantic-tool-contracts.json` | 1 | `generate:semantic-contracts`   | `check:semantic-contracts`   |
+| `spec/capability/*.yaml`                       | 3     | `generate:capability-inventory` | `check:capability-inventory` |
+| `docs/capability-contract.md`                  | 1     | `generate:capability-inventory` | `check:capability-inventory` |
+| `src/generated/capability-contract.ts`         | 1     | `generate:capability-inventory` | `check:capability-inventory` |
+
+`check:capability-contract` is blind to `docs/`, `spec/` and `semantic-tool-contracts.json`; `check:capability-inventory` is
+blind to `generated/capability/`. That split is deliberate: the generators have different inputs, and each gate re-renders
+only what its own generator owns. **Run all three** to prove the contract is current:
+
+```sh
+pnpm check:capability-contract
+pnpm check:capability-inventory
+pnpm check:semantic-contracts
+```
+
+All three run in CI as part of this package's `build`, so a stale artefact in any of the 11 files fails the required
+`build` job. `check:semantic-contracts` is the slowest of the three because it compiles TypeScript first, and it also
+guards `protocol/manifest.json` and `protocol/fixtures/evals/native-execution-seeded.json`.
+
+This matters most after a rebase that shifts `packages/mcp-server/src/tools.ts` line numbers, because every MCP
+`sourceAnchor` embeds that line number. The files go stale in a fixed order:
+
+1. `generated/capability/mcp-tool-map.yaml` (anchors like `tools.ts#L300`) and `spec/capability/mcp-tool-map.yaml`
+   (anchors like `tools.ts:300`). `check:capability-inventory` reports each as `legacyMcpAliases:<id> has stale
+   sourceAnchor`.
+2. `docs/capability-contract.md` next, and only once `spec/` has been regenerated to match — it embeds the anchors that
+   `spec/` supplies, so it is still correct while `spec/` is stale.
+3. `src/generated/capability-contract.ts` never goes stale from a line shift. It carries no `sourceAnchor` and re-renders
+   byte-identical against a shifted source; it can only drift if the inventory schema or row content changes.
+
+Regenerate rather than hand-editing any of these.
+
+To regenerate, note that `generate:capability-inventory` needs the Paperclip Evals corpus, which is a separate
+repository. Set `PAPERCLIP_EVALS_ROOT` to its `paperclip-skill-optimization` directory if it is not checked out
+alongside this one. None of the three `check:` gates need it.
 
 ## Navigate
 

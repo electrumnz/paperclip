@@ -3854,10 +3854,10 @@ registry.registerPath({
   tags: ["issues"],
   summary: "Update an issue",
   description:
-    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads.",
+    "When posting a comment, attachmentIds selects up to 20 unique uploaded attachments from this exact task and company. The comment, attachment binding, and issue update commit atomically. attachmentIds without a comment is rejected; Markdown links alone do not bind uploads. The body is validated strictly: an unrecognised key is rejected with 400 and named in the error details rather than being silently ignored, so a misspelled field (for example assigneeId, which does not exist; use assigneeAgentId or assigneeUserId) cannot return a success that wrote no data.",
   request: {
     params: z.object({ id: z.string() }),
-    body: jsonBody(updateIssueSchema.partial()),
+    body: jsonBody(updateIssueSchema.partial().strict()),
   },
   responses: {
     200: r.ok(),
@@ -4870,6 +4870,31 @@ registry.registerPath({
   summary: "Delete a secret",
   request: { params: z.object({ id: z.string() }) },
   responses: { 200: r.ok(), 401: r.unauthorized },
+});
+
+registry.registerPath({
+  method: "delete",
+  path: "/api/secrets/{secretId}/bindings/{bindingId}",
+  tags: ["secrets"],
+  summary: "Revoke a single secret binding",
+  description:
+    "Removes the secret ref at the binding's configPath from the target's adapterConfig and " +
+    "writes it through the normal config-revision path, so the binding-row projection " +
+    "reconciles and the secret stops projecting into the target's runtime. Only targetType " +
+    "\"agent\" is supported today; other target types return 422. Returns 409 if the value " +
+    "currently at the binding's configPath is no longer a secret_ref for this secret " +
+    "(config changed since the binding was read).",
+  request: {
+    params: z.object({ secretId: z.string(), bindingId: z.string() }),
+  },
+  responses: {
+    200: r.ok(),
+    401: r.unauthorized,
+    403: r.forbidden,
+    404: r.notFound,
+    409: r.conflict,
+    422: r.unprocessable,
+  },
 });
 
 registry.registerPath({

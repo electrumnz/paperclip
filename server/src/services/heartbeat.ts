@@ -36,6 +36,7 @@ import {
 } from "./adapter-execution-control.js";
 import { executionFailureRetryCount, executionRetryAttemptCount, accountingForScheduledRetry } from "./execution-recovery-attempt.js";
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
+import { boardDescriptorForBlock } from "./recovery/blocked-descriptor.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { buildExecutionContinuation, StaleExecutionContinuationError } from "./execution-continuation.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
@@ -260,7 +261,7 @@ import {
   providerTraceStore,
   PROVIDER_TRACE_MAX_BYTES,
 } from "./provider-trace-store.js";
-import { getServerAdapter, runningProcesses } from "../adapters/index.js";
+import { getServerAdapter, readProcessGroupIdFromProc, runningProcesses, sweepRunDescendantsByRunId } from "../adapters/index.js";
 import type {
   AdapterExecutionResult,
   AdapterInvocationMeta,
@@ -407,6 +408,7 @@ import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "./issue-dependency-wakeups.
 import {
   buildIssueMonitorClearedPatch,
   buildIssueMonitorTriggeredPatch,
+  hasClearedIssueMonitor,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
 } from "./issue-execution-policy.js";
@@ -1468,6 +1470,9 @@ const FORBIDDEN_ENV_BINDING_KEYS = new Set([
   "PAPERCLIP_GITHUB_BROKER_URL",
   "PAPERCLIP_GITHUB_BRIDGE_TOKEN",
   "PAPERCLIP_GITHUB_LAUNCHER_DIR",
+  // Runtime-resolved. A binding may point gh at a directory with no hosts.yml,
+  // which makes gh report "not logged into any GitHub hosts" for a valid token.
+  "GH_CONFIG_DIR",
 ]);
 const MANAGED_GITHUB_TOKEN_KEYS = new Set([
   "GH_TOKEN",
@@ -6919,11 +6924,13 @@ export function shouldAutoCheckoutIssueForWake(input: {
   issueStatus: string | null;
   issueAssigneeAgentId: string | null;
   issueExecutionState?: unknown;
+  issueUnblockDescriptor?: unknown;
   isDependencyReady: boolean;
   agentId: string;
 }) {
   if (input.issueAssigneeAgentId !== input.agentId) return false;
   if (!input.isDependencyReady) return false;
+  if (input.issueUnblockDescriptor != null) return false;
   const executionState = parseIssueExecutionState(input.issueExecutionState);
   if (executionState?.status === "pending") return false;
 
@@ -6939,6 +6946,7 @@ export function shouldAutoCheckoutIssueForWake(input: {
 
   const wakeReason = readNonEmptyString(input.contextSnapshot?.wakeReason);
   if (!wakeReason) return false;
+  if (wakeReason === "issue_unblock_requested") return false;
   if (wakeReason === "issue_comment_mentioned") return false;
   if (wakeReason === "source_scoped_recovery_action") return false;
   if (wakeReason.startsWith("execution_")) return false;
@@ -8038,7 +8046,24 @@ export async function buildPaperclipWakePayload(input: {
           notice: externalAttachmentOmissionNotice(omission),
         }))
     : [];
+  const unblockDescriptor = parseObject(
+    input.contextSnapshot.unblockDescriptor,
+  );
+  const unblockAction = readNonEmptyString(
+    input.contextSnapshot.unblockAction,
+  );
   const payload = {
+    // Binding hold instructions intentionally lead the wake payload so the
+    // named owner sees the required action before the ordinary wake context.
+    ...(unblockAction
+      ? {
+          unblockAction,
+          unblockDescriptor:
+            Object.keys(unblockDescriptor).length > 0
+              ? unblockDescriptor
+              : null,
+        }
+      : {}),
     reason: readNonEmptyString(input.contextSnapshot.wakeReason),
     executionContinuation: input.contextSnapshot.executionContinuation ?? null,
     attachmentOmissions,
@@ -8886,31 +8911,151 @@ export async function persistHeartbeatRunProcessMetadata(
   });
 }
 
-async function terminateHeartbeatRunProcess(input: {
+// Cancellation of a run must reach the whole run, not just the processes still
+// in the run's process group.
+//
+// `runChildProcess` spawns detached, so the direct child leads a process group,
+// and signalling `-processGroupId` only reaches that group. Tool commands break
+// it: a `timeout`-wrapped command (`timeout 900 pnpm --filter server exec vitest
+// ...`) makes `timeout` place its payload in a NEW process group via
+// `setpgid(0, 0)` — same session, different group — so the payload and everything
+// it spawns (pnpm, tsc, vitest, embedded postgres fixtures) sit outside the run's
+// group and survive the group signal.
+//
+// The comment above the codex_local SIGINT special case below records the same
+// failure mode being worked around for one adapter only. This is the general
+// fix: `PAPERCLIP_RUN_ID` is assigned to the run's child and inherited by every
+// descendant regardless of which process group it ended up in, so sweeping by
+// run id reaches whatever the group signal missed.
+//
+// The run id is required rather than optional so no caller can silently take the
+// group-only path that leaves descendants behind.
+// Exported for the regression test that proves cancellation reaches descendants
+// outside the run's process group. Not part of the service surface: callers
+// inside this module use it directly, and `heartbeatService(...).cancelRun` is
+// the supported entry point.
+export async function terminateHeartbeatRunProcess(input: {
+  runId: string;
   pid: number | null | undefined;
   processGroupId: number | null | undefined;
   graceMs?: number;
   signal?: NodeJS.Signals;
+  /**
+   * Pids the run owns and that must SURVIVE this cleanup, even though they carry
+   * the run id in their environment.
+   *
+   * This is the adapter's own live child. Session-shaped adapters (`claude_local`
+   * with the ACP engine, `codex_local`, and the sessioned local adapters generally)
+   * keep one long-lived process across a stop: the ACP fixture in
+   * `scripts/mcp-fixtures/servers/acp-stop-agent.mjs` writes a `continued` marker
+   * on `session/cancel` and stays alive expecting a later `session/prompt` on the
+   * SAME process. Killing it is indistinguishable, from the next run's point of
+   * view, from an agent that never started -- the follow-up run then has nothing
+   * to talk to and simply never produces a message.
+   *
+   * The group signal above deliberately stops the run's work; this preserves the
+   * session carrier itself. The two are different lifetimes and were previously
+   * conflated because the sweep inferred ownership from `pid`, which is null on
+   * the no-registry path.
+   *
+   * Preservation is a SWEEP concern only. The caller must still pass `pid: null`
+   * and `processGroupId: null` on the no-registry path, so the group signal stays
+   * silent: a persisted pid with no live registry entry is deliberately not
+   * signalled (`heartbeat-process-recovery.test.ts`, "does not signal an unowned
+   * persisted process"). Feeding the run's recorded group in as `processGroupId`
+   * re-arms that signal and fails those three tests.
+   */
+  preservePids?: number[];
 }) {
   const pid = input.pid ?? null;
   const processGroupId = input.processGroupId ?? null;
-  if (typeof pid !== "number" && typeof processGroupId !== "number") return;
 
-  await terminateLocalService(
-    {
-      pid:
-        typeof pid === "number" && Number.isInteger(pid) && pid > 0
-          ? pid
-          : (processGroupId ?? 0),
-      processGroupId:
-        typeof processGroupId === "number" &&
-        Number.isInteger(processGroupId) &&
-        processGroupId > 0
-          ? processGroupId
-          : null,
-    },
-    { forceAfterMs: input.graceMs, signal: input.signal },
-  );
+  // The process-group signal is best effort. The run-id sweep below is not, and
+  // it must run even when there is no process to signal at all.
+  //
+  // This is the orphan case: the run's own process and its group are already
+  // gone -- a crash, the oomd kill, or a registry entry that never existed
+  // because the run never registered a local child -- while a `timeout`-wrapped
+  // or login-shell descendant still carries the run id and is still holding
+  // memory. Returning early on absent pid/group left exactly those holding
+  // memory, because there was no process group left for the group signal to
+  // reach. Cleanup must not depend on main-process liveness.
+  if (typeof pid === "number" || typeof processGroupId === "number") {
+    await terminateLocalService(
+      {
+        pid:
+          typeof pid === "number" && Number.isInteger(pid) && pid > 0
+            ? pid
+            : (processGroupId ?? 0),
+        processGroupId:
+          typeof processGroupId === "number" &&
+          Number.isInteger(processGroupId) &&
+          processGroupId > 0
+            ? processGroupId
+            : null,
+      },
+      { forceAfterMs: input.graceMs, signal: input.signal },
+    );
+  }
+
+  // Companion to the group signal: catch descendants that a `timeout`-wrapped tool
+  // command moved into a process group of their own. Best effort, and it runs
+  // after the group signal so a sweep failure can never turn a successful
+  // cancellation into a failure.
+  //
+  // The exclusion set is explicit and is the union of:
+  //   - this process, which the helper always adds;
+  //   - the run's own child when the caller has one, which the group signal
+  //     above already owned;
+  //   - `preservePids`, the session carriers that must outlive the stop.
+  //
+  // Note what is NOT here: any inference about which pids "belong" to the run
+  // based on liveness or on the presence of a registry entry. On the no-registry
+  // path `pid` is null, and inferring ownership from it silently widened the
+  // sweep to the run's live session process -- which is what broke
+  // `tests/e2e/acp-stop-continuation.spec.ts`.
+  //
+  // Attribution is the run id in the environment, which is host-local by
+  // construction: a remote run's processes do not carry this server's run id, so
+  // the sweep cannot reach across a remote boundary even if one were passed here.
+  try {
+    const exclude = new Set<number>(input.preservePids ?? []);
+    if (typeof pid === "number" && Number.isInteger(pid) && pid > 0) {
+      exclude.add(pid);
+    }
+    // Preserve the group of every preserved pid, not only a group passed in
+    // separately.
+    //
+    // A session carrier is a supervisor (`timeout`, a wrapper, a login shell)
+    // whose payload shares ITS OWN process group. A warm-reused persistent ACP
+    // session reports exactly this shape: `acpx-engine/execute.ts:4485-4489`
+    // calls onSpawn with the session pid and `processGroupId: null`, because the
+    // session was not spawned by this run. With no group on the run record there
+    // is nothing to preserve, so the sweep signals the payload and the
+    // supervisor dies transitively -- measured: `timeout 30 sleep 30`, SIGKILL
+    // on the `sleep` alone, reports the `timeout` as Killed.
+    //
+    // So the preserved pids' own groups are resolved here, which covers the
+    // null-group case as well as a recorded one.
+    const preserveGroups = new Set<number>();
+    for (const preserved of exclude) {
+      const groupId = readProcessGroupIdFromProc(preserved);
+      if (groupId !== null) preserveGroups.add(groupId);
+    }
+    if (
+      typeof processGroupId === "number" &&
+      Number.isInteger(processGroupId) &&
+      processGroupId > 0
+    ) {
+      preserveGroups.add(processGroupId);
+    }
+    sweepRunDescendantsByRunId(input.runId, input.signal ?? "SIGKILL", {
+      excludePids: [...exclude],
+      preserveProcessGroupIds: [...preserveGroups],
+    });
+  } catch {
+    // Never turn a successful cancellation into a reported failure.
+  }
 }
 
 function buildProcessLossMessage(
@@ -10651,6 +10796,7 @@ export function heartbeatService(
         assigneeAdapterOverrides: issues.assigneeAdapterOverrides,
         executionPolicy: issues.executionPolicy,
         executionState: issues.executionState,
+        unblockDescriptor: issues.unblockDescriptor,
         executionWorkspaceSettings: issues.executionWorkspaceSettings,
         parentId: issues.parentId,
         createdByUserId: issues.createdByUserId,
@@ -15113,9 +15259,26 @@ export function heartbeatService(
         }
         if (running) {
           await terminateHeartbeatRunProcess({
+            runId: run.id,
             pid: running.child.pid,
             processGroupId: running.processGroupId,
+            // The live child is the session carrier and must survive the stop;
+            // the group signal above already ended the run's work.
+            preservePids: typeof running.child.pid === "number" ? [running.child.pid] : [],
             graceMs: Math.max(1, running.graceSec) * 1000,
+          });
+        } else {
+          // Shutdown must not strand a `timeout`-wrapped descendant just because
+          // the registry has no entry for this run.
+          await terminateHeartbeatRunProcess({
+            runId: run.id,
+            pid: null,
+            processGroupId: null,
+            // Preserve the run's session carrier; see the single-run path.
+            preservePids: [run.processPid].filter(
+              (value): value is number =>
+                typeof value === "number" && Number.isInteger(value) && value > 0,
+            ),
           });
         }
       } finally {
@@ -16754,24 +16917,96 @@ export function heartbeatService(
     return cancelled;
   }
 
+  // A timer wake is worth its cost if ANY assigned candidate is actionable.
+  // Pulling every candidate's execution policy and execution state into one
+  // `jsonb_agg` scaled the result set with the company's whole backlog, on the
+  // hot path of every timer tick, for a yes/no answer. A bounded existence
+  // query answers the common case, and the keyset-paged scan below preserves
+  // correctness past the first page: if a candidate on a later page is
+  // actionable while the first page is entirely cleared monitors, this must
+  // still return true.
   async function hasActionableTimerWork(agent: typeof agents.$inferSelect) {
-    const row = await db
+    const timerCandidateCondition = () =>
+      and(
+        eq(issues.companyId, agent.companyId),
+        eq(issues.assigneeAgentId, agent.id),
+        isNull(issues.assigneeUserId),
+        isNull(issues.hiddenAt),
+        inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
+        isNull(issues.conversationAgentId),
+        nonIdleSlackIssueCondition(),
+      );
+
+    const todo = await db
       .select({ id: issues.id })
       .from(issues)
       .where(
         and(
-          eq(issues.companyId, agent.companyId),
-          eq(issues.assigneeAgentId, agent.id),
-          isNull(issues.assigneeUserId),
-          isNull(issues.hiddenAt),
-          inArray(issues.status, [...TIMER_ACTIONABLE_ISSUE_STATUSES]),
-          isNull(issues.conversationAgentId),
-          nonIdleSlackIssueCondition(),
+          timerCandidateCondition(),
+          eq(issues.status, "todo"),
         ),
       )
-      .limit(1)
-      .then((rows) => rows[0] ?? null);
-    return Boolean(row);
+      .limit(1);
+    if (todo[0]) return true;
+
+    // A monitor that is still scheduled, or a policy that still declares a
+    // monitor, is the durable wait path. This mirrors `hasClearedIssueMonitor`
+    // clause for clause, and it must stay conservative in the one direction that
+    // matters: a row this query calls actionable is one the JS function would
+    // also call actionable, so the early return can never invent work. The
+    // residual disagreement (a `cleared` monitor that still carries a
+    // `nextCheckAt`, which the JS function treats as actionable) can only make
+    // this query miss a row, and the keyset scan below re-checks every
+    // candidate with the authoritative JS function. `jsonb_typeof` is what
+    // makes the policy clause exact: the JS accepts a monitor only when it is a
+    // non-array object, and `is not null` would also accept a scalar.
+    const actionableInProgress = and(
+      timerCandidateCondition(),
+      eq(issues.status, "in_progress"),
+      or(
+        isNotNull(issues.monitorNextCheckAt),
+        sql`jsonb_typeof(${issues.executionPolicy} -> 'monitor') = 'object'`,
+        sql`(${issues.executionState} -> 'monitor' ->> 'status') is distinct from 'cleared'`,
+      ),
+    );
+
+    const [actionableRow] = await db
+      .select({ id: issues.id })
+      .from(issues)
+      .where(actionableInProgress)
+      .limit(1);
+    if (actionableRow) return true;
+
+    // Only now is the bounded answer inconclusive: either the page held no
+    // in_progress candidates at all, or every one of them is a cleared-monitor
+    // strand. Walk the remaining candidates in bounded keyset pages so a
+    // backlog larger than one page still cannot hide actionable work.
+    const PAGE_SIZE = 100;
+    let cursor: string | null = null;
+    for (;;) {
+      const page = await db
+        .select({
+          id: issues.id,
+          monitorNextCheckAt: issues.monitorNextCheckAt,
+          executionPolicy: issues.executionPolicy,
+          executionState: issues.executionState,
+        })
+        .from(issues)
+        .where(
+          and(
+            timerCandidateCondition(),
+            eq(issues.status, "in_progress"),
+            cursor ? gt(issues.id, cursor) : undefined,
+          ),
+        )
+        .orderBy(asc(issues.id))
+        .limit(PAGE_SIZE);
+
+      const actionable = page.some((row) => !hasClearedIssueMonitor(row));
+      if (actionable) return true;
+      if (page.length < PAGE_SIZE) return false;
+      cursor = page[page.length - 1]!.id;
+    }
   }
 
   async function markTimerHeartbeatChecked(
@@ -17157,6 +17392,7 @@ export function heartbeatService(
   async function claimQueuedRun(
     run: typeof heartbeatRuns.$inferSelect,
     companyAgents?: AgentOrgRow[],
+    cancelledBeforeClaim?: Array<typeof heartbeatRuns.$inferSelect>,
   ) {
     if (run.status !== "queued") return run;
     const agent = await getAgent(run.agentId);
@@ -17269,6 +17505,52 @@ export function heartbeatService(
         return null;
       }
 
+      const bindingIssue = await getIssueExecutionContext(run.companyId, issueId);
+      const bindingWakeReason = readNonEmptyString(context.wakeReason);
+      const bindingOwner = bindingIssue?.unblockDescriptor?.owner;
+      const isNamedAgentUnblockWake =
+        bindingWakeReason === "issue_unblock_requested" &&
+        typeof bindingOwner === "object" &&
+        "agentId" in bindingOwner &&
+        bindingOwner.agentId === run.agentId;
+      // Same exemption as the wake-time gate: a hold that requires the stopped
+      // run to be reconciled must not cancel the reconciled continuation. The
+      // stored `wakeReason` is only trusted together with the recovery action
+      // id and the reconciliation source stamp, all written by the delivery
+      // path itself rather than by a caller.
+      const isReconciledContinuation =
+        bindingWakeReason === "issue_recovery_action_restored" &&
+        context.source === "execution.reconciled" &&
+        isUuidLike(readNonEmptyString(context.recoveryActionId) ?? "");
+      if (
+        bindingIssue?.unblockDescriptor &&
+        !isNamedAgentUnblockWake &&
+        !isReconciledContinuation
+      ) {
+        await cancelRunInternal(
+          run.id,
+          "Cancelled because issue is held by a binding unblock descriptor",
+        );
+        await logActivity(db, {
+          companyId: run.companyId,
+          actorType: "system",
+          actorId: "system",
+          agentId: run.agentId,
+          runId: run.id,
+          action: "issue.unblock_hold_run_skipped",
+          entityType: "heartbeat_run",
+          entityId: run.id,
+          issueId,
+          details: {
+            issueId,
+            requestedReason: bindingWakeReason,
+            unblockDescriptor: bindingIssue.unblockDescriptor,
+            source: "heartbeat.claim_queued_run",
+          },
+        });
+        return null;
+      }
+
       const dependencyReadiness = await issuesSvc.listDependencyReadiness(
         run.companyId,
         [issueId],
@@ -17301,6 +17583,10 @@ export function heartbeatService(
       });
       if (staleness.outcome === "cancelled") {
         applyRunDispatchPostCommitEffects(staleness.postCommitEffects);
+        // A stale queued successor may have held back the new assignee's
+        // deferred wake. It has no executor/finally block to drain that queue.
+        if (cancelledBeforeClaim) cancelledBeforeClaim.push(run);
+        else await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true });
         logger.info(
           { runId: run.id, issueId, errorCode: staleness.errorCode },
           "claimQueuedRun: cancelled stale queued run",
@@ -19405,6 +19691,70 @@ export function heartbeatService(
         logger.warn({ err, queueId: wake.id }, "failed to resume interrupted comment queue");
       });
     }
+    // A stale queued cancellation can leave a new assignee's assignment wake
+    // deferred if its post-lock promotion fails. Retry only the exact source
+    // run stored in that wake. The promotion transaction clears the issue
+    // execution lock and claims the wake by compare-and-set, so a retry after
+    // an ambiguous commit cannot create a second run.
+    const strandedAssignmentHandoffs = await db
+      .select({
+        wakeId: agentWakeupRequests.id,
+        companyId: agentWakeupRequests.companyId,
+        sourceRunId: sql<string>`${agentWakeupRequests.payload}->>'deferredByRunId'`,
+      })
+      .from(agentWakeupRequests)
+      .innerJoin(issues, and(
+        eq(issues.companyId, agentWakeupRequests.companyId),
+        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        eq(issues.assigneeAgentId, agentWakeupRequests.agentId),
+        // A failed promotion rolls back the lock release with it, so the issue
+        // still points at the very source run this wake is waiting on. Accept
+        // that exact stale lock as well as a free one, and never treat a lock
+        // held by any other run as a candidate.
+        or(
+          isNull(issues.executionRunId),
+          sql`${issues.executionRunId}::text = ${agentWakeupRequests.payload}->>'deferredByRunId'`,
+        ),
+      ))
+      .innerJoin(companies, and(
+        eq(companies.id, issues.companyId),
+        eq(companies.status, "active"),
+      ))
+      .where(and(
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        eq(agentWakeupRequests.source, "assignment"),
+        sql`${agentWakeupRequests.payload}->>'deferredByRunId' is not null`,
+        sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'issue_assigned'`,
+        cutoff
+          ? gte(agentWakeupRequests.requestedAt, cutoff)
+          : undefined,
+      ))
+      .orderBy(asc(agentWakeupRequests.updatedAt), asc(agentWakeupRequests.id))
+      .limit(50);
+    for (const handoff of strandedAssignmentHandoffs) {
+      if (!handoff.sourceRunId) continue;
+      // The release is company-scoped: it re-reads the source run inside its
+      // own transaction. Only an already-terminal run is safe to retry, so a
+      // still-active lock owner is never promoted around.
+      const [sourceRun] = await db
+        .select({ id: heartbeatRuns.id, companyId: heartbeatRuns.companyId })
+        .from(heartbeatRuns)
+        .where(and(
+          eq(heartbeatRuns.id, handoff.sourceRunId),
+          eq(heartbeatRuns.companyId, handoff.companyId),
+          inArray(heartbeatRuns.status, ["cancelled", "failed", "timed_out", "interrupted", "succeeded"]),
+        ));
+      if (!sourceRun) continue;
+      await releaseIssueExecutionAndPromote(sourceRun, {
+        suppressImmediateRecovery: true,
+      }).catch((err) => {
+        logger.warn(
+          { err, queueId: handoff.wakeId, runId: handoff.sourceRunId },
+          "failed to retry deferred assignment handoff",
+        );
+      });
+    }
+
     // A server restart or a message/cleanup race can leave a deferred wake
     // after its owner has released the issue lock. Revisit it through the same
     // release admission, so recovery holds and operator Stops still apply.
@@ -19797,6 +20147,7 @@ export function heartbeatService(
   async function startNextQueuedRunForAgent(agentId: string) {
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
+    const cancelledBeforeClaim: Array<typeof heartbeatRuns.$inferSelect> = [];
 
     return withAgentStartLock(agentId, async () => {
       const agent = await getAgent(agentId);
@@ -19908,7 +20259,7 @@ export function heartbeatService(
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of prioritizedRuns) {
         if (claimedRuns.length >= availableSlots) break;
-        const claimed = await claimQueuedRun(queuedRun, companyAgents);
+        const claimed = await claimQueuedRun(queuedRun, companyAgents, cancelledBeforeClaim);
         if (claimed) claimedRuns.push(claimed);
       }
       if (claimedRuns.length === 0) return [];
@@ -19932,6 +20283,15 @@ export function heartbeatService(
         });
       }
       return claimedRuns;
+    }).finally(async () => {
+      // Promotion can target this same agent. Release its start lock first;
+      // otherwise nested promotion waits on its own lock until the stale timeout.
+      for (const cancelled of cancelledBeforeClaim) {
+        await releaseIssueExecutionAndPromote(cancelled, { suppressImmediateRecovery: true }).catch((err) => {
+          logger.error({ err, runId: cancelled.id },
+            "failed to promote deferred task wake after stale queued cancellation");
+        });
+      }
     });
   }
 
@@ -20341,6 +20701,7 @@ export function heartbeatService(
           issueStatus: issueContext.status,
           issueAssigneeAgentId: issueContext.assigneeAgentId,
           issueExecutionState: issueContext.executionState,
+          issueUnblockDescriptor: issueContext.unblockDescriptor,
           isDependencyReady:
             issueDependencyReadiness?.isDependencyReady ?? true,
           agentId: agent.id,
@@ -24882,7 +25243,11 @@ export function heartbeatService(
             : null;
 
         const persistedResultJson = mergeHeartbeatRunResultJson(
-          mergeRunStopMetadataForAgent(agent, outcome, {
+          // The effective runtime config, not the stored agent config: a
+          // per-issue adapter override or a workspace-managed key can change
+          // `timeoutSec` for this run, and the recorded timeout is the one the
+          // run actually ran under.
+          mergeRunStopMetadataForAgent({ ...agent, adapterConfig: runtimeConfig }, outcome, {
             resultJson: mergeAdapterRecoveryMetadata({
               resultJson: {
                 ...(adapterResult.nativeFinalization || outcome === "cancelled"
@@ -26656,6 +27021,63 @@ export function heartbeatService(
     }
 
     if (issueId) {
+      const bindingIssue = await getIssueExecutionContext(agent.companyId, issueId);
+      const bindingWakeReason =
+        reason ?? readNonEmptyString(enrichedContextSnapshot.wakeReason);
+      if (bindingIssue?.unblockDescriptor) {
+        enrichedContextSnapshot.unblockDescriptor = bindingIssue.unblockDescriptor;
+        enrichedContextSnapshot.unblockAction = bindingIssue.unblockDescriptor.action;
+        const bindingOwner = bindingIssue.unblockDescriptor.owner;
+        const isNamedAgentUnblockWake =
+          bindingWakeReason === "issue_unblock_requested" &&
+          typeof bindingOwner === "object" &&
+          "agentId" in bindingOwner &&
+          bindingOwner.agentId === agentId;
+        // A board hold names the reconciliation as the required next step, e.g.
+        // "verify safe staging, THEN reconcile the stopped run". The hold gates
+        // NEW work; the continuation for an already-stopped, operator-reconciled
+        // run is the action the hold asks for. Refusing it strands the run with
+        // no delivery path, because nothing re-arms `continuationDelivery`.
+        // `executionReconciliationWake` is the validated signal for this, derived
+        // from the server-minted `execution-reconciliation:` idempotency key, not
+        // from a caller-supplied wake reason.
+        if (!isNamedAgentUnblockWake && !executionReconciliationWake) {
+          const wait = await writeSkippedRequest(
+            "issue_unblock_hold_active",
+            {
+              error: bindingIssue.unblockDescriptor.action,
+              payload: {
+                ...(payload ?? {}),
+                unblockDescriptor: bindingIssue.unblockDescriptor,
+              },
+            },
+            {
+              issueId,
+              unblockDescriptor: bindingIssue.unblockDescriptor,
+            },
+          );
+          if (wait.created) {
+            await logActivity(db, {
+              companyId: agent.companyId,
+              actorType: "system",
+              actorId: "system",
+              agentId,
+              runId: null,
+              action: "issue.unblock_hold_wakeup_skipped",
+              entityType: "issue",
+              entityId: issueId,
+              details: {
+                requestedReason: bindingWakeReason,
+                source,
+                triggerDetail,
+                unblockDescriptor: bindingIssue.unblockDescriptor,
+              },
+            });
+          }
+          return null;
+        }
+      }
+
       const activePauseHold = await treeControlSvc.getActivePauseHoldGate(
         agent.companyId,
         issueId,
@@ -26946,6 +27368,7 @@ export function heartbeatService(
               assigneeAgentId: issues.assigneeAgentId,
               executionRunId: issues.executionRunId,
               executionAgentNameKey: issues.executionAgentNameKey,
+              unblockDescriptor: issues.unblockDescriptor,
               createdAt: issues.createdAt,
             })
             .from(issues)
@@ -27624,10 +28047,29 @@ export function heartbeatService(
                 `- Reason: ${WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE}`,
                 `- Next action: ${WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION}`,
               ].join("\n");
+              // Do not displace a valid descriptor this path did not create.
+              // The unblockable-card guarantee still holds either way: the card
+              // is still `blocked`, `blockedTransitionAt` is still recorded (the
+              // transition really is happening, and board attention requires it),
+              // and when an agent- or user-owned descriptor survives it remains
+              // the wake route to whoever is already responsible.
+              const worktreeUnblockDescriptor = boardDescriptorForBlock({
+                existing: issue.unblockDescriptor,
+                action: WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
+              });
               await tx
                 .update(issues)
                 .set({
                   status: "blocked",
+                  // This flip carries no blocker relation and its wakeup
+                  // receipt below is recorded `skipped`, not queued — without
+                  // a descriptor and a blockedTransitionAt, the card would be
+                  // blocked with no way for anything to ever find or wake it
+                  // (board attention requires isProspectiveBlockedTransition).
+                  ...(worktreeUnblockDescriptor
+                    ? { unblockDescriptor: worktreeUnblockDescriptor }
+                    : {}),
+                  blockedTransitionAt: now,
                   checkoutRunId: null,
                   executionRunId: null,
                   executionAgentNameKey: null,
@@ -27730,7 +28172,16 @@ export function heartbeatService(
                 contextSnapshot: enrichedContextSnapshot,
                 source,
                 triggerDetail,
-                payload,
+                // Keep the exact execution that caused an assignment handoff
+                // wait. The periodic recovery sweep can then retry only this
+                // source run after a transient post-cancellation promotion
+                // failure. Override any caller value with the row-lock identity.
+                payload: {
+                  ...(payload ?? {}),
+                  ...(source === "assignment" && reason === "issue_assigned"
+                    ? { deferredByRunId: activeExecutionRun.id }
+                    : {}),
+                },
                 requestedByActorType: opts.requestedByActorType ?? null,
                 requestedByActorId: opts.requestedByActorId ?? null,
                 idempotencyKey: opts.idempotencyKey ?? null,
@@ -28928,8 +29379,12 @@ export function heartbeatService(
             });
             if (running) {
               await terminateHeartbeatRunProcess({
+                runId: run.id,
                 pid: running.child.pid,
                 processGroupId: running.processGroupId,
+                // The live child is the session carrier and must survive the stop;
+                // the group signal above already ended the run's work.
+                preservePids: typeof running.child.pid === "number" ? [running.child.pid] : [],
                 // Codex handles Ctrl-C by cancelling its tool sessions. SIGTERM
                 // can leave commands in their separate process groups alive.
                 signal: !control && agent?.adapterType === "codex_local" ? "SIGINT" : undefined,
@@ -28937,6 +29392,25 @@ export function heartbeatService(
                   running.graceSec,
                   options.terminationGraceMs,
                 ),
+              });
+            } else {
+              // No registry entry: the run never registered a local child, or it
+              // was already cleaned up. That says nothing about descendants a
+              // `timeout`-wrapped command moved into another process group, so
+              // the run-id sweep still has to run. It is the only cleanup left.
+              await terminateHeartbeatRunProcess({
+                runId: run.id,
+                pid: null,
+                processGroupId: null,
+                // The run's persisted child is the session carrier for
+                // session-shaped adapters and must survive a stop: a later run in
+                // the same session talks to the SAME process. Preserve it by
+                // pid even though the live registry has no entry.
+                preservePids: [run.processPid].filter(
+                  (value): value is number =>
+                    typeof value === "number" && Number.isInteger(value) && value > 0,
+                ),
+                signal: !control && agent?.adapterType === "codex_local" ? "SIGINT" : undefined,
               });
             }
             terminationSettled = true;
@@ -29141,9 +29615,28 @@ export function heartbeatService(
         const running = runningProcesses.get(run.id);
         if (running) {
           await terminateHeartbeatRunProcess({
+            runId: run.id,
             pid: running.child.pid,
             processGroupId: running.processGroupId,
+            // The live child is the session carrier and must survive the stop;
+            // the group signal above already ended the run's work.
+            preservePids: typeof running.child.pid === "number" ? [running.child.pid] : [],
             graceMs: Math.max(1, running.graceSec) * 1000,
+          });
+        } else {
+          // Same orphan case as the single-run path: an empty registry does not
+          // mean there is nothing left to clean up. This is the path that
+          // finalised runs as `cancelled` in the 12:21Z attribution, where
+          // cancelled runs still held 24 / 22 / 6 child processes.
+          await terminateHeartbeatRunProcess({
+            runId: run.id,
+            pid: null,
+            processGroupId: null,
+            // Preserve the run's session carrier; see the single-run path.
+            preservePids: [run.processPid].filter(
+              (value): value is number =>
+                typeof value === "number" && Number.isInteger(value) && value > 0,
+            ),
           });
         }
         runningProcesses.delete(run.id);

@@ -1,4 +1,5 @@
 import { agentAppearanceSchema, randomAgentAppearance, resolveAgentAppearance, agentAvatarUrl } from "@paperclipai/shared";
+import { isDeepStrictEqual } from "node:util";
 import { createHash, randomBytes } from "node:crypto";
 import { and, desc, eq, gte, inArray, lt, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
@@ -123,6 +124,24 @@ interface UpdateAgentOptions {
   allowBuiltInAgentMetadata?: boolean;
   allowPendingApprovalConfigUpdate?: boolean;
   claudeLogin?: ClaudeLoginContext;
+  /**
+   * Optimistic concurrency guard for callers that prepare a config patch before
+   * taking the row lock. The service compares the config the caller observed
+   * against the config now on the row and refuses a patch prepared from stale
+   * state.
+   *
+   * This deliberately keys on the caller's observed `adapterConfig` rather than
+   * the row's `updatedAt`. Several background writers update `agents.updated_at`
+   * without touching the config at all -- the cost rollup in
+   * services/costs.ts, budget updates in services/budgets.ts, the active-run
+   * watchdog on every run completion, and the execution-control reconciler.
+   * Keying the guard on `updatedAt` therefore rejects a perfectly good edit
+   * whenever one of those lands between a handler's read and its write, turning
+   * a security control into a routine 409 on the main PATCH /agents/:id path.
+   * Comparing config state keeps the guarantee that matters -- a patch built
+   * from a stale config cannot clobber a newer config -- without that cost.
+   */
+  expectedAdapterConfig?: unknown;
 }
 
 interface CreateAgentOptions {
@@ -150,7 +169,7 @@ function jsonEqual(left: unknown, right: unknown): boolean {
 }
 
 function buildConfigSnapshot(
-  row: Pick<typeof agents.$inferSelect, ConfigRevisionField>,
+  row: Pick<typeof agents.$inferSelect, ConfigRevisionField> & { id: string },
 ): AgentConfigSnapshot {
   const adapterConfig =
     typeof row.adapterConfig === "object" && row.adapterConfig !== null && !Array.isArray(row.adapterConfig)
@@ -169,7 +188,12 @@ function buildConfigSnapshot(
     role: row.role,
     title: row.title,
     icon: row.icon,
-    appearance: row.appearance,
+    // Resolve stored appearance the same way the public hydrated read does, so
+    // the before- and after-snapshots of one revision agree on the
+    // representation. Without this, a null or invalid stored appearance makes an
+    // unrelated edit record a phantom `appearance` change, and rolling that
+    // revision back would rewrite appearance to a value the agent never had.
+    appearance: resolveAgentAppearance(row.appearance, row.id),
     reportsTo: row.reportsTo,
     capabilities: row.capabilities,
     adapterType: row.adapterType,
@@ -399,10 +423,14 @@ export function agentService(db: Db) {
     return db.select().from(agents).where(eq(agents.companyId, companyId));
   }
 
-  async function getMonthlySpendByAgentIds(companyId: string, agentIds: string[]) {
+  async function getMonthlySpendByAgentIds(
+    companyId: string,
+    agentIds: string[],
+    dbClient: Db = db,
+  ) {
     if (agentIds.length === 0) return new Map<string, number>();
     const { start, end } = currentUtcMonthWindow();
-    const rows = await db
+    const rows = await dbClient
       .select({
         agentId: costEvents.agentId,
         spentMonthlyCents: sql<number>`coalesce(sum(${costEvents.costCents}), 0)::double precision`,
@@ -420,29 +448,45 @@ export function agentService(db: Db) {
     return new Map(rows.map((row) => [row.agentId, Number(row.spentMonthlyCents ?? 0)]));
   }
 
-  async function hydrateAgentSpend<T extends { id: string; companyId: string; spentMonthlyCents: number }>(rows: T[]) {
+  async function hydrateAgentSpend<T extends { id: string; companyId: string; spentMonthlyCents: number }>(
+    rows: T[],
+    dbClient: Db = db,
+  ) {
     const agentIds = rows.map((row) => row.id);
     const companyId = rows[0]?.companyId;
     if (!companyId || agentIds.length === 0) return rows;
-    const spendByAgentId = await getMonthlySpendByAgentIds(companyId, agentIds);
+    const spendByAgentId = await getMonthlySpendByAgentIds(companyId, agentIds, dbClient);
     return rows.map((row) => ({
       ...row,
       spentMonthlyCents: spendByAgentId.get(row.id) ?? 0,
     }));
   }
 
-  async function getById(id: string) {
-    const row = await db
+  async function getBaseAgentByIdWithDb(dbClient: Db, id: string, lock = false) {
+    const selectQuery = dbClient
       .select()
       .from(agents)
-      .where(eq(agents.id, id))
+      .where(eq(agents.id, id));
+    return (lock ? selectQuery.for("update") : selectQuery)
       .then((rows) => rows[0] ?? null);
+  }
+
+  async function getByIdWithDb(dbClient: Db, id: string) {
+    // The parallel public-shape reads below make ordering observable to
+    // sequence-based database fakes. Keep the agent base row first, then read
+    // the company rows and current-month spend in that stable order.
+    const row = await getBaseAgentByIdWithDb(dbClient, id);
     if (!row) return null;
-    const [companyRows, hydrated] = await Promise.all([
-      listCompanyAgentRows(row.companyId),
-      hydrateAgentSpend([row]).then((rows) => rows[0]!),
-    ]);
+    const companyRows = await dbClient
+      .select()
+      .from(agents)
+      .where(eq(agents.companyId, row.companyId));
+    const hydrated = await hydrateAgentSpend([row], dbClient).then((rows) => rows[0]!);
     return normalizeAgentRow(hydrated, companyRows);
+  }
+
+  async function getById(id: string) {
+    return getByIdWithDb(db, id);
   }
 
   async function requireGetById(id: string) {
@@ -696,13 +740,46 @@ export function agentService(db: Db) {
     });
   }
 
+  type AgentUpdateResult = Awaited<ReturnType<typeof getById>>;
+
   async function updateAgent(
     id: string,
     data: Partial<typeof agents.$inferInsert>,
     options?: UpdateAgentOptions,
   ) {
-    const existing = await getById(id);
+    const transaction = (db as unknown as {
+      transaction?: (callback: (tx: unknown) => Promise<AgentUpdateResult>) => Promise<AgentUpdateResult>;
+    }).transaction;
+    if (typeof transaction !== "function") {
+      return updateAgentInTransaction(id, data, options, db);
+    }
+    return transaction.call(db, async (tx) => {
+      const txDb = tx as unknown as Db;
+      return updateAgentInTransaction(id, data, options, txDb);
+    });
+  }
+
+  async function updateAgentInTransaction(
+    id: string,
+    data: Partial<typeof agents.$inferInsert>,
+    options: UpdateAgentOptions | undefined,
+    txDb: Db,
+  ) {
+    // Use the base row for the optimistic guard and invariant checks. The
+    // hydrated public shape performs extra company/spend reads, which must not
+    // consume the caller's prepared-select result before the write path has
+    // compared its version and locked the row.
+    const existing = await getBaseAgentByIdWithDb(txDb, id, true);
     if (!existing) return null;
+    if (
+      options?.expectedAdapterConfig !== undefined &&
+      !isDeepStrictEqual(existing.adapterConfig, options.expectedAdapterConfig)
+    ) {
+      throw conflict("The agent changed before this update acquired the agent lock; refresh and retry", {
+        code: "agent_config_concurrency_conflict",
+        agentId: id,
+      });
+    }
 
     if (existing.status === "terminated" && data.status && data.status !== "terminated") {
       throw conflict("Terminated agents cannot be resumed");
@@ -852,11 +929,7 @@ export function agentService(db: Db) {
       return normalizedUpdated;
     };
 
-    const transaction = (db as unknown as {
-      transaction?: (callback: (tx: unknown) => Promise<AgentUpdateResult>) => Promise<AgentUpdateResult>;
-    }).transaction;
-    if (typeof transaction !== "function") return applyUpdate(db);
-    return transaction.call(db, async (tx) => applyUpdate(tx as unknown as Db));
+    return applyUpdate(txDb);
   }
 
   return {

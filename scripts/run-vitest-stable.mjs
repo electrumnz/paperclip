@@ -1,12 +1,17 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
-import os from "node:os";
+import { mkdirSync, readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadShardDurations, selectGeneralServerShard } from "./general-server-shard.mjs";
 
 import { assertSelectedTests, partitionTestLines } from "./test-line-shard.mjs";
+import {
+  createTestRoot,
+  registerExitCleanup,
+  sweepOrphanedTestRoots,
+  tempRootParent,
+} from "./vitest-temp-root.mjs";
 
 const repoRoot = process.cwd();
 const scriptsDir = path.dirname(fileURLToPath(import.meta.url));
@@ -26,9 +31,23 @@ const nonServerProjects = [
   "@paperclipai/adapter-utils",
   "@paperclipai/adapter-claude-local",
   "@paperclipai/adapter-codex-local",
+  "@paperclipai/adapter-cursor-cloud",
+  "@paperclipai/adapter-cursor-local",
+  "@paperclipai/adapter-gemini-local",
   "@paperclipai/adapter-grok-local",
+  "@paperclipai/adapter-kimi-local",
   "@paperclipai/adapter-openclaw-gateway",
   "@paperclipai/adapter-opencode-local",
+  "@paperclipai/adapter-pi-local",
+  // Regression tests for the large-prompt transport (KEE-923) live here. This
+  // array, not the root vitest.config.ts projects list, is what every CI lane
+  // runs, so a project missing from here has its tests silently skipped in CI
+  // while `pnpm exec vitest` still collects them locally. cursor-cloud,
+  // cursor-local, gemini-local, kimi-local and pi-local had the same gap;
+  // KEE-930 closed it, and the guard test in
+  // scripts/__tests__/run-vitest-stable-shard.test.mjs now fails on the next
+  // divergence between this array and the root projects list.
+  "@paperclipai/hermes-paperclip-adapter",
   "@paperclipai/plugin-daytona",
   "@paperclipai/plugin-sdk",
   "@paperclipai/create-paperclip-plugin",
@@ -64,6 +83,24 @@ const additionalSerializedServerTests = new Set([
   "server/src/__tests__/routines-e2e.test.ts",
 ]);
 let invocationIndex = 0;
+// Every test root this process creates, so one exit hook can release them all.
+// The hook is what makes the process.exit() failure paths below clean up.
+const ownedTestRoots = new Set();
+registerExitCleanup(ownedTestRoots);
+// The root of the invocation that is currently running, kept separately so the
+// next invocation can release it once this one has returned.
+let currentTestRootHandle = null;
+
+// Release the previous invocation's root now that its vitest run has finished.
+// The exit hook still owns every root as a backstop; this only shortens the
+// window in which a long multi-invocation run holds N roots at once.
+function releaseFinishedTestRoots() {
+  if (!currentTestRootHandle) return;
+  const previous = currentTestRootHandle;
+  currentTestRootHandle = null;
+  ownedTestRoots.delete(previous);
+  previous.release("next-invocation");
+}
 const serializedModeName = "serialized";
 const generalModeName = "general";
 const allModeName = "all";
@@ -306,10 +343,36 @@ function selectSerializedSuites(routeTests, shardIndex, shardCount) {
 function runVitest(args, label, testShard = null) {
   console.log(`\n[test:run] ${label}`);
   invocationIndex += 1;
-  const tempRootParent = process.platform === "win32" ? os.tmpdir() : "/tmp";
-  // Production workspace/security checks reject symlink aliases. In particular
-  // /tmp is /private/tmp on macOS, so fixture roots must use the canonical path.
-  const testRoot = realpathSync(mkdtempSync(path.join(tempRootParent, "pv-")));
+  const tempRootParentDir = tempRootParent();
+  // A multi-invocation run (for example --mode all, which calls this 7+ times)
+  // otherwise holds every root it ever created until the process exits, so peak
+  // usage is higher than steady state, and the peak is exactly the window in
+  // which the original out-of-space failure happened. The previous invocation
+  // has already returned by the time the next one starts, so its root is no
+  // longer in use and can go now rather than at process exit.
+  releaseFinishedTestRoots();
+  // Reclaim roots left by runs that were killed instead of exiting, so a
+  // cancelled CI job or an OOM kill cannot leak a root for good.
+  //
+  // A leak-reclaim helper must never be able to fail the run it is protecting:
+  // the sweep runs before the suite starts, so an error here would abort a test
+  // run for a reason that has nothing to do with the code under test. Log it and
+  // carry on to createTestRoot, which is the path that actually matters.
+  let swept = [];
+  try {
+    swept = sweepOrphanedTestRoots({ parent: tempRootParentDir });
+  } catch (error) {
+    console.warn(
+      `[test:run] orphan sweep failed (${error?.message ?? error}); continuing without reclaiming`,
+    );
+  }
+  if (swept.length > 0) {
+    console.log(`[test:run] reclaimed ${swept.length} orphaned test temp root(s) in ${tempRootParentDir}`);
+  }
+  const testRootHandle = createTestRoot({ parent: tempRootParentDir });
+  ownedTestRoots.add(testRootHandle);
+  currentTestRootHandle = testRootHandle;
+  const testRoot = testRootHandle.root;
   // Keep per-run paths compact so Unix socket fixtures stay under macOS path limits.
   const env = {
     ...process.env,

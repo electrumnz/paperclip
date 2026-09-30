@@ -116,7 +116,9 @@ import { createDecisionRetentionNotifyOriginAgent, createDecisionWakeOriginAgent
 import {
   closeHttpListenerForShutdown,
   coordinateHeartbeatSchedulerShutdown,
+  createShutdownAdmissionHold,
   drainRunExecutionFinalizersForShutdown,
+  engageShutdownAdmissionHold,
   finalizeServerShutdown,
   loadWithoutCoordinatedShutdownSignalHooks,
 } from "./shutdown.js";
@@ -158,7 +160,6 @@ type EmbeddedPostgresCtor = new (opts: {
   onLog?: (message: unknown) => void;
   onError?: (message: unknown) => void;
 }) => EmbeddedPostgresInstance;
-
 
 export interface StartedServer {
   server: ReturnType<typeof createServer>;
@@ -1142,7 +1143,24 @@ async function startServerWithDatabaseTeardown(
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
     tracked = Promise.resolve(work)
-      .then(() => undefined, () => undefined)
+      // KEE-1095: log, do not re-throw. This handler is shared by every
+      // scheduled heartbeat work, so it deliberately keeps its existing resolve
+      // semantics and gains observability only: a rejection that used to vanish
+      // silently is now recorded with its error. Re-throwing here would be an
+      // unhandled rejection and would change control flow for every other
+      // scheduled work, which is a much wider change than this one needs. The
+      // two callers that must react still see the failure, because
+      // `reconcileStrandedAssignedIssues` now contains per-issue failures and
+      // surfaces sweep-level ones through its own result and log.
+      .then(
+        () => undefined,
+        (error: unknown) => {
+          logger.error(
+            { err: error },
+            "scheduled heartbeat work rejected; the schedule continues on its next tick",
+          );
+        },
+      )
       .finally(() => {
         heartbeatSchedulerInFlight.delete(tracked);
       });
@@ -1530,6 +1548,11 @@ async function startServerWithDatabaseTeardown(
           reconciled.continuationRequeued > 0 ||
           reconciled.successfulRunHandoffEscalated > 0 ||
           reconciled.successfulRunHandoffRetried > 0 ||
+          // KEE-1121: a contained per-candidate failure leaves every one of
+          // the counters above at 0, so without this the pass logged nothing
+          // at all. The comment in service.ts promised this warn reports
+          // `failed`; this makes that true.
+          reconciled.failed > 0 ||
           reconciled.escalated > 0
         ) {
           logger.warn(
@@ -1771,6 +1794,9 @@ async function startServerWithDatabaseTeardown(
                 reconciled.continuationRequeued > 0 ||
                 reconciled.successfulRunHandoffEscalated > 0 ||
                 reconciled.successfulRunHandoffRetried > 0 ||
+                // KEE-1121: see the startup guard above. A sweep where every
+                // candidate failed would otherwise log nothing here.
+                reconciled.failed > 0 ||
                 reconciled.escalated > 0
               ) {
                 logger.warn(
@@ -1916,6 +1942,21 @@ async function startServerWithDatabaseTeardown(
     signal: "SIGINT" | "SIGTERM",
     exitProcess: boolean,
   ) => {
+    // Owns the admission hold for this call: engages it before the run drain
+    // and releases it again if this teardown finishes without exiting, so the
+    // hold cannot outlive the teardown that created it.
+    const admissionHold = createShutdownAdmissionHold({
+      engage: () =>
+        heartbeat
+          ? engageShutdownAdmissionHold({
+              startTaskDrain: () => heartbeat.startTaskDrain(),
+              getTaskDrainStatus: () => heartbeat.getTaskDrainStatus(),
+            })
+          : null,
+      release: () => heartbeat?.stopTaskDrain(),
+      log: logger,
+    });
+
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
     heartbeatSchedulerStopped = true;
     clearInterval(executionControlInterval);
@@ -1928,6 +1969,15 @@ async function startServerWithDatabaseTeardown(
       signal,
       prepareHotRestartShutdown,
       waitForHeartbeatSchedulerIdle,
+      // `heartbeatSchedulerStopped` above stops the scheduler interval from
+      // scheduling new work, but it does not stop a sweep that is already
+      // in flight, and it is not the gate the admission checks read — they
+      // read the task drain. So this call is load-bearing for a late sweep,
+      // which is exactly the KEE-1149 mechanism: hold admission across the run
+      // drain so such a sweep cannot claim a new run and race rows the drain is
+      // already reading and updating.
+      closeSchedulerAdmission: () => admissionHold.hold(),
+      log: logger,
     });
     const skipHeartbeatDrain = heartbeatShutdown.hotRestart?.skipDrain === true;
     const selectiveDrainRunIds = heartbeatShutdown.hotRestart?.drainRunIds ?? null;
@@ -1943,73 +1993,97 @@ async function startServerWithDatabaseTeardown(
       );
     }
 
-    const telemetryClient = getTelemetryClient();
-    if (telemetryClient) {
-      telemetryClient.stop();
-      await telemetryClient.flush();
-    }
-
-    if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
-      try {
-        const drain = await drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds);
-        logger.info({ signal, drain }, "graceful heartbeat run drain complete");
-      } catch (err) {
-        logger.error({ err, signal }, "graceful heartbeat run drain failed");
+    // From here to the release, the admission hold is engaged. A throw at any
+    // point in that span would otherwise leave the hold — and the marker that
+    // makes the operator route refuse — set for the life of a process that
+    // never exits, with no route left to clear it (KEE-1149, RC5). So the span
+    // runs under try/finally: the release is guaranteed on every exit,
+    // including an exceptional one, and admission is not left shut after a
+    // teardown that failed.
+    try {
+      const telemetryClient = getTelemetryClient();
+      if (telemetryClient) {
+        telemetryClient.stop();
+        await telemetryClient.flush();
       }
-    }
 
-    if (!skipHeartbeatDrain) {
-      await drainRunExecutionFinalizersForShutdown({
+      if (!skipHeartbeatDrain && drainHeartbeatRunsForShutdown) {
+        try {
+          const drain = await drainHeartbeatRunsForShutdown(signal, selectiveDrainRunIds);
+          logger.info({ signal, drain }, "graceful heartbeat run drain complete");
+        } catch (err) {
+          logger.error({ err, signal }, "graceful heartbeat run drain failed");
+        }
+      }
+
+      if (!skipHeartbeatDrain) {
+        await drainRunExecutionFinalizersForShutdown({
+          signal,
+          drain: drainHeartbeatExecutionFinalizers,
+          log: logger,
+        });
+      }
+
+      // Whatever the drain did not finalize (timed-out runs, the hot-restart
+      // skip path) still has a local-only tail when the in-flight run-log
+      // mirror is enabled; upload those tails now so an orderly restart
+      // never loses run output. No-op when the mirror is off.
+      try {
+        await flushInFlightRunLogMirrors();
+      } catch (err) {
+        logger.error({ err, signal }, "run-log in-flight mirror flush failed");
+      }
+
+      const appShutdown = (app as { locals?: { paperclipShutdown?: () => Promise<void> } }).locals
+        ?.paperclipShutdown;
+      const stopEmbeddedPostgres = embeddedPostgres && embeddedPostgresStartedByThisProcess
+        ? () => embeddedPostgresSupervisor?.shutdown() ?? embeddedPostgres!.stop()
+        : null;
+
+      // Await the ordered application teardown before the process exits. A live
+      // setup-token login session must stop and release its sandbox lease before
+      // the database and the provider stop, so an orderly shutdown never leaves a
+      // sandbox lease or confidential login state alive past the process exit.
+      // The HTTP listener closes first, while every service is still up, so a
+      // request in flight is drained against a working server and none reaches
+      // a route once the pool is gone; the programmatic close below then finds
+      // the listener already closed and skips.
+      await finalizeServerShutdown({
         signal,
-        drain: drainHeartbeatExecutionFinalizers,
+        shutdownAppServices: appShutdown,
+        closeHttpListener: () =>
+          closeHttpListenerForShutdown({ server, signal, log: logger }),
+        drainPendingRunFailureReports: waitForPendingRunFailureReports,
+        closeDatabase: closeDatabaseClients,
+        stopEmbeddedPostgres,
+        shutdownInstrumentation,
+        shutdownSentry,
         log: logger,
       });
-    }
 
-    // Whatever the drain did not finalize (timed-out runs, the hot-restart
-    // skip path) still has a local-only tail when the in-flight run-log
-    // mirror is enabled; upload those tails now so an orderly restart
-    // never loses run output. No-op when the mirror is off.
-    try {
-      await flushInFlightRunLogMirrors();
-    } catch (err) {
-      logger.error({ err, signal }, "run-log in-flight mirror flush failed");
-    }
-
-    const appShutdown = (app as { locals?: { paperclipShutdown?: () => Promise<void> } }).locals
-      ?.paperclipShutdown;
-    const stopEmbeddedPostgres = embeddedPostgres && embeddedPostgresStartedByThisProcess
-      ? () => embeddedPostgresSupervisor?.shutdown() ?? embeddedPostgres!.stop()
-      : null;
-
-    // Await the ordered application teardown before the process exits. A live
-    // setup-token login session must stop and release its sandbox lease before
-    // the database and the provider stop, so an orderly shutdown never leaves a
-    // sandbox lease or confidential login state alive past the process exit.
-    // The HTTP listener closes first, while every service is still up, so a
-    // request in flight is drained against a working server and none reaches
-    // a route once the pool is gone; the programmatic close below then finds
-    // the listener already closed and skips.
-    await finalizeServerShutdown({
-      signal,
-      shutdownAppServices: appShutdown,
-      closeHttpListener: () =>
-        closeHttpListenerForShutdown({ server, signal, log: logger }),
-      drainPendingRunFailureReports: waitForPendingRunFailureReports,
-      closeDatabase: closeDatabaseClients,
-      stopEmbeddedPostgres,
-      shutdownInstrumentation,
-      shutdownSentry,
-      log: logger,
-    });
-
-    if (!exitProcess && server.listening) {
-      await new Promise<void>((resolveClose, rejectClose) => {
-        server.close((err) => {
-          if (err) rejectClose(err);
-          else resolveClose();
+      if (!exitProcess && server.listening) {
+        await new Promise<void>((resolveClose, rejectClose) => {
+          server.close((err) => {
+            if (err) rejectClose(err);
+            else resolveClose();
+          });
         });
-      });
+      }
+
+    } finally {
+      // The hold is process-local, so a signal-driven shutdown clears it by
+      // exiting. This teardown is the non-exiting path
+      // (`StartedServer.shutdown` is `shutdown(signal, false)`, reachable from
+      // cli/src/commands/run.ts when an `afterStart` hook throws), where the
+      // caller can hold a process that outlives the teardown, so release the
+      // hold here. It is the only correct point: any earlier and it would
+      // re-open the late-sweep claim race for the run drain itself. A hold an
+      // operator owns is not released.
+      //
+      // Runs in `finally` so a teardown that threw still releases. That also
+      // hardens the pre-existing drain leak: a throw used to strand the drain
+      // itself, which the operator could still clear with the DELETE route.
+      admissionHold.releaseIfHeld(signal, exitProcess);
     }
 
     if (exitProcess) process.exit(0);

@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { HttpError } from "../errors.js";
 
 const mockIssueService = vi.hoisted(() => ({
@@ -318,6 +318,17 @@ async function waitForWakeup(assertion: () => void) {
 }
 
 describe.sequential("issue comment reopen routes", () => {
+  // Import the route module once, up front. Transforming src/routes/issues.ts
+  // and its dependency graph is a one-time cost that is otherwise charged to
+  // whichever test happens to run first. On a loaded serial runner that cost
+  // can cross the 15s testTimeout, and a test that times out mid-request lets
+  // its fire-and-forget wake land inside the *next* test — which then reports
+  // a bogus `addComment` call count. Warming in beforeAll moves the cost onto
+  // the 30s hookTimeout budget instead, so no test pays for it twice.
+  beforeAll(async () => {
+    await import("../routes/issues.js");
+  });
+
   beforeEach(() => {
     vi.clearAllMocks();
     mockIssueService.getById.mockReset();

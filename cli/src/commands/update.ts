@@ -5,7 +5,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import * as p from "@clack/prompts";
 import pc from "picocolors";
-import { assertManagedShimWritable, writeManagedShim, buildNextManifest, flipCurrentAtomic, isManagedExecutable, pruneInstallPayloads, readInstallManifest, resolveInstallStorePaths, withInstallStoreLock, writeInstallManifestAtomic, type InstallChannel, type InstallManifest, type InstallRecord, type InstallStorePaths } from "../install-store.js";
+import { assertManagedShimWritable, writeManagedShim, buildNextManifest, flipCurrentAtomic, isManagedExecutable, migrateManagedSkillLinks, pruneInstallPayloads, readInstallManifest, resolveInstallStorePaths, withInstallStoreLock, writeInstallManifestAtomic, type InstallChannel, type InstallManifest, type InstallRecord, type InstallStorePaths } from "../install-store.js";
 import { dbBackupCommand } from "./db-backup.js";
 import { assertSupportedNodeVersion, installGitPayload, installNpmPayload, PUBLIC_NPM_REGISTRY, resolveGitHubRef, resolvePublishedVersion, type CommandRunner } from "./install.js";
 import { resolvePaperclipInstanceId, resolvePaperclipInstanceRoot } from "../config/home.js";
@@ -136,6 +136,7 @@ export function rollbackManagedInstall(paths = resolveInstallStorePaths()): Inst
   const oldTarget = fs.readlinkSync(paths.currentPath);
   flipCurrentAtomic(target.payloadPath, paths);
   try { writeInstallManifestAtomic(next, paths); } catch (error) { flipCurrentAtomic(path.resolve(paths.cliRoot, oldTarget), paths); throw error; }
+  migrateManagedSkillLinks(next, paths);
   return next;
 }
 
@@ -200,7 +201,7 @@ export async function updateCommand(options: UpdateOptions, overrides: Partial<D
       const record: InstallRecord = { source: "git", version: payload.version, channel: "pinned", repo: manifest.repo, ref: manifest.ref, sha: targetSha, payloadPath: payload.payloadPath, installedAt: (overrides.now?.() ?? new Date()).toISOString() };
       const next = buildNextManifest(record, manifest); const oldTarget = fs.readlinkSync(paths.currentPath); flipCurrentAtomic(payload.payloadPath, paths);
       try { writeInstallManifestAtomic(next, paths); } catch (error) { flipCurrentAtomic(path.resolve(paths.cliRoot, oldTarget), paths); throw error; }
-      pruneInstallPayloads(next, paths); return payload;
+      migrateManagedSkillLinks(next, paths); pruneInstallPayloads(next, paths); return payload;
     }, paths);
     let restarted: boolean;
     try {
@@ -256,7 +257,7 @@ export async function updateCommand(options: UpdateOptions, overrides: Partial<D
     const record: InstallRecord = { source: "npm", version: targetVersion, channel: request.channel, payloadPath: payload.payloadPath, installedAt: (overrides.now?.() ?? new Date()).toISOString() };
     const next = buildNextManifest(record, manifest); const oldTarget = fs.readlinkSync(paths.currentPath); flipCurrentAtomic(payload.payloadPath, paths);
     try { writeInstallManifestAtomic(next, paths); } catch (error) { flipCurrentAtomic(path.resolve(paths.cliRoot, oldTarget), paths); throw error; }
-    pruneInstallPayloads(next, paths); return payload;
+    migrateManagedSkillLinks(next, paths); pruneInstallPayloads(next, paths); return payload;
   }, paths);
   let restarted: boolean;
   try {

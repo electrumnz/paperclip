@@ -1585,6 +1585,11 @@ async function githubOperationLauncherBasePath(
   return remotePath;
 }
 
+/** A gh config directory is only trustworthy when it really holds hosts.yml. */
+async function fileExists(candidate: string): Promise<boolean> {
+  return (await fs.lstat(candidate).catch(() => null))?.isFile() ?? false;
+}
+
 /** Read only execution-target Git context; never import the controller's credentials into SSH. */
 export async function prepareGitHubExecutionEnvironment(input: {
   target: AdapterExecutionTarget | null | undefined;
@@ -1604,7 +1609,15 @@ if (process.argv[1] === 'host') {
     if (/^(GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|PAPERCLIP_GIT_TOKEN|GH_CONFIG_DIR|GIT_CONFIG_(GLOBAL|SYSTEM|NOSYSTEM|COUNT|KEY_\d+|VALUE_\d+)|GIT_(AUTHOR|COMMITTER)_(NAME|EMAIL)|GIT_ASKPASS|SSH_ASKPASS|SSH_AUTH_SOCK|GIT_SSH_COMMAND|GIT_SSH)$/.test(key)) env[key] = value;
   }
   env.PAPERCLIP_GITHUB_HOST_HOME = process.env.HOME || '';
-  env.GH_CONFIG_DIR ||= path.join(process.env.XDG_CONFIG_HOME || path.join(process.env.HOME || '', '.config'), 'gh');
+  // Only trust an inherited GH_CONFIG_DIR that actually holds gh's hosts file.
+  // A controller started with GH_CONFIG_DIR pointing at $HOME (or anywhere else
+  // without hosts.yml) would otherwise be passed through verbatim, and gh then
+  // reports "not logged into any GitHub hosts" for a token that is valid.
+  const inherited = env.GH_CONFIG_DIR;
+  const home = process.env.HOME || '';
+  if (!inherited || !fs.existsSync(path.join(inherited, 'hosts.yml'))) {
+    env.GH_CONFIG_DIR = path.join(process.env.XDG_CONFIG_HOME || path.join(home, '.config'), 'gh');
+  }
 }
 try {
   const top = cp.execFileSync('git', ['rev-parse', '--show-toplevel'], {encoding:'utf8',stdio:['ignore','pipe','ignore']}).trim();
@@ -1637,7 +1650,14 @@ if [ "$1" = host ]; then
     index=$((index + 1))
   done
   printf 'PAPERCLIP_GITHUB_HOST_HOME\0%s\0' "$HOME"
-  printf 'GH_CONFIG_DIR\0%s\0' "${"$"}{GH_CONFIG_DIR:-${"$"}{XDG_CONFIG_HOME:-$HOME/.config}/gh}"
+  # Trust an inherited GH_CONFIG_DIR only when it really holds gh's hosts file,
+  # so a $HOME (or otherwise wrong) value cannot make gh report "not logged in"
+  # for a token that is present and valid.
+  gh_config_dir=${"$"}{GH_CONFIG_DIR:-}
+  if [ -z "$gh_config_dir" ] || [ ! -f "$gh_config_dir/hosts.yml" ]; then
+    gh_config_dir=${"$"}{XDG_CONFIG_HOME:-$HOME/.config}/gh
+  fi
+  printf 'GH_CONFIG_DIR\0%s\0' "$gh_config_dir"
 fi
 for file in /etc/resolv.conf /etc/hosts /etc/nsswitch.conf /etc/ssl/certs /etc/ssl/cert.pem; do
   index=0
@@ -1690,13 +1710,21 @@ printf '\0PAPERCLIP_GIT_CONTEXT_END\0'
     catch { throw new Error("Could not read execution-target Git context"); }
   }
   // Controller-derived roots and mode must not be replaced by agent bindings.
-  return { ...discovered, ...input.env,
+  // Typed as a plain record: the spread also carries projected GitHub keys such
+  // as GH_CONFIG_DIR, which are not part of the controller-assigned subset.
+  const resolved: Record<string, string> = { ...discovered, ...input.env,
     ...(input.hostCredentials ? { PAPERCLIP_GITHUB_HOST_HOME: discovered.PAPERCLIP_GITHUB_HOST_HOME } : {}),
     PAPERCLIP_GIT_METADATA_ROOTS: discovered.PAPERCLIP_GIT_METADATA_ROOTS ?? "[]",
     PAPERCLIP_RUNNER_NETWORK_ROOTS: discovered.PAPERCLIP_RUNNER_NETWORK_ROOTS ?? "[]",
     PAPERCLIP_GITHUB_AUTH_MODE: input.hostCredentials ? "host" : "managed",
     PAPERCLIP_RUNNER_NETWORK_ACCESS: input.networkAccess ? "enabled" : "disabled",
   };
+  // A run env binding must not redirect gh at a config directory that does not
+  // hold hosts.yml: gh would then report "not logged in" for a valid token.
+  if (input.hostCredentials && resolved.GH_CONFIG_DIR && !(await fileExists(path.join(resolved.GH_CONFIG_DIR, "hosts.yml")))) {
+    resolved.GH_CONFIG_DIR = discovered.GH_CONFIG_DIR;
+  }
+  return resolved;
 }
 
 /** Stage token-free launchers next to the execution, not in shared global Git config. */

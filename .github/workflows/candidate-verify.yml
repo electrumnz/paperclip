@@ -1,0 +1,78 @@
+name: Candidate Verify
+
+# Fork-only verification entry point for one frozen candidate SHA.
+#
+# Neither existing lane can verify a specific commit on demand:
+#   - `PR` (pr.yml) fires on pull_request only, and calls the upstream-pinned
+#     pr-trusted.yml, which reads github.event.pull_request throughout and
+#     selects its own checkout from the PR head. It has no ref input and
+#     cannot be dispatched.
+#   - `Release Verify` (release-verify.yml) is workflow_call-only.
+#
+# This is the smallest entry point that closes that gap. It declares no jobs
+# of its own beyond a guard: it calls release-verify.yml whole, so the tests
+# and build run are the existing ones, unmodified.
+#
+# Why release-verify.yml is safe to reuse here:
+#   - it reads no secrets (no `secrets.` reference anywhere in the file)
+#   - it performs no publish, registry upload, image push or release step
+#   - every job holds `permissions: contents: read`
+#   - its self-hosted AWS routing is gated on the upstream repository and id,
+#     so on this fork each job falls back to ubuntu-latest (GitHub-hosted)
+#     and does not touch the TinyPC
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Full 40-character commit SHA to verify. Branches and tags are refused so the tree under test cannot move during the run.
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: candidate-verify-${{ inputs.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Confirm fork-only and frozen SHA
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Assert fork-only
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REPOSITORY" != "electrumnz/paperclip" ]]; then
+            echo "::error::Candidate Verify is fork-only; refusing to run in $GITHUB_REPOSITORY"
+            exit 1
+          fi
+
+      - name: Assert the ref is a full commit SHA
+        env:
+          CANDIDATE_REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$CANDIDATE_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            # The value is untrusted until it passes, so it is not echoed into
+            # the workflow command, which is itself injectable via ::error::.
+            echo "::error::ref must be a full 40-character lowercase commit SHA so the verified tree is frozen"
+            exit 1
+          fi
+          echo "Verifying frozen candidate $CANDIDATE_REF"
+
+  verify:
+    name: Release Verify
+    needs: [gate]
+    # Token scopes can only be maintained or reduced through a called-workflow
+    # chain, so this is the floor the caller must grant: every job in
+    # release-verify.yml and runner-chaos-evals.yml checks out the candidate, and
+    # contents: read is the only scope any of them declares.
+    permissions:
+      contents: read
+    uses: ./.github/workflows/release-verify.yml
+    with:
+      ref: ${{ inputs.ref }}

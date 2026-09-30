@@ -145,9 +145,125 @@ describeEmbeddedPostgres("activity service", () => {
       },
     ]);
 
-    const result = await activityService(db).list({ companyId, limit: 2 });
+    const svc = activityService(db);
+    const firstPage = await svc.list({ companyId, limit: 2 });
 
-    expect(result.map((event) => event.action)).toEqual(["test.newest", "test.middle"]);
+    expect(firstPage.rows.map((event) => event.action)).toEqual(["test.newest", "test.middle"]);
+    expect(firstPage.nextCursor).not.toBeNull();
+
+    const secondPage = await svc.list({ companyId, limit: 2, before: firstPage.nextCursor ?? undefined });
+
+    expect(secondPage.rows.map((event) => event.action)).toEqual(["test.oldest"]);
+    expect(secondPage.nextCursor).toBeNull();
+  });
+
+  it("ignores a forged or malformed before cursor instead of failing the query", async () => {
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(activityLog).values({
+      companyId,
+      actorType: "system",
+      actorId: "system",
+      action: "test.newest",
+      entityType: "company",
+      entityId: companyId,
+      createdAt: new Date("2026-04-21T12:00:00.000Z"),
+    });
+
+    const svc = activityService(db);
+    const forge = (value: unknown) =>
+      Buffer.from(JSON.stringify(value), "utf8").toString("base64url");
+
+    // Each of these reached Postgres before the decode was tightened, where a
+    // non-uuid `id` / unparseable `createdAt` threw and surfaced as a 500.
+    const rejected = [
+      { label: "non-uuid id", cursor: forge({ createdAt: "2026-04-21T11:00:00.000Z", id: "not-a-uuid" }) },
+      { label: "uuid id with quote/terminator", cursor: forge({ createdAt: "2026-04-21T11:00:00.000Z", id: "x\"; drop table activity_log; --" }) },
+      { label: "unparseable createdAt", cursor: forge({ createdAt: "garbage-not-a-time", id: randomUUID() }) },
+      // `Date.parse` accepts these by rolling them over (2026-02-30 -> 2026-03-02),
+      // but Postgres `::timestamptz` raises "date/time field value out of range",
+      // so a `Date.parse`-only guard still let the 500 through.
+      { label: "calendar-invalid createdAt (day overflow)", cursor: forge({ createdAt: "2026-02-30T00:00:00.000Z", id: randomUUID() }) },
+      { label: "calendar-invalid createdAt (month day overflow)", cursor: forge({ createdAt: "2026-02-31T00:00:00.000Z", id: randomUUID() }) },
+      { label: "calendar-invalid createdAt (leap day in a non-leap year)", cursor: forge({ createdAt: "2026-02-29T00:00:00.000Z", id: randomUUID() }) },
+      // The strict round-trip check still admits every instant JavaScript's own
+      // `Date` can represent, which is far wider than what Postgres casts:
+      // year 0 and the two ends of the JS Date range all raise "date/time field
+      // value out of range" (or "time zone displacement out of range") in
+      // `::timestamptz`. The predicate and the cast must be the same predicate.
+      { label: "createdAt below Postgres' accepted range (year 0)", cursor: forge({ createdAt: "0000-01-01T00:00:00.000Z", id: randomUUID() }) },
+      { label: "createdAt at the lower end of the JS Date range", cursor: forge({ createdAt: "-271821-04-20T00:00:00.000Z", id: randomUUID() }) },
+      { label: "createdAt at the upper end of the JS Date range", cursor: forge({ createdAt: "+275760-09-13T00:00:00.000Z", id: randomUUID() }) },
+      { label: "wrong field types", cursor: forge({ createdAt: 123, id: true }) },
+    ];
+
+    for (const { label, cursor } of rejected) {
+      const page = await svc.list({ companyId, limit: 10, before: cursor });
+      // Treated as absent: the newest page is served, not an error.
+      expect(page.rows.map((event) => event.action), label).toEqual(["test.newest"]);
+    }
+
+    // A well-formed cursor still pages correctly — the guard is not a blanket
+    // rejection of client input.
+    const deep = await svc.list({
+      companyId,
+      limit: 10,
+      before: forge({ createdAt: "2026-04-21T11:00:00.000Z", id: "ffffffff-ffff-ffff-ffff-ffffffffffff" }),
+    });
+    expect(deep.rows).toEqual([]);
+  });
+
+  it("honours a real server-minted nextCursor, which the strict timestamp guard must not reject", async () => {
+    const companyId = randomUUID();
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    await db.insert(activityLog).values([
+      {
+        companyId,
+        actorType: "system",
+        actorId: "system",
+        action: "test.newest",
+        entityType: "company",
+        entityId: companyId,
+        createdAt: new Date("2026-04-21T12:00:00.000Z"),
+      },
+      {
+        companyId,
+        actorType: "system",
+        actorId: "system",
+        action: "test.older",
+        entityType: "company",
+        entityId: companyId,
+        createdAt: new Date("2026-04-21T10:00:00.000Z"),
+      },
+    ]);
+
+    const svc = activityService(db);
+
+    // Cursor exactly as `list` mints it.
+    const first = await svc.list({ companyId, limit: 1 });
+    expect(first.rows.map((event) => event.action)).toEqual(["test.newest"]);
+    expect(first.nextCursor).not.toBeNull();
+
+    // The strict round-trip guard is narrower than Postgres, so this is the
+    // assertion that keeps it from quietly rejecting every real cursor (and
+    // silently serving page one forever). The second page must be the older row.
+    const second = await svc.list({ companyId, limit: 1, before: first.nextCursor ?? undefined });
+    expect(second.rows.map((event) => event.action)).toEqual(["test.older"]);
+    expect(second.nextCursor).toBeNull();
   });
 
   it("returns compact usage and result summaries for issue runs", async () => {

@@ -92,6 +92,8 @@ import {
   type AcpRuntimeUsageCost,
   type AcpSessionStore,
 } from "acpx/runtime";
+import { enforceCodexShellSnapshotPolicy } from "./codex-shell-snapshot.js";
+import { ensureRestrictedDir } from "./restricted-files.js";
 import {
   ACPX_DUPLEX_LOSS_CANCEL_DEADLINE_MS,
   ACPX_HANDSHAKE_TIMEOUT_MS,
@@ -117,6 +119,7 @@ import type {
   TurnCompletion,
 } from "./run-contracts.js";
 import { createRunResourceLedger } from "./run-resource-ledger.js";
+import { classifyAcpxOutputRejection } from "./output-rejection.js";
 import { settleAcpRun, type SettlementSteps } from "./settlement-sequence.js";
 import {
   runAttempt,
@@ -130,6 +133,13 @@ import {
   type TurnFinalizeInput,
 } from "./turn-sequence.js";
 import {
+  buildTurnGateFollowUp,
+  createTurnGate,
+  readTurnGateBudgetExemption,
+  resolveTurnGateThresholds,
+  type TurnGateFollowUp,
+} from "./turn-gate.js";
+import {
   createHostRunSite,
   type AcpxAgentProcessIdentity,
   type AcpxProcessIdentitySink,
@@ -137,6 +147,7 @@ import {
   type RuntimeCacheEntry,
 } from "./run-site-host.js";
 import { createSandboxRunSite, type SandboxRunSite } from "./run-site-sandbox.js";
+import { createCredentialSafeSessionStore } from "./session-store.js";
 import {
   createRuntimeSpanRunner,
   emitRunPhaseTiming,
@@ -1291,6 +1302,14 @@ async function prepareCodexSkillRuntime(input: {
       targetHome: managedCodexHome,
       onLog: input.onLog,
     });
+  // Codex writes the provider launch environment — this run's bound credentials
+  // included — into `$CODEX_HOME/shell_snapshots/*.sh` as plaintext `declare -x`
+  // lines. Pin the policy off on every run, not only on the seed: the managed
+  // home is seeded once from the operator's `~/.codex/config.toml`, and an
+  // operator-supplied `CODEX_HOME` is never seeded at all. Runs on both.
+  for (const line of await enforceCodexShellSnapshotPolicy(effectiveCodexHome)) {
+    await input.onLog("stdout", `${line}\n`);
+  }
   const { allSkills, selectedSkills, desiredSkillNames } = await resolveSelectedRuntimeSkills(input.config, input.moduleDir);
   const skillSetKey = await buildSkillSetKey({ skills: selectedSkills, label: "codex" });
   const skillsHome = path.join(effectiveCodexHome, "skills");
@@ -2595,11 +2614,33 @@ async function applySessionConfigOptions(input: {
     throw new Error(message);
   }
   for (const option of options) {
-    await input.runtime.setConfigOption({
-      handle: input.handle,
-      key: option.key,
-      value: option.value,
-    });
+    try {
+      await input.runtime.setConfigOption({
+        handle: input.handle,
+        key: option.key,
+        value: option.value,
+      });
+    } catch (err) {
+      // The advertised config surface varies by ACP agent build (some sessions
+      // of the same agent advertise `effort`, some do not), so an unsupported
+      // option here is not a fixed capability gap — retrying later can succeed
+      // with the same config unchanged. Drop the option and keep the session
+      // alive rather than failing the whole run over one optional control.
+      const code = isAcpRuntimeError(err)
+        ? err.code
+        : err && typeof err === "object" && typeof (err as { code?: unknown }).code === "string"
+          ? (err as { code: string }).code
+          : null;
+      if (code === "ACP_BACKEND_UNSUPPORTED_CONTROL") {
+        const message = err instanceof Error ? err.message : String(err);
+        await input.onLog(
+          "stderr",
+          `[paperclip] ACPX ${input.prepared.acpxAgent} session does not advertise config option '${option.key}' for this session; skipping. ${message}\n`,
+        );
+        continue;
+      }
+      throw err;
+    }
     await input.onLog(
       "stdout",
       `[paperclip] Applied ACPX ${input.prepared.acpxAgent} config ${option.key}=${option.value}\n`,
@@ -4205,27 +4246,25 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         processIdentitySink.current = ctx.onSpawn;
         flushChildStderr(childStderrState);
         childStderrState.logPath = prepared.childStderrLogPath;
+        // ACPX's own `FileSessionStore` creates `<stateDir>/sessions` and writes
+        // each record with no mode argument — 0755 and 0644 under the usual
+        // umask — and both calls live inside the vendored package, so the record
+        // files cannot be created at 0600 from here. Creating the directory at
+        // 0700 first is what is reachable: `ensureDir()` in the store is
+        // `mkdir(recursive)`, which leaves an existing directory's mode alone, so
+        // this wins the race by running before any load or save. Narrowing, not
+        // a control — see restricted-files.ts.
+        for (const line of await ensureRestrictedDir(path.join(prepared.stateDir, "sessions"))) {
+          await ctx.onLog("stderr", `${line}\n`);
+        }
         const persistedRuntimeStore = createRuntimeStore({ stateDir: prepared.stateDir });
-        const runtimeStore: AcpSessionStore = {
-          async load(id) {
-            const record = await persistedRuntimeStore.load(id);
-            if (!record) return undefined;
-            // ACPX resumes from the stored session options rather than the
-            // options passed to ensureSession. Keep conversation state, but
-            // launch the provider with this run's credentials and scratch paths.
-            return {
-              ...record,
-              acpx: {
-                ...record.acpx,
-                session_options: {
-                  ...record.acpx?.session_options,
-                  env: { ...prepared.env },
-                },
-              },
-            };
-          },
-          save: (record) => persistedRuntimeStore.save(record),
-        };
+        // `load` re-injects this run's launch environment (ACPX resumes from the
+        // stored session options, not the options passed to ensureSession) and
+        // `save` keeps that environment out of the on-disk record entirely.
+        const runtimeStore: AcpSessionStore = createCredentialSafeSessionStore({
+          persisted: persistedRuntimeStore,
+          launchEnv: prepared.env,
+        });
         const runtimeOptions: PaperclipAcpRuntimeOptions = {
           cwd: prepared.cwd,
           // Host-only spawn cwd for the relay proxy on the remote process-session
@@ -4662,6 +4701,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         outputSegments.push(currentOutputChunk.join(""));
         currentOutputChunk = [];
       };
+      // Whether the turn did anything beyond talking. The output-rejection seam
+      // below reads it: a turn that called a tool is doing work, so its text is
+      // never reclassified as a provider rejection, however the text reads.
+      let sawToolActivity = false;
       let eventBreakdown: AcpRuntimeUsageBreakdown | null = null;
       let eventCostUsd: number | null = null;
       // The turn-local state the sequence steps share. `promptBuild` sets the
@@ -4744,15 +4787,39 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         await emitPhase("prepare_turn", preparePhaseStart, "ok");
         turnPhaseStart = now();
       };
-      const stepTurnStart = (signal: AbortSignal, startTimeoutMs: number | undefined): StartedTurn => {
-        ctx.signal?.throwIfAborted();
+      // The run-loop turn gate (KEE-440). Thresholds come from adapter config, so
+      // they can be set to unlimited without a redeploy; the exemption comes from
+      // the card's own Budget section. Both are read once, before the first turn.
+      const turnGateThresholds = resolveTurnGateThresholds(ctx.config);
+      const turnGate = createTurnGate({
+        thresholds: turnGateThresholds,
+        budgetExempt: readTurnGateBudgetExemption(ctx.context),
+      });
+      // The signal the sequence owns. `stepTurnStart` captures it so a gate
+      // follow-up turn runs under the same abort and the same wall clock: the
+      // gate bounds tool calls, it must never extend a run past `timeoutSec`.
+      let turnSignal: AbortSignal | undefined;
+      let turnTimeoutMs: number | undefined;
+      const startAgentTurn = (text: string): AcpRuntimeTurn => {
         const turn = runtime.startTurn({
           handle: sessionHandle,
-          text: runPrompt,
+          text,
           mode: "prompt",
           requestId: ctx.runId,
-          timeoutMs: startTimeoutMs,
-          signal,
+          // KEE-440 (fork): the sequence owns the signal and the wall clock, and
+          // `stepTurnStart` captures both into these bindings before every call
+          // here — including the gate follow-up turn, which deliberately runs
+          // under the same abort and the same deadline rather than extending the
+          // run past `timeoutSec`. Upstream's `startTimeoutMs`/`signal` pair was
+          // live only while this call sat inline inside `stepTurnStart`; the
+          // extraction into `startAgentTurn` moved it out of their scope, so
+          // reading them here no longer resolves. These two are their replacement.
+          timeoutMs: turnTimeoutMs,
+          signal: turnSignal,
+          // Upstream terminal-failure classification. The fork has no
+          // `classifyTerminalSessionFailure` at all, so this survives only by
+          // taking this side; dropping it would silently turn every classified
+          // terminal session failure into an unclassified one at line 5114.
           // The callback belongs to this turn, including when a runtime is reused.
           // Raw provider text must never enter the result or the run log.
           ...(deps.classifyTerminalSessionFailure
@@ -4790,12 +4857,26 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               }, duplexLossCancelDeadlineMs);
             }
           };
+          // Re-arm per turn. A gate follow-up is a new turn, and a listener
+          // still bound to the previous one would cancel a turn that has
+          // already settled, leaving the live turn to wait out the deadline
+          // instead of ending as soon as the loss latches.
+          removeLossListener?.();
           removeLossListener = bridge.onLoss(cancelForLoss);
           const alreadyLatched = bridge.readRunDisposition?.();
           if (alreadyLatched?.failed) cancelForLoss(alreadyLatched.lossReason ?? "other");
         }
+        return turn;
+      };
+      const stepTurnStart = (signal: AbortSignal, startTimeoutMs: number | undefined): StartedTurn => {
+        ctx.signal?.throwIfAborted();
+        turnSignal = signal;
+        turnTimeoutMs = startTimeoutMs;
+        const turn = startAgentTurn(runPrompt);
         // ACP can resolve the turn before its provider exits. Keep the Stop
-        // deadline armed through settlement, including provider cleanup.
+        // deadline armed through settlement, including provider cleanup. This
+        // is armed once per run, not once per turn: it closes the session
+        // rather than the turn, so a gate follow-up needs no second arming.
         const armStopDeadline = () => {
           stopTimer = setTimeout(() => {
             forcedStop = true;
@@ -4815,7 +4896,9 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         if (ctx.signal?.aborted) armStopDeadline();
         return {
           cancel: async (reason: string) => {
-            await turn.cancel({ reason });
+            // Cancel whichever turn is live. After a gate follow-up that is the
+            // follow-up turn, not the first one.
+            await (activeTurn ?? turn).cancel({ reason });
           },
         };
       };
@@ -4830,63 +4913,123 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         stopReason: "paperclip_duplex_loss_deadline",
       };
       const stepEventRelay = async (): Promise<AcpRuntimeTurnResult> => {
-        const turn = activeTurn as AcpRuntimeTurn;
         const toolTitles = new Map<string, string>();
-        const drainEvents = (async (): Promise<void> => {
-          for await (const event of turn.events) {
-            // ACPX currently flattens client-side filesystem/terminal receipts
-            // into status text. They cannot establish complete action outcomes.
-            if (event.type === "status" && /^(fs|terminal)\//.test(event.text)) incompleteToolInventory = true;
-            if (event.type === "tool_call") {
-              if (!event.toolCallId) incompleteToolInventory = true;
-              else {
-                const previous = interruptionTools.get(event.toolCallId);
-                interruptionTools.set(event.toolCallId, {
-                  kind: event.kind ?? previous?.kind,
-                  status: event.status ?? previous?.status,
-                });
+        // Relay one turn's events, feeding tool calls to the gate. `loss` means
+        // the fail-fast deadline won and the agent is gone; otherwise `followUp`
+        // carries what the gate asked for, or null for an ungated finish.
+        type RelayOutcome =
+          | { kind: "loss" }
+          | { kind: "finished"; followUp: TurnGateFollowUp | null };
+        const relayOneTurn = async (turn: AcpRuntimeTurn, gated: boolean): Promise<RelayOutcome> => {
+          let followUp: TurnGateFollowUp | null = null;
+          const drainEvents = (async (): Promise<void> => {
+            for await (const event of turn.events) {
+              // ACPX currently flattens client-side filesystem/terminal receipts
+              // into status text. They cannot establish complete action outcomes.
+              if (event.type === "tool_call") sawToolActivity = true;
+              if (event.type === "status" && /^(fs|terminal)\//.test(event.text)) incompleteToolInventory = true;
+              if (event.type === "tool_call") {
+                if (!event.toolCallId) incompleteToolInventory = true;
+                else {
+                  const previous = interruptionTools.get(event.toolCallId);
+                  interruptionTools.set(event.toolCallId, {
+                    kind: event.kind ?? previous?.kind,
+                    status: event.status ?? previous?.status,
+                  });
+                }
               }
+              if (event.type === "text_delta" && event.stream !== "thought") {
+                currentOutputChunk.push(event.text);
+              } else if (event.type === "tool_call" && event.tag !== "tool_call_update") {
+                // ACP makes tool-call status optional. The normalized event tag is
+                // the reliable boundary between an initial call and its updates,
+                // so a statusless initial call must still end the preceding output
+                // segment while updates must not create extra boundaries.
+                flushOutputSegment();
+              }
+              if (event.type === "status" && event.tag === "usage_update") {
+                eventBreakdown = event.breakdown ?? eventBreakdown;
+                eventCostUsd = usdCostAmount(event.cost) ?? eventCostUsd;
+              }
+              await emitRuntimeEvent(ctx, event, toolTitles, prepared.coalescePlaceholderToolUpdates);
+              // Feed the gate after the event is relayed, so the transcript records
+              // the call that tripped the gate. Once a follow-up is pending the
+              // gate is ignored: the cancel is already in flight and the remaining
+              // events are just the stream draining.
+              if (!gated || followUp || event.type !== "tool_call") continue;
+              const decision = turnGate.observe({
+                toolCallId: typeof event.toolCallId === "string" ? event.toolCallId : "",
+                status: typeof event.status === "string" ? event.status : undefined,
+              });
+              if (!decision) continue;
+              followUp = buildTurnGateFollowUp(decision, turnGateThresholds);
+              await emitAcpxLog(ctx, {
+                type: "acpx.status",
+                text: `Paperclip turn gate: ${decision.kind} at ${decision.toolCalls} tool calls (threshold ${decision.threshold}).`,
+                tag: "turn_gate",
+              });
+              // Cancel, then keep draining. Breaking out of the loop instead would
+              // close the iterator before the runtime has flushed the events it had
+              // already produced, losing them from the transcript.
+              await turn.cancel({ reason: followUp.cancelReason });
             }
-            if (event.type === "text_delta" && event.stream !== "thought") {
-              currentOutputChunk.push(event.text);
-            } else if (event.type === "tool_call" && event.tag !== "tool_call_update") {
-              // ACP makes tool-call status optional. The normalized event tag is
-              // the reliable boundary between an initial call and its updates,
-              // so a statusless initial call must still end the preceding output
-              // segment while updates must not create extra boundaries.
-              flushOutputSegment();
-            }
-            if (event.type === "status" && event.tag === "usage_update") {
-              eventBreakdown = event.breakdown ?? eventBreakdown;
-              eventCostUsd = usdCostAmount(event.cost) ?? eventCostUsd;
-            }
-            await emitRuntimeEvent(ctx, event, toolTitles, prepared.coalescePlaceholderToolUpdates);
+          })();
+          // A latched loss already asked the agent to cancel (above, in
+          // `cancelForLoss`); that request settles neither `turn.events` nor
+          // `turn.result` by itself. Race the event drain against the fail-fast
+          // deadline so a silent agent cannot hold this wait open.
+          const eventsEnded = await Promise.race([
+            drainEvents.then(() => true as const),
+            lossDeadline.then(() => false as const),
+          ]);
+          if (!eventsEnded) {
+            // The deadline won: stop waiting on the agent. `closeStream` ends
+            // the event drain locally, with no agent cooperation required. Await
+            // both the close call and the drain it unblocks before this step
+            // returns, so no late runtime event can still mutate shared state
+            // (output segments, tool inventory) after finalization reads it.
+            await turn.closeStream({ reason: "paperclip duplex loss cancel deadline" }).catch(() => {});
+            await drainEvents.catch(() => {});
+            flushOutputSegment();
+            return { kind: "loss" };
           }
-        })();
-        // A latched loss already asked the agent to cancel (above, in
-        // `cancelForLoss`); that request settles neither `turn.events` nor
-        // `turn.result` by itself. Race the event drain against the fail-fast
-        // deadline so a silent agent cannot hold this wait open.
-        const eventsEnded = await Promise.race([
-          drainEvents.then(() => true as const),
-          lossDeadline.then(() => false as const),
-        ]);
-        if (!eventsEnded) {
-          // The deadline won: stop waiting on the agent. `closeStream` ends
-          // the event drain locally, with no agent cooperation required. Await
-          // both the close call and the drain it unblocks before this step
-          // returns, so no late runtime event can still mutate shared state
-          // (output segments, tool inventory) after finalization reads it.
-          await turn.closeStream({ reason: "paperclip duplex loss cancel deadline" }).catch(() => {});
-          await drainEvents.catch(() => {});
           flushOutputSegment();
-          return LOSS_DEADLINE_TERMINAL;
+          return { kind: "finished", followUp };
+        };
+
+        let turn = activeTurn as AcpRuntimeTurn;
+        let gated = turnGate.exemption === null;
+        for (;;) {
+          const outcome = await relayOneTurn(turn, gated);
+          if (outcome.kind === "loss") return LOSS_DEADLINE_TERMINAL;
+          // `turn.result` settles only when the agent's provider process
+          // returns or rejects; a latched loss that armed the deadline after
+          // the event drain already ended must still bound this wait.
+          const result: AcpRuntimeTurnResult = await Promise.race([
+            turn.result,
+            lossDeadline.then((): AcpRuntimeTurnResult => LOSS_DEADLINE_TERMINAL),
+          ]);
+          if (!outcome.followUp) return result;
+          // The gate fired. The first turn's terminal is a cancel we caused, so it
+          // is not the run's outcome — the follow-up turn's terminal is. But a
+          // follow-up is only worth starting if there is an agent left to answer
+          // it and wall clock left to answer in: a lost duplex channel or an
+          // aborted run returns the terminal it already has.
+          if (result === LOSS_DEADLINE_TERMINAL || lossDeadlineTripped) return result;
+          if (turnSignal?.aborted) return result;
+          await emitAcpxLog(ctx, {
+            type: "acpx.status",
+            text: `Paperclip turn gate: starting the ${outcome.followUp.kind} follow-up turn.`,
+            tag: "turn_gate",
+          });
+          // `relayOneTurn` already flushed, so the follow-up's output starts its
+          // own segment: the handback is never glued onto the sentence the cancel
+          // cut in half, and it is the last segment, so it becomes the run summary.
+          turn = startAgentTurn(outcome.followUp.prompt);
+          // After a hard stop the follow-up turn is ungated: it exists only to
+          // produce the handback, and gating it could leave the run with none.
+          gated = outcome.followUp.gated;
         }
-        flushOutputSegment();
-        // `turn.result` settles only when the agent's provider process
-        // returns or rejects; a latched loss that armed the deadline after
-        // the event drain already ended must still bound this wait.
-        return await Promise.race([turn.result, lossDeadline.then(() => LOSS_DEADLINE_TERMINAL)]);
       };
       const stepTurnFinalize = async (
         input: TurnFinalizeInput<AcpRuntimeTurnResult>,
@@ -4921,10 +5064,24 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
         const channelLostMessage = duplexLossReason
           ? `The sandbox duplex control channel was lost (${duplexLossReason}) before the run completed.`
           : null;
-        // A completed, non-timed-out turn whose channel stayed live is the one
-        // success path. Every other outcome — a failed, cancelled, or timed-out
-        // terminal, or a completed terminal with a lost channel — is a failure.
-        const turnSucceeded = terminal.status === "completed" && !timedOut && !channelLost;
+        // A provider that refuses the requested model can answer the rejection as
+        // ordinary assistant text and still end the turn `end_turn`. Nothing was
+        // done, but every operator surface reads healthy and the assigned card
+        // just never moves. Reclassify that turn here, so the run records the
+        // failure its output already describes. The seam runs only on an
+        // otherwise-success-eligible terminal: a failed, cancelled, timed-out or
+        // channel-lost turn already has a truer cause than its text.
+        const outputRejection =
+          terminal.status === "completed" && !timedOut && !channelLost
+            ? classifyAcpxOutputRejection({ outputSegments, sawToolActivity })
+            : null;
+        // A completed, non-timed-out turn whose channel stayed live and whose
+        // output is not a bare provider error payload is the one success path.
+        // Every other outcome — a failed, cancelled, or timed-out terminal, a
+        // completed terminal with a lost channel, or a completed terminal that
+        // only relayed a provider rejection — is a failure.
+        const turnSucceeded =
+          terminal.status === "completed" && !timedOut && !channelLost && outputRejection === null;
         // Read usage before the settlement can discard runtime state.
         const postTurnStatus = await readRuntimeStatus(runtime, sessionHandle);
         const turnUsage = summarizeAcpxTurnUsage({
@@ -4964,10 +5121,16 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
             ? "paperclip timeout cleanup"
             : channelLost
               ? "paperclip duplex channel lost cleanup"
-              : failedTurn
-                ? `paperclip turn ${terminal.status}`
-                : "paperclip completed turn cleanup",
-          discardPersistentState: sessionUnavailable || (terminal.status === "cancelled" && !preserveInterruptedSession) || timedOut || channelLost,
+              : outputRejection
+                ? `paperclip turn ${outputRejection.kind}`
+                : failedTurn
+                  ? `paperclip turn ${terminal.status}`
+                  : "paperclip completed turn cleanup",
+          // Discard the conversation a rejected turn leaves behind. Resuming it
+          // would replay a provider error payload as the last exchange, and the
+          // turn banked no work worth carrying forward.
+          discardPersistentState:
+            sessionUnavailable || (terminal.status === "cancelled" && !preserveInterruptedSession) || timedOut || channelLost || outputRejection !== null,
           dropWarmEntry: false,
           recordCloseError: false,
           cancelTurnReason: null,
@@ -4978,14 +5141,20 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           ? formatAdapterExecutionTimeoutErrorMessage(prepared.timeoutResolution)
           : channelLost
             ? channelLostMessage
-            : resultErrorMessage(terminal);
+            : outputRejection
+              ? outputRejection.message
+              : resultErrorMessage(terminal);
         const terminalStopReason = terminal.status === "failed" ? terminal.error.message : terminal.stopReason;
         const classifiedFailure = !timedOut && !channelLost && terminal.status === "failed"
           ? terminalFailureClassification
           : null;
         await emitAcpxLog(ctx, {
           type: turnSucceeded ? "acpx.result" : "acpx.error",
-          summary: channelLost ? "duplex_channel_lost" : terminal.status,
+          summary: channelLost
+            ? "duplex_channel_lost"
+            : outputRejection
+              ? outputRejection.kind
+              : terminal.status,
           stopReason: terminalStopReason,
           message: errorMessage,
         });
@@ -4998,13 +5167,15 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           signal: timedOut ? "SIGTERM" : null,
           timedOut,
           errorMessage,
-          errorCode: timedOut
-            ? "acpx_timeout"
-            : channelLost
-              ? DUPLEX_CHANNEL_LOST_ERROR_CODE
-              : terminal.status === "failed"
-                ? classifiedFailure?.errorCode ?? "acpx_turn_failed"
-                : null,
+          errorCode: outputRejection
+            ? outputRejection.errorCode
+            : timedOut
+              ? "acpx_timeout"
+              : channelLost
+                ? DUPLEX_CHANNEL_LOST_ERROR_CODE
+                : terminal.status === "failed"
+                  ? classifiedFailure?.errorCode ?? "acpx_turn_failed"
+                  : null,
           ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
           ...(classifiedFailure?.retryNotBefore ? { retryNotBefore: classifiedFailure.retryNotBefore } : {}),
           sessionId: sessionHandle.backendSessionId ?? sessionHandle.runtimeSessionName,
@@ -5016,7 +5187,10 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
           ...(turnUsage.usage ? { usage: turnUsage.usage, usageBasis: "per_run" as const } : {}),
           costUsd: turnUsage.costUsd,
           resultJson: {
-            status: channelLost ? "failed" : terminal.status,
+            // The provider's own stop reason stays on the record. It is the
+            // evidence for the reclassification, not a contradiction of it: a
+            // rejected turn really did end `end_turn`, which is the bug.
+            status: channelLost || outputRejection ? "failed" : terminal.status,
             ...(classifiedFailure?.errorFamily ? { errorFamily: classifiedFailure.errorFamily } : {}),
             ...(classifiedFailure?.retryNotBefore
               ? {
@@ -5027,6 +5201,7 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
                 }
               : {}),
             stopReason: terminalStopReason,
+            ...(outputRejection ? { outputRejection: outputRejection.kind } : {}),
             permissionMode: prepared.permissionMode,
             mode: prepared.mode,
             requestedModel: prepared.requestedModel || null,
@@ -5092,6 +5267,16 @@ export function createAcpxEngineExecutor(deps: AcpxEngineExecutorOptions = {}) {
               kind: "turn_failed",
               error: terminal.error instanceof Error ? terminal.error : new Error(String(terminal.error)),
             },
+            resources: emptyConsumed,
+          };
+        }
+        // A completed terminal that only relayed a provider rejection returns a
+        // failed completion for the same reason: the coordinator settles for a
+        // failure and the reuse decision forbids saving the session.
+        if (outputRejection) {
+          return {
+            kind: "failed",
+            cause: { kind: "turn_failed", error: new Error(outputRejection.message) },
             resources: emptyConsumed,
           };
         }

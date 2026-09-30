@@ -1,11 +1,12 @@
 import type { ExecutionContinuationEnvelope } from "@paperclipai/shared";
 import { spawn, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { constants as fsConstants, promises as fs, type Dirent } from "node:fs";
+import { constants as fsConstants, promises as fs, readFileSync, readdirSync, type Dirent } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { CONNECTION_INTENT_AGENT_GUIDANCE } from "@paperclipai/shared";
 import { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
+import { SUPERVISOR_NOTIFY_ENV_KEYS } from "./supervisor-notify-env.js";
 import {
   buildLocalProcessSandboxSpawnTarget,
   type LocalProcessSandboxOptions,
@@ -63,6 +64,12 @@ export interface RunProcessResult {
   // duplex control channel died before a clean completion.
   errorCode?: string | null;
   terminalResultCleanup?: TerminalResultCleanupEvidence | null;
+  // The message of a stdin write that the child refused (EPIPE when the child
+  // exits before draining its input), or absent when stdin was never written or
+  // the write completed. Additive-optional for the same reason as the fields
+  // above: the run's exit status already reports the child's own failure, and
+  // this names the side-channel failure that went with it.
+  stdinWriteError?: string | null;
 }
 
 export interface TerminalResultCleanupOptions {
@@ -141,6 +148,263 @@ export function signalRunningProcess(
   if (running.child.exitCode === null && running.child.signalCode === null) {
     running.child.kill(signal);
   }
+}
+
+// A run's own descendants do not reliably stay in the run's process group.
+// `runChildProcess` spawns detached, so the direct child becomes a process-group
+// leader, and cancellation signals `-processGroupId` — which only reaches
+// processes still in that group.
+//
+// Tool commands break that. The Hermes adapter (and our own tool shell) runs a
+// command through a login shell and then a script, and those scripts wrap
+// long-running work in `timeout` (for example `timeout 900 pnpm --filter server
+// exec vitest ...`). `timeout` puts its payload in a NEW process group via
+// `setpgid(0, 0)` — same session, different group — so the payload, `pnpm`, and
+// the `tsc`/`vitest` worker under it all land outside the run's group. Measured
+// on the live service during the incident:
+//
+//   hermes   pid=1239232 pgid=1239232 sid=1239232   <- what cancellation signals
+//     bash -lic        pid=1446549 pgid=1446549
+//       bash <script>  pid=1446680 pgid=1446549
+//         timeout 900 pnpm ... vitest  pid=1469916 pgid=1469916 sid=1446549  612 MB
+//
+// `kill(-1239232)` reaches none of pgid 1446549 or 1469916. Note the session is
+// unchanged, so this is a process-group escape, not a `setsid` and not an
+// `exec`. Verified by isolating each construct: a bare `sleep`, and
+// `sh -c 'exec sleep'`, both stay in the parent's group; `timeout 60 sleep 60`
+// alone produces `pgid == pid` in the same session. Half of the heavy processes
+// inside the service cgroup were in a group of their own, and the largest single
+// holders (`tsc` 1.45 GB, `vitest` 1.07 GB) were among them. They outlived
+// cancellation and accumulated until systemd-oomd killed the unit.
+//
+// The reliable identifier is the environment: Paperclip assigns
+// `PAPERCLIP_RUN_ID` to the run's child and that assignment is inherited by
+// every descendant, including the ones that moved to another process group.
+// Matching on it finds the whole run regardless of how it re-grouped itself.
+//
+// Safety properties this relies on, both verified against the live service:
+//   1. The Paperclip server process does NOT carry `PAPERCLIP_RUN_ID` (it
+//      assigns it, it does not inherit one), so a sweep can never signal the
+//      server or anything outside a run.
+//   2. The match is an exact string equality on a single well-known key, so it
+//      cannot collide with an unrelated process.
+const RUN_ID_ENV_KEY = "PAPERCLIP_RUN_ID";
+const IS_LINUX = process.platform === "linux";
+
+function readRunIdFromProc(pid: number): string | null {
+  try {
+    const raw = readFileSync(`/proc/${pid}/environ`, "utf8");
+    for (const entry of raw.split("\0")) {
+      if (!entry.startsWith(`${RUN_ID_ENV_KEY}=`)) continue;
+      const value = entry.slice(RUN_ID_ENV_KEY.length + 1);
+      if (value.length > 0) return value;
+    }
+  } catch {
+    // The process exited between the scan and the read, or /proc is unavailable.
+  }
+  return null;
+}
+
+function isLivePid(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    // EPERM means the process exists but is owned by another user; that still
+    // counts as live for the purposes of "should we try to signal it".
+    return (err as NodeJS.ErrnoException)?.code === "EPERM";
+  }
+}
+
+// Re-read the run id immediately before signalling, so a pid recycled between the
+// scan and the kill is not signalled on the strength of a stale attribution.
+//
+// Without this, a `timeout`-wrapped run that exits during the sweep frees its pid
+// for an unrelated process, and we would send a signal to a process that has
+// nothing to do with the run. Linux reuses pids freely under memory pressure,
+// which is exactly the condition under which this sweep runs. The cost is a
+// second /proc read per candidate; the candidates are few.
+//
+// The reader is passed in rather than imported so the scan and the recheck
+// necessarily use the same attribution source. A recheck that silently fell back
+// to /proc while the scan used an injected reader would be a different check from
+// the one the caller asked for.
+function stillAttributedToRun(
+  pid: number,
+  runId: string,
+  readRunId: (pid: number) => string | null,
+): boolean {
+  return readRunId(pid) === runId;
+}
+
+export interface RunDescendantSweepOptions {
+  /**
+   * Extra pids to never signal. These are UNIONed with this process, never
+   * substituted for it: a caller must not be able to make the server itself
+   * sweepable by omitting its own pid from the exclusion set.
+   */
+  excludePids?: Iterable<number>;
+  /**
+   * Process GROUPS to preserve in full. Every member of these groups is treated
+   * as excluded, not just the leader.
+   *
+   * This exists because excluding a pid is not sufficient to keep a process
+   * alive. A session carrier is commonly a supervisor (`timeout`, a wrapper
+   * script, a login shell) whose payload is a child in the SAME process group.
+   * Signalling the payload kills the supervisor transitively -- measured:
+   * `timeout 30 sleep 30`, SIGKILL on the `sleep` alone, leaves the `timeout`
+   * reported as "Killed". Excluding the supervisor's pid would therefore not
+   * save it; the whole group has to be preserved.
+   */
+  preserveProcessGroupIds?: Iterable<number>;
+  /** Injectable pid source; defaults to a /proc scan. Test seam only. */
+  listPids?: () => number[];
+  /**
+   * Injectable attribution reader. Test seam only; defaults to /proc.
+   * Production must not override it, or the pid-reuse guard is meaningless.
+   */
+  readRunId?: (pid: number) => string | null;
+  /**
+   * Skip the pre-signal attribution recheck. Test seam only: setting this
+   * bypasses the PID-reuse guard, so it exists purely to exercise the failure
+   * branch deterministically.
+   */
+  skipIdentityRecheck?: boolean;
+  /**
+   * Injectable process-group lookup. Test seam only; defaults to /proc.
+   * Defaults to `null` (unknown) when it cannot be read, which fails SAFE:
+   * an unknown group is preserved, never signalled.
+   */
+  readProcessGroupId?: (pid: number) => number | null;
+}
+
+export interface RunDescendantSweepResult {
+  /** Ids swept, i.e. processes matching the run id other than the excluded set. */
+  matchedRunIds: string[];
+  /** Pids that were alive, still attributed to the run, and were signalled. */
+  signaledPids: number[];
+  /** Pids that matched but had already exited by the time we signalled. */
+  alreadyExited: number[];
+  /**
+   * Pids whose run id no longer matched at the moment before signalling. These
+   * are almost always pid reuse: the pid existed when we scanned it and belongs
+   * to something else by the time we act. Deliberately NOT signalled.
+   */
+  attributionLost: number[];
+  /** Ids deliberately skipped because they were in the exclusion set. */
+  excludedPids: number[];
+}
+
+function defaultListPids(): number[] {
+  return readdirSync("/proc")
+    .map((entry) => Number.parseInt(entry, 10))
+    .filter((pid) => Number.isInteger(pid) && pid > 0);
+}
+
+// /proc/<pid>/stat field 5 is the process group id. Field 2 (comm) can contain
+// spaces and parentheses, so the parse anchors on the LAST ')' before the rest.
+// Exported so a caller that must preserve a process can also preserve the
+// process GROUP it leads, without re-implementing the parse.
+export function readProcessGroupIdFromProc(pid: number): number | null {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const close = stat.lastIndexOf(")");
+    if (close < 0) return null;
+    const fields = stat.slice(close + 2).trim().split(/\s+/);
+    // After comm, field 3 is state and field 4 is ppid, so ppgid is index 2.
+    const pgid = Number.parseInt(fields[2] ?? "", 10);
+    return Number.isInteger(pgid) && pgid > 0 ? pgid : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Signal every live process that carries `runId` in its environment, excluding
+ * this process and `excludePids`.
+ *
+ * This is a companion to the process-group signal, not a replacement: the group
+ * signal stays the fast path, and this catches descendants that a
+ * `timeout`-wrapped command placed in a process group of their own. Both are
+ * needed because neither alone reaches the whole run.
+ *
+ * The sweep does not depend on the run's own process being alive. The orphan case
+ * -- Hermes and the main process group already gone, `timeout`/login-shell
+ * descendants still holding memory -- is precisely the case that needs this, and
+ * gating on main-process liveness would skip it.
+ */
+export function sweepRunDescendantsByRunId(
+  runId: string,
+  signal: NodeJS.Signals,
+  options: RunDescendantSweepOptions = {},
+): RunDescendantSweepResult {
+  // Union, never replace: this process is excluded unconditionally so no caller
+  // can make the Paperclip server sweepable by passing its own excludePids.
+  const exclude = new Set<number>(options.excludePids ?? []);
+  exclude.add(process.pid);
+  // Whole groups to preserve. Membership is expanded per candidate pid, so a
+  // supervisor's payload in the same group is preserved with it. See
+  // `preserveProcessGroupIds` for why pid-level exclusion is not enough.
+  const preserveGroups = new Set<number>();
+  for (const groupId of options.preserveProcessGroupIds ?? []) {
+    if (Number.isInteger(groupId) && groupId > 0) preserveGroups.add(groupId);
+  }
+  const readProcessGroupId = options.readProcessGroupId ?? readProcessGroupIdFromProc;
+  const listPids = options.listPids ?? defaultListPids;
+  const readRunId = options.readRunId ?? readRunIdFromProc;
+  const result: RunDescendantSweepResult = {
+    matchedRunIds: [],
+    signaledPids: [],
+    alreadyExited: [],
+    attributionLost: [],
+    excludedPids: [],
+  };
+  if (!runId) return result;
+  // Without /proc there is no way to attribute a process to a run, and guessing
+  // from the command line could match an unrelated process. Do nothing rather
+  // than signal something we cannot identify.
+  if (!IS_LINUX) return result;
+
+  const seenRunIds = new Set<string>();
+  for (const pid of listPids()) {
+    if (exclude.has(pid)) {
+      result.excludedPids.push(pid);
+      continue;
+    }
+    // A preserved group is preserved in full. An unreadable group id is treated
+    // as "unknown" and preserved too: failing safe here can leak one process,
+    // whereas failing open would kill a session the caller asked to keep.
+    if (preserveGroups.size > 0) {
+      const groupId = readProcessGroupId(pid);
+      if (groupId === null || preserveGroups.has(groupId)) {
+        result.excludedPids.push(pid);
+        continue;
+      }
+    }
+    if (readRunId(pid) !== runId) continue;
+    seenRunIds.add(runId);
+    if (!isLivePid(pid)) {
+      result.alreadyExited.push(pid);
+      continue;
+    }
+    // Re-attribute immediately before signalling. Between the scan above and this
+    // point the original process may have exited and had its pid reused; the run
+    // id in /proc is then someone else's, and signalling it would be a
+    // cross-run kill.
+    if (!options.skipIdentityRecheck && !stillAttributedToRun(pid, runId, readRunId)) {
+      result.attributionLost.push(pid);
+      continue;
+    }
+    try {
+      process.kill(pid, signal);
+      result.signaledPids.push(pid);
+    } catch {
+      // Exited between the liveness check and the signal.
+      result.alreadyExited.push(pid);
+    }
+  }
+  result.matchedRunIds = [...seenRunIds];
+  return result;
 }
 
 export const runningProcesses = new Map<string, RunningProcess>();
@@ -4633,6 +4897,25 @@ export async function runChildProcess(
       delete rawMerged[key];
     }
 
+    // Applied here rather than at each call site, because this merge re-spreads
+    // `process.env` and layers the caller's env on top: a call site that
+    // removed NOTIFY_SOCKET from its own env object is silently undone by this
+    // function. Paperclip runs as a `Type=notify` unit with `NotifyAccess=all`,
+    // so an inherited NOTIFY_SOCKET is a write capability on this unit's own
+    // notify socket. A child that sends `STOPPING=1` puts the unit into
+    // deactivating/stop-sigterm without any signal reaching the main process, so
+    // the main process never runs its shutdown path, emits none of its teardown
+    // log lines, and the supervisor SIGKILLs the whole control group at
+    // TimeoutStopSec with every child worker undrained (KEE-1149).
+    //
+    // The caller's value still wins if it names one of these keys: an adapter
+    // that deliberately targets a *different* unit's socket is a real (if
+    // unusual) configuration, and this must not silently override it.
+    for (const key of SUPERVISOR_NOTIFY_ENV_KEYS) {
+      if (opts.env && key in opts.env) continue;
+      delete rawMerged[key];
+    }
+
     const mergedEnv = ensurePathInEnv(rawMerged);
     if (opts.localProcessSandbox?.homeDir) {
       mergedEnv.HOME = opts.localProcessSandbox.homeDir;
@@ -4688,12 +4971,36 @@ export async function runChildProcess(
         let terminalCleanupKillTimer: NodeJS.Timeout | null = null;
         let terminalResultStdoutScanOffset = 0;
         let terminalResultStderrScanOffset = 0;
+        let stdinWriteError: Error | null = null;
 
         const clearTerminalCleanupTimers = () => {
           if (terminalCleanupTimer) clearTimeout(terminalCleanupTimer);
           if (terminalCleanupKillTimer) clearTimeout(terminalCleanupKillTimer);
           terminalCleanupTimer = null;
           terminalCleanupKillTimer = null;
+        };
+
+        // Companion to the process-group signal: catches descendants that a
+        // `timeout`-wrapped tool command detached into a process group of their
+        // own, which `-processGroupId` cannot reach. The run's direct child is
+        // excluded because `signalRunningProcess` already owns it, and this
+        // process is excluded by default.
+        // Named `sweepEscapedRunProcesses` rather than `sweepRunDescendants` so it
+        // does not shadow the module-level `sweepRunDescendantsByRunId` binding
+        // that it calls.
+        const sweepEscapedRunProcesses = (sig: NodeJS.Signals) => {
+          if (typeof child.pid !== "number" || child.pid <= 0) return;
+          try {
+            sweepRunDescendantsByRunId(runId, sig, {
+              excludePids: [child.pid],
+            });
+          } catch (err) {
+            onLogError(
+              err,
+              runId,
+              "failed to sweep escaped run descendants",
+            );
+          }
         };
 
         const maybeArmTerminalResultCleanup = () => {
@@ -4742,12 +5049,14 @@ export async function runChildProcess(
             terminalCleanupStarted = true;
             terminalCleanupSignal = "SIGTERM";
             signalRunningProcess({ child, processGroupId }, "SIGTERM");
+            sweepEscapedRunProcesses("SIGTERM");
             terminalCleanupKillTimer = setTimeout(
               () => {
                 terminalCleanupKillTimer = null;
                 terminalCleanupSignal = "SIGKILL";
                 terminalCleanupForceKilled = true;
                 signalRunningProcess({ child, processGroupId }, "SIGKILL");
+                sweepEscapedRunProcesses("SIGKILL");
               },
               Math.max(1, opts.graceSec) * 1000,
             );
@@ -4760,9 +5069,11 @@ export async function runChildProcess(
                 timedOut = true;
                 clearTerminalCleanupTimers();
                 signalRunningProcess({ child, processGroupId }, "SIGTERM");
+                sweepEscapedRunProcesses("SIGTERM");
                 setTimeout(
                   () => {
                     signalRunningProcess({ child, processGroupId }, "SIGKILL");
+                    sweepEscapedRunProcesses("SIGKILL");
                   },
                   Math.max(1, opts.graceSec) * 1000,
                 );
@@ -4807,10 +5118,32 @@ export async function runChildProcess(
 
         const stdin = child.stdin;
         if (opts.stdin != null && stdin) {
+          // A child that exits before it drains stdin (bad flag, early crash,
+          // a fast nonzero exit) closes the pipe and the pending write fails
+          // with EPIPE. `child.stdin` is an EventEmitter with no default error
+          // handling: an unhandled 'error' event takes down the whole Paperclip
+          // server, not just this run. The run's own result already reports the
+          // child's exit status, so record the write failure as a log line and
+          // let the child close the promise.
+          stdin.on("error", (err: Error) => {
+            stdinWriteError = err;
+            void opts.onLog(
+              "stderr",
+              `[runChildProcess] stdin write failed after the child closed its input: ${err.message}\n`,
+            );
+          });
           void spawnPersistPromise.finally(() => {
             if (child.killed || stdin.destroyed) return;
-            stdin.write(opts.stdin as string);
-            stdin.end();
+            try {
+              stdin.write(opts.stdin as string);
+              stdin.end();
+            } catch (err) {
+              stdinWriteError = err instanceof Error ? err : new Error(String(err));
+              void opts.onLog(
+                "stderr",
+                `[runChildProcess] stdin write failed synchronously: ${stdinWriteError.message}\n`,
+              );
+            }
           });
         }
 
@@ -4850,6 +5183,7 @@ export async function runChildProcess(
                     stderr,
                     pid: child.pid ?? null,
                     startedAt,
+                    stdinWriteError: stdinWriteError ? stdinWriteError.message : null,
                     terminalResultCleanup: terminalCleanupStarted
                       ? {
                           kind: "terminal_result_cleanup",

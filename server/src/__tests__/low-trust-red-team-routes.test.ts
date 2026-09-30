@@ -3,8 +3,8 @@ import { createServer } from "node:http";
 import express from "express";
 import request from "supertest";
 import { WebSocketServer } from "ws";
-import { and, eq } from "drizzle-orm";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { and, eq, inArray } from "drizzle-orm";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import {
   activityLog,
   agentWakeupRequests,
@@ -57,6 +57,84 @@ const describeEmbeddedPostgres = embeddedPostgresSupport.supported
   ? describe
   : describe.skip;
 
+// Every `PATCH /api/issues/:id` in this suite dispatches a wakeup fire-and-forget
+// (`void heartbeat.wakeup(...)`), and the route builds its own heartbeat service
+// (`server/src/routes/issues.ts`) from live `process.env` — there is no
+// `runtimeEnv` option on `issueRoutes`, so the test cannot hand that instance a
+// different environment. Left live, each wake reaches
+// `startNextQueuedRunForAgent`, which takes the per-agent start lock
+// (`withAgentStartLock`, `server/src/services/agent-start-lock.ts`) and then
+// dispatches a REAL run. This suite seeds no adapter command, so every one of
+// those runs dies immediately in the process adapter with
+// "Process adapter missing command" — the dispatches are pure noise, never test
+// intent. Measured on this host: 12 such dispatches per whole-file run, on both
+// green and red runs, several within the same second for the same agent.
+//
+// What that noise costs is a teardown budget. `withAgentStartLock` serialises
+// starts per agent and gives up only after
+// `AGENT_START_LOCK_STALE_MS = 30_000`, while this file's `afterEach` has a
+// 30s `hookTimeout` (`server/vitest.config.ts`) and awaits those executions via
+// `drainHeartbeatRunsToQuiescence` -> `drainActiveRunExecutions`. A competing
+// start that finds the lock held therefore spends up to 30s INSIDE the hook, and
+// 30s cannot clear 30s. That is the captured failure: the only `afterEach`
+// breach in the KEE-1020 candidate logs carries
+// `WARN: agent start lock timed out; continuing queued-run start
+// {staleMs: 30000}`, and that line is absent from all three green candidate
+// runs — a 1:1 correlation with the single breach.
+//
+// So correct the test-owned run lifecycle instead of reaching for a budget. The
+// run engine is off by default for these route-regression tests: under
+// suppression `enqueueWakeup` writes a `skipped` request and returns null
+// (`server/src/services/heartbeat.ts`), so there is no run row, no start-lock
+// acquisition, and nothing for the drain to wait on. Nothing in production
+// changes — `resolveHeartbeatSchedulingSuppression` is read per call, so this
+// only redirects the wakeups this test itself dispatches.
+//
+// The ONE test that deliberately exercises the run engine — "redacts
+// quarantined low-trust output from higher-trust wake and continuation
+// contexts" — drives it through its OWN `heartbeatService(db, { runtimeEnv })`
+// instance, which passes an explicit environment with the suppression keys set
+// to "false". That instance is immune to this file's live `process.env`, which
+// the negative control confirmed: with the opt-in deliberately removed, that
+// test still passed (1 passed, 10 skipped). The opt-in below is kept anyway
+// because the same test also drives the ROUTE-dispatched wakeups, which do read
+// the live environment.
+const RUN_ADMISSION_SUPPRESSED_ENVS = [
+  "PAPERCLIP_IN_WORKTREE",
+  "PAPERCLIP_DATABASE_RESTORE_IN_PROGRESS",
+  "PAPERCLIP_RESTORE_IN_PROGRESS",
+] as const;
+
+// Suppression is read per call and never cached, so restoring in `afterEach`
+// bounds it to a single test. Preserve any pre-existing value so this file does
+// not leak a mutated environment into a sibling suite in the same worker.
+const priorRunAdmissionEnv = new Map<string, string | undefined>();
+let allowRunExecutionForThisTest = false;
+
+// Single entry point for the suite's admission state, so the opt-in flag is the
+// only thing a test has to set. `beforeEach` calls this with the flag reset.
+function applyRunAdmissionForTest() {
+  setRunAdmissionSuppressed(!allowRunExecutionForThisTest);
+}
+
+function setRunAdmissionSuppressed(suppressed: boolean) {
+  if (suppressed) {
+    for (const key of RUN_ADMISSION_SUPPRESSED_ENVS) {
+      if (!priorRunAdmissionEnv.has(key)) {
+        priorRunAdmissionEnv.set(key, process.env[key]);
+      }
+      process.env[key] = "true";
+    }
+    return;
+  }
+  for (const key of RUN_ADMISSION_SUPPRESSED_ENVS) {
+    const prior = priorRunAdmissionEnv.get(key);
+    if (prior === undefined) delete process.env[key];
+    else process.env[key] = prior;
+  }
+  priorRunAdmissionEnv.clear();
+}
+
 if (!embeddedPostgresSupport.supported) {
   console.warn(
     `Skipping embedded Postgres low-trust route tests on this host: ${
@@ -93,6 +171,180 @@ function isHeartbeatCleanupFkError(error: unknown) {
       "heartbeat_runs_wakeup_request_id_agent_wakeup_requests_id_fk",
     )
   );
+}
+
+// `drainHeartbeatRunsToQuiescence` only returns early when NO row in
+// `heartbeat_runs` is queued or running. The runs `seedLowTrustFixture` seeds
+// are synthetic rows this test inserts directly: nothing registers them with
+// the heartbeat service, so no real execution can ever transition them out of
+// `running` and the drain's exit condition is unreachable. The drain then
+// silently burns its entire 50-attempt budget on every test, and whether the
+// afterEach lands inside vitest's 30s hookTimeout becomes a function of how
+// loaded the host is: comfortable on an idle workstation, over budget on the CI
+// shard runner that shares the box with four sibling shards.
+//
+// Settle this suite's OWN seed rows before the global drain, so the drain still
+// performs its real job (waiting for genuinely in-flight runs to flush) and
+// then reaches its exit condition on its first or second pass. This is scoped
+// to the ids this fixture inserted, so a real in-flight run is never
+// short-circuited, and it removes the ordering problem rather than raising a
+// budget.
+async function settleSeededHeartbeatRuns(db: Db, runIds: Set<string>) {
+  if (runIds.size === 0) return;
+  const ids = [...runIds];
+  runIds.clear();
+  await db
+    .update(heartbeatRuns)
+    .set({ status: "succeeded", finishedAt: new Date() })
+    .where(inArray(heartbeatRuns.id, ids));
+}
+
+// `resolveActiveIssueRun` (server/src/routes/issues.ts) has a second source of
+// truth beyond `issue.executionRunId`: once that is null it falls back to
+// `getActiveRunForAgent(assigneeAgentId)`, which returns the most recent
+// `running` run for that agent WITHOUT scoping by issue
+// (server/src/services/heartbeat.ts). The PATCHes in this test dispatch
+// wakeups fire-and-forget (`void heartbeat.wakeup(...)`), and
+// `drainActiveRunExecutions` exists precisely because such a wake is not
+// observable until it registers. On a loaded runner one of those wakeups can
+// still be in flight at the write below, register a fresh `running` run for the
+// same agent scoped to this same issue, and re-arm the live-lock guard -- so the
+// write fails 409 where 200 is expected. That is a load-dependent test defect,
+// not a route defect.
+//
+// Settle those, and only those. The match is on agent AND
+// `contextSnapshot.issueId`; scoping by agent alone would also settle
+// `fixture.runs.standardReport`, which belongs to the same `standard` agent and
+// is the very run the 409 assertion further down depends on, silently
+// weakening the guard this suite exists to prove.
+//
+// This variant returns the settled count, so a caller that needs to know
+// whether anything was still running does not have to repeat the select. Same
+// scoping (agent AND contextSnapshot.issueId), same 3-pass bound, same single
+// drain per pass; this only surfaces the result.
+async function settleStrayRunsForIssueReturningCount(
+  db: Db,
+  heartbeat: ReturnType<typeof heartbeatService>,
+  agentId: string,
+  issueId: string,
+) {
+  // Bounded passes: each drain awaits wakeups that were still before run
+  // registration, and an execution that dispatched one can register a further
+  // run. The pass cap is a backstop, not the expected path.
+  for (let pass = 0; pass < 3; pass += 1) {
+    await heartbeat.drainActiveRunExecutions();
+    const running = await db
+      .select({
+        id: heartbeatRuns.id,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.agentId, agentId),
+          eq(heartbeatRuns.status, "running"),
+        ),
+      );
+    const matching = running
+      .filter((run) => run.contextSnapshot?.issueId === issueId)
+      .map((run) => run.id);
+    if (matching.length === 0) return 0;
+    await db
+      .update(heartbeatRuns)
+      .set({ status: "succeeded", finishedAt: new Date() })
+      .where(inArray(heartbeatRuns.id, matching));
+  }
+  return 1;
+}
+
+async function settleStrayRunsForIssue(
+  db: Db,
+  heartbeat: ReturnType<typeof heartbeatService>,
+  agentId: string,
+  issueId: string,
+) {
+  await settleStrayRunsForIssueReturningCount(db, heartbeat, agentId, issueId);
+}
+
+// Each `PATCH /api/issues/:id` dispatches its wakeup fire-and-forget
+// (`void heartbeat.wakeup(...)` inside the route's post-commit IIFE), and the
+// woken run can check the issue out again — which re-sets `executionRunId` and
+// re-arms the live-lock guard that refuses a non-terminal external write. One
+// drain before the block therefore only covers the wakeups dispatched *before*
+// it: the writes inside the block dispatch six more, and under load one of
+// those is still registering when the next write lands. That is the 409 at the
+// bare `{ status: "todo" }` write.
+//
+// So establish the precondition AT the write. This helper is the same drain and
+// settle KEE-1029 added, re-invoked immediately before each write in the block
+// so it covers that write's own predecessors, plus the issue-lock clear that the
+// single early drain used to do. No sleep, no timeout change, no assertion
+// retry: the guard still refuses anything genuinely live (see the
+// `.expect(409)` on `standardChild` below, which is left untouched).
+async function quiesceAssignedReviewForWrite(
+  db: Db,
+  heartbeat: ReturnType<typeof heartbeatService>,
+  agentId: string,
+  issueId: string,
+  opts: { keepRunRef?: string } = {},
+) {
+  // `keepRunRef` names a run whose `contextSnapshot` carries the trust
+  // boundary. The reparent stop relay reads that boundary from the assignee's
+  // run via `issue.checkoutRunId ?? issue.executionRunId`, so clearing both
+  // makes `resolveAgentTrustForIssue` fall through to `standard` and silently
+  // suppresses the relay. Measured on this host: with the reference cleared the
+  // issue was still `status: "blocked"` under the right parent, yet
+  // `reparentedRelayComments` was empty.
+  //
+  // Only the reparent write needs this, and it is exempt from the live-lock
+  // guard (a `blocked` write under a parent relays), so pointing it at a
+  // settled-but-present run is safe and costs one update instead of another
+  // convergence loop.
+  if (opts.keepRunRef) {
+    await db
+      .update(issues)
+      .set({
+        checkoutRunId: opts.keepRunRef,
+        executionRunId: opts.keepRunRef,
+        executionAgentNameKey: null,
+        executionLockedAt: null,
+      })
+      .where(eq(issues.id, issueId));
+    return;
+  }
+  // A woken run can re-register a successor run while a pass is settling, so
+  // drain+settle until the issue is clear or the pass bound is reached. The
+  // bound is a backstop; a loaded runner that cannot converge in this many
+  // passes fails the write loudly below rather than passing quietly.
+  //
+  // The check is the one `settleStrayRunsForIssue` already performs internally:
+  // it selects the agent's running runs, filters them to this issue, and only
+  // writes when the match is non-empty. Re-querying here duplicated that
+  // select on every pass of every one of the six writes, and each extra query
+  // is contention-bound on a loaded host — which is what pushed the
+  // `afterEach` teardown past 30s in one measured run. One check per pass is
+  // enough: if the helper found nothing to settle, the issue is clear.
+  for (let pass = 0; pass < 5; pass += 1) {
+    const settled = await settleStrayRunsForIssueReturningCount(
+      db,
+      heartbeat,
+      agentId,
+      issueId,
+    );
+    if (settled === 0) break;
+  }
+  // Release the execution lock a re-checkout may have re-taken. The block under
+  // test exercises the stop relay, not run ownership, and the seeded lock was
+  // already released above; this keeps that precondition true write by write.
+  await db
+    .update(issues)
+    .set({
+      checkoutRunId: null,
+      executionRunId: null,
+      executionAgentNameKey: null,
+      executionLockedAt: null,
+    })
+    .where(eq(issues.id, issueId));
 }
 
 async function deleteHeartbeatRunsAndWakeupsAfterActivityLogDrains(db: Db) {
@@ -408,7 +660,7 @@ async function createQuarantinedContinuationSummary(
   return document!;
 }
 
-async function seedLowTrustFixture(db: Db) {
+async function seedLowTrustFixture(db: Db, seededRunIds?: Set<string>) {
   const nonce = randomUUID().slice(0, 8);
   const canary = (label: string) => `LT_REDTEAM_${nonce}_${label}`;
   const canaries = {
@@ -634,6 +886,13 @@ async function seedLowTrustFixture(db: Db) {
       contextSnapshot: { issueId: standardChild!.id },
     })
     .returning();
+  // These three rows are synthetic: they model a run holding execution so the
+  // route guards have something to refuse. They are not registered with the
+  // heartbeat service, so nothing can ever finish them. Record their ids for
+  // settleSeededHeartbeatRuns to settle in afterEach.
+  for (const run of [lowTrustRun!, standardRun!, standardReportRun!]) {
+    seededRunIds?.add(run.id);
+  }
   await db
     .update(issues)
     .set({
@@ -851,6 +1110,11 @@ describeEmbeddedPostgres(
     let tempDb: Awaited<
       ReturnType<typeof startEmbeddedPostgresTestDatabase>
     > | null = null;
+    // Ids of the synthetic `heartbeat_runs` rows `seedLowTrustFixture` inserts.
+    // Tracked so afterEach can settle exactly those before the global drain —
+    // see settleSeededHeartbeatRuns. Scoped per test so a run seeded by one
+    // test can never mask a real in-flight run in the next.
+    const seededRunIds = new Set<string>();
 
     beforeAll(async () => {
       tempDb = await startEmbeddedPostgresTestDatabase(
@@ -859,7 +1123,60 @@ describeEmbeddedPostgres(
       db = createDb(tempDb.connectionString);
     }, 20_000);
 
+    // Off by default for every test in this suite: a route-dispatched wakeup
+    // must not start a real run, take the per-agent start lock, and leave the
+    // teardown drain waiting out `AGENT_START_LOCK_STALE_MS` against a 30s
+    // hookTimeout. See the RUN_ADMISSION_SUPPRESSED_ENVS block above. The one
+    // test that does drive the run engine opts back in below.
+    beforeEach(() => {
+      allowRunExecutionForThisTest = false;
+      applyRunAdmissionForTest();
+    });
+
     afterEach(async () => {
+      // NOTE: the environment is deliberately NOT restored at the top of this
+      // hook. It is restored in `afterAll` below, after every drain has
+      // completed. Ordering matters, and the reasoning is worth stating
+      // precisely because the obvious alternative is wrong:
+      //
+      // A route dispatches its wakeup fire-and-forget through `trackWakeup`,
+      // which parks the `enqueueWakeup` promise in `activeWakeupPromises` and
+      // returns to the route immediately. `drainActiveRunExecutions` awaits
+      // those promises -- but `enqueueWakeup` does not read its suppression
+      // state until `getSchedulingSuppression()` at heartbeat.ts:26544, which
+      // sits BEHIND a long async prologue: agent lookup, issue-execution-context
+      // read, and adapter-config normalisation with its own writes. There are
+      // twelve `await`s between `enqueueWakeup` entering at heartbeat.ts:26319
+      // and that check.
+      //
+      // So restoring at the top of this hook would hand a wakeup that is still
+      // in that prologue an UNSUPPRESSED environment. Awaiting the drain does
+      // not prevent it: the drain waits for the promise to finish, and the
+      // promise reads whatever the environment says at the moment it reaches
+      // 26544. Such a wakeup admits a real dispatch, takes the per-agent start
+      // lock, and leaves this hook waiting out `AGENT_START_LOCK_STALE_MS` --
+      // re-creating the very breach this suppression exists to prevent. The
+      // admission state the test body ran under is the state a still-in-flight
+      // wakeup must also observe, which is only true if the restore happens
+      // after every wakeup has already read it.
+      //
+      // MEASURED, not argued: a two-arm probe (separate agent per arm, same
+      // host, back to back) dispatches one wakeup fire-and-forget and then
+      // either restores-then-drains or drains-then-restores. Restore-before-drain
+      // admitted 1 request and created 1 `heartbeat_runs` row, which died as
+      // "Process adapter missing command" -- the same rogue dispatch this
+      // suppression exists to stop. Drain-then-restore admitted 0 and created
+      // 0. Evidence: ~/Work/keece-1140-evidence/run4/probe-report.json.
+      //
+      // Settle this suite's own synthetic seed runs first. They are inserted
+      // directly and no real execution owns them, so
+      // `drainHeartbeatRunsToQuiescence` below can never reach its "nothing is
+      // queued or running" exit condition while they sit at `running`; it
+      // would spin its full 50-attempt budget on every test and blow the 30s
+      // hookTimeout whenever the host is loaded. Settling them here keeps the
+      // drain's real purpose intact — it still awaits genuinely in-flight
+      // runs — and makes the hook's duration independent of machine load.
+      await settleSeededHeartbeatRuns(db, seededRunIds);
       // Await every in-flight background heartbeat run to quiescence before the
       // deletes below. A route dispatches a wakeup fire-and-forget, so a run can
       // still be writing issues, issue_comments, and heartbeat_runs rows when
@@ -893,12 +1210,17 @@ describeEmbeddedPostgres(
       await deleteCompanySkillsAfterLateHeartbeatWritesDrain(db);
     });
 
+    // Safety net: the restore MUST run even if a teardown delete throws, or a
+    // suppressed environment leaks into whatever runs next in this worker.
+    // `afterAll` is the last hook in the file, so by here the drain has already
+    // completed and no wakeup from this suite is left before its check.
     afterAll(async () => {
+      setRunAdmissionSuppressed(false);
       await tempDb?.cleanup();
     });
 
     it("allows bounded same-issue reads and writes while quarantining low-trust output", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       const app = createApp(db, agentActor(fixture));
 
       const issueRead = await request(app).get(
@@ -951,7 +1273,7 @@ describeEmbeddedPostgres(
     });
 
     it("preserves direct-parent reporting while default-opening visible standard-trust writes", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       const standardApp = createApp(db, standardReportActor(fixture));
       const lowTrustApp = createApp(db, agentActor(fixture));
 
@@ -1052,7 +1374,7 @@ describeEmbeddedPostgres(
     });
 
     it("relays blocked and cancelled stops once without laundering child prose", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       const app = createApp(db, boardActor(fixture));
       const unblockDescriptor = {
         owner: "board",
@@ -1073,30 +1395,138 @@ describeEmbeddedPostgres(
       expect(blocked.status, JSON.stringify(blocked.body)).toBe(200);
       expect(blocked.body.unblockDescriptor).toEqual(unblockDescriptor);
 
+      // The subject of this test is the stop relay, not the live-lock guard.
+      // The remaining steps below are ordinary non-terminal status writes, and
+      // the guard (added by this change) legitimately refuses those with 409
+      // while a run still holds execution on the issue.
+      //
+      // `seedLowTrustFixture` seeds three `running` heartbeat runs and pins
+      // `executionRunId` at one of them. Clearing the issue lock alone is not
+      // enough: `resolveActiveIssueRun` also falls back to the assignee's
+      // current active run, so the writes below kept flapping between `:1087`
+      // and `:1095` depending on background timing.
+      //
+      // Settle only the two runs that hold `assignedReview` and clear that
+      // issue's lock, so the guard has nothing live to refuse here. The third
+      // seeded run is deliberately left running: it holds `standardChild`, and
+      // the step below asserts the guard *does* return 409 for that issue.
+      // Settling the guard's own behaviour is covered directly in
+      // `issue-stale-execution-lock-routes.test.ts`.
+      //
+      // The two seeded runs below are settled, then the lock is cleared. The
+      // assignee fallback still has a hole: this test's own earlier PATCHes
+      // dispatch wakeups fire-and-forget, and on a loaded runner one can still
+      // be in flight at the writes after this point, registering a fresh
+      // `running` run for this same agent on this same issue. Drain those and
+      // settle them too, so the guard's precondition is deterministic instead of
+      // dependent on background timing. Scoped to `assignedReview`, so the
+      // `standardChild` run that the 409 assertion below depends on is left
+      // running.
+      await settleStrayRunsForIssue(
+        db,
+        heartbeatService(db),
+        fixture.agents.lowTrust.id,
+        fixture.issues.assignedReview.id,
+      );
+      await db
+        .update(heartbeatRuns)
+        .set({ status: "succeeded", finishedAt: new Date() })
+        .where(
+          inArray(heartbeatRuns.id, [
+            fixture.runs.lowTrust.id,
+            fixture.runs.standard.id,
+          ]),
+        );
+      await db
+        .update(issues)
+        .set({
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+        })
+        .where(eq(issues.id, fixture.issues.assignedReview.id));
+
+      // Per-write quiesce, not one drain before the block. Every write below
+      // dispatches its own fire-and-forget wakeup, and on a loaded runner the
+      // run that wake creates can still be registering when the NEXT write
+      // lands — re-arming the live-lock guard and turning an expected 200 into
+      // the 409 this issue tracks. Draining once, before the block, only
+      // covered the writes before it. Each write below therefore re-establishes
+      // the precondition immediately beforehand, which is what makes the
+      // result deterministic rather than load-dependent.
+      //
+      // The helper is scoped to `assignedReview` by agent AND
+      // `contextSnapshot.issueId`, so the `standardChild` run that the 409
+      // assertion further down depends on is never settled and the guard keeps
+      // something real to refuse.
+      const quiesceBeforeWrite = async (opts?: { keepRunRef?: string }) => {
+        await quiesceAssignedReviewForWrite(
+          db,
+          heartbeatService(db),
+          fixture.agents.lowTrust.id,
+          fixture.issues.assignedReview.id,
+          opts ?? {},
+        );
+      };
+
+      await quiesceBeforeWrite();
       await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
-        .send({ status: "todo" })
+        .send({ status: "todo", unblockDescriptor: null })
         .expect(200);
+      await quiesceBeforeWrite();
       await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
         .send({ status: "blocked", unblockDescriptor })
         .expect(200);
+      await quiesceBeforeWrite();
       await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
-        .send({ status: "todo" })
+        .send({ status: "todo", unblockDescriptor: null })
         .expect(200);
-      await request(app)
+      await quiesceBeforeWrite();
+      // `unblockDescriptor: null` is explicit here for the same reason the
+      // quiesce is: the preceding write set this hold, and a run woken by that
+      // write can re-apply it before this one lands, so "the descriptor is
+      // currently null" is not something the write may assume. Sending the
+      // clear states the precondition at the write rather than relying on the
+      // previous write having stuck. The bare form was previously masked by the
+      // 409: a refused write returns before this validation is ever reached, so
+      // the latent 422 only surfaced once the race was fixed.
+      const cancelledWrite = await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
-        .send({ status: "cancelled" })
-        .expect(200);
-      await request(app)
+        .send({ status: "cancelled", unblockDescriptor: null });
+      expect(cancelledWrite.status, JSON.stringify(cancelledWrite.body)).toBe(
+        200,
+      );
+      // This is the write that originally failed with 409 where 200 was
+      // expected. It also sends a BARE `{ status: "todo" }` while its
+      // neighbours send `{ status: "todo", unblockDescriptor: null }`. The
+      // quiesce fixes the 409; the explicit descriptor clear fixes the same
+      // class of latent assumption on the preceding `blocked` write's hold.
+      // Asserting on the response body (not `.expect(200)`) is deliberate: a
+      // bare `.expect` reports only the status, and a wrong-status failure
+      // here is the one signal this suite exists to catch, so the body travels
+      // with the assertion.
+      await quiesceBeforeWrite();
+      const bareTodoWrite = await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
-        .send({ status: "todo" })
-        .expect(200);
+        .send({ status: "todo", unblockDescriptor: null });
+      expect(bareTodoWrite.status, JSON.stringify(bareTodoWrite.body)).toBe(
+        200,
+      );
       await db
         .update(issues)
         .set({ parentId: null })
         .where(eq(issues.id, fixture.issues.assignedReview.id));
+      // The reparent write is the one write whose expected outcome depends on
+      // the stop relay, so it keeps a reference to the seeded low-trust run —
+      // the one whose `contextSnapshot.executionPolicy` carries the trust
+      // boundary the relay gate reads. Every other write above clears the
+      // reference, which is what the live-lock guard needs. See
+      // quiesceAssignedReviewForWrite.
+      await quiesceBeforeWrite({ keepRunRef: fixture.runs.lowTrust.id });
       await request(app)
         .patch(`/api/issues/${fixture.issues.assignedReview.id}`)
         .send({
@@ -1106,10 +1536,24 @@ describeEmbeddedPostgres(
         })
         .expect(200);
 
+      // `standardChild` is standard-trust, so it produces no relay; this step
+      // only exists to prove a standard child's stop does not leak. The hold
+      // rules require an external status write to be refused while another run
+      // holds execution, so the board actor gets 409 here and must use the
+      // documented release path before the standard child can be completed.
       await request(app)
         .patch(`/api/issues/${fixture.issues.standardChild.id}`)
         .send({ status: "blocked", unblockDescriptor })
-        .expect(200);
+        .expect(409);
+      await db
+        .update(issues)
+        .set({
+          checkoutRunId: null,
+          executionRunId: null,
+          executionAgentNameKey: null,
+          executionLockedAt: null,
+        })
+        .where(eq(issues.id, fixture.issues.standardChild.id));
       await request(app)
         .patch(`/api/issues/${fixture.issues.standardChild.id}`)
         .send({ status: "todo" })
@@ -1178,7 +1622,7 @@ describeEmbeddedPostgres(
     });
 
     it("allows mentioned low-trust agents to comment on out-of-bound assigned issues", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       const [targetIssue] = await db
         .insert(issues)
         .values({
@@ -1237,7 +1681,7 @@ describeEmbeddedPostgres(
     });
 
     it("propagates denied low-trust policy conflicts on control-plane guards", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       const conflictingExecutionPolicy = {
         authorizationPolicy: {
           trustBoundary: {
@@ -1268,7 +1712,7 @@ describeEmbeddedPostgres(
     });
 
     it("restricts low-trust self inspection without changing standard-agent visibility", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       await db.insert(companyMemberships).values({
         companyId: fixture.company.id,
         principalType: "agent",
@@ -1439,7 +1883,7 @@ describeEmbeddedPostgres(
     });
 
     it("denies out-of-bound and control-plane attempts without leaking canaries or creating durable side effects", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       const app = createApp(db, agentActor(fixture));
       const forbiddenMarkers = Object.values(fixture.canaries);
 
@@ -1663,7 +2107,7 @@ describeEmbeddedPostgres(
     });
 
     it("denies skill-test scoped tokens on foreign issue-adjacent reads", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       const app = createApp(db, skillTestActor(fixture));
       const forbiddenMarkers = Object.values(fixture.canaries);
 
@@ -1759,7 +2203,7 @@ describeEmbeddedPostgres(
     });
 
     it("counts blocked inbox issues with the low-trust boundary applied in the database", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       await db.insert(issues).values([
         {
           companyId: fixture.company.id,
@@ -1798,7 +2242,17 @@ describeEmbeddedPostgres(
     });
 
     it("redacts quarantined low-trust output from higher-trust wake and continuation contexts", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      // This is the one test that deliberately drives the run engine: it points
+      // an agent at a controlled gateway and waits for the woken run to deliver
+      // a payload. Its own `heartbeatService` below passes an explicit
+      // `runtimeEnv` with the suppression keys set to "false", so the run
+      // execution it awaits is unaffected either way. Opt back in anyway
+      // because this test ALSO drives the route-dispatched wakeups, and those
+      // read the live environment.
+      allowRunExecutionForThisTest = true;
+      applyRunAdmissionForTest();
+
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       const lowTrustApp = createApp(db, agentActor(fixture));
       const standardApp = createApp(
         db,
@@ -2035,7 +2489,7 @@ describeEmbeddedPostgres(
     }, 120_000);
 
     it("keeps board positive controls for issue-linked approvals and sanitized promotion", async () => {
-      const fixture = await seedLowTrustFixture(db);
+      const fixture = await seedLowTrustFixture(db, seededRunIds);
       const app = createApp(db, boardActor(fixture));
 
       const approvalsRes = await request(app).get(

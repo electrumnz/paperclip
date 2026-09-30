@@ -132,9 +132,19 @@ const createIssueToolSchema = z.object({
   companyId: companyIdOptional,
 }).merge(createIssueInputSchema);
 
+// KEE-1003: this tool is the MCP boundary for issue updates, and a lenient
+// object turned a mistyped field into a silent no-op - an agent asked to
+// assign with `assigneeId` (the real field is `assigneeAgentId`) got a
+// successful tool call back while nothing was written. `.strict()` makes the
+// unknown key a named error instead. It is deliberately the last call in the
+// chain: it has to sit after `.merge()`, or the merged update fields would be
+// rejected as unknown.
+// `index.ts` must register this as a schema *instance* rather than
+// `schema.shape`; the SDK rebuilds a raw shape as a fresh lenient object and
+// would drop the strict flag before the handler ever sees the arguments.
 const updateIssueToolSchema = z.object({
   issueId: issueIdSchema,
-}).merge(updateIssueSchema);
+}).merge(updateIssueSchema).strict();
 
 const checkoutIssueToolSchema = z.object({
   issueId: issueIdSchema,

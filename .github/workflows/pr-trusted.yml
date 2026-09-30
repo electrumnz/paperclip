@@ -266,9 +266,24 @@ jobs:
           fetch-depth: 0
 
       - name: Block manual lockfile edits
+        # CI owns the lockfile, so a pull request that changes it is failed.
+        # This step runs (the check runs) for everyone who is not exempt.
+        #
+        # Exemption rules, in the order they are checked:
+        #   - dependabot: it must update the lockfile to match the manifest it
+        #     bumps, so almost every dependabot pull request touches the lockfile
+        #   - the refresh bot, but only on the branch it owns. A human on that
+        #     branch is still checked. Keying the bot's exemption to its author
+        #     is what stops a human pull request from inheriting it
+        #   - a human, but only on the plain manual-exemption name
+        #
+        # The bot clauses are grouped so the branch test cannot leak to a human.
         if: >-
-          github.head_ref != 'chore/refresh-lockfile' &&
-          github.event.pull_request.user.login != 'dependabot[bot]'
+          github.event.pull_request.user.login != 'dependabot[bot]' &&
+          (github.event.pull_request.user.login != 'github-actions[bot]' ||
+           (github.head_ref != 'chore/refresh-lockfile-bot' &&
+            github.head_ref != 'chore/refresh-lockfile')) &&
+          github.head_ref != 'chore/refresh-lockfile'
         run: |
           # Diff the PR branch against its merge base so recent base-branch commits
           # do not masquerade as changes made by the PR itself.
@@ -321,8 +336,26 @@ jobs:
       - name: Test PR quality-gate scripts
         run: node --test '.github/scripts/tests/*.test.mjs'
 
+      # The lockfile refresh claim step is shell, so the only tests that
+      # exercise it are the collision ones. They build a throwaway git remote
+      # and stub `gh`, so they need no network, no token, and about three
+      # seconds. Running them here is what keeps the fail-closed guard honest:
+      # the static-text tests above stay green even when `claim_rc` handling is
+      # mutated away, so this is the only step that catches it.
+      - name: Test lockfile refresh collision guards
+        run: bash .github/scripts/tests/manual/refresh-lockfile-collision-e2e.sh
+
       - name: Test general-server shard partition
         run: node --test ./scripts/__tests__/run-vitest-stable-shard.test.mjs
+
+      - name: Test worktree isolation guard
+        run: node --test ./scripts/__tests__/check-worktree-isolation.test.mjs
+
+      - name: Test worktree isolation hook installer
+        run: node --test ./scripts/__tests__/install-worktree-isolation-hook.test.mjs
+
+      - name: Test fleet-guard downgrade cross-check (KEE-962)
+        run: node --test ./scripts/__tests__/kee962-crosscheck.test.mjs
 
       - name: Test e2e shard partition
         run: node --test ./scripts/__tests__/e2e-shard.test.mjs
