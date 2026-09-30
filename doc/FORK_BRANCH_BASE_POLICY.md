@@ -116,7 +116,10 @@ Moving a base from behind `master` to `master` is not a rename. Measure before
 you do it.
 
 Three open pull requests have a base that is not `master`. All three are stale
-against `master`.
+against `master`. Every figure in the "merges cleanly" column is measured
+against `master`; the "diff against own base" column is measured against each
+pull request's own base, which is a different comparison and is why the two
+columns do not agree.
 
 | PR | base | commits behind `master` | diff against own base | diff against `master` | merges cleanly |
 |---|---|---|---|---|---|
@@ -185,31 +188,81 @@ git diff --shortstat "$(git merge-base <head> <base>)"...<head>
 git diff --shortstat "$(git merge-base <head> fork/master)"...<head>
 ```
 
-Would it merge cleanly? The three-argument form writes no objects at all, and it is
-the form to use when you only need the verdict:
+Would it merge cleanly? Use the two-argument form. It is the only one of the
+`merge-tree` forms that both asks this question and answers it unambiguously:
 
 ```
-git merge-tree "$(git rev-parse <base>^{tree})" "$(git rev-parse <head>^{tree})" \
-  "$(git rev-parse "$(git merge-base <base> <head>)"^{tree})"
+git merge-tree --name-only <base> <head> ; echo $?
 ```
 
-Read the result by its output, not by its exit code. This form exits 0 whether or
-not there are conflicts. It reports each contested path with a `changed in both` (or
-`added in both`) section; empty output means a clean merge. Verified on this host:
-a conflicting pair emits those markers, a clean pair emits none, and the loose
-object count did not move.
+Exit status is the verdict: `1` means conflicts, `0` means clean. On a clean
+merge the output is a single line, the resulting tree OID. On a conflicted merge
+line 1 is that same OID, lines 2 to n are exactly the conflicting paths, and the
+`CONFLICT (<type>): ...` messages follow. The types seen on these pull requests
+are `content` and `add/add`.
 
-This form needs git 2.38 or later; this host has 2.55.0.
+Read the exit status, not the output. `git help merge-tree` warns against the
+opposite: "Do NOT interpret an empty Conflicted file info list as a clean
+merge; check the exit status." A merge can have conflicts with an empty path
+list, for example directory-rename conflicts.
 
-The two-argument form, `git merge-tree --write-tree --name-only <base> <head>`, is
-more convenient because it exits non-zero and prints the conflicting paths, but it
-is not read-only: it writes a tree object into the object store. Verified on this
-host, the tree it emits for #28 against `master` is
-`9536c52c5aeddd638a5ac463a3efbe4430be10ba`, which exists as a loose object in the
-shared store and is referenced by zero refs. It touches no worktree, index, HEAD or
-ref, so it is safe, but it does leave unreferenced objects behind. Use it when you
-want the conflicting paths, and use the three-argument form when you only need the
-verdict.
+`git help merge-tree` is the authority on which form is which, and its synopsis
+is the thing to read first:
+
+```
+git merge-tree [--write-tree] [<options>] <branch1> <branch2>
+git merge-tree [--trivial-merge] <base-tree> <branch1> <branch2> (deprecated)
+```
+
+### Do not use the three-argument form to judge a merge
+
+The bare three-argument form is the **deprecated `--trivial-merge`** mode, not a
+conflict check. It reports every path changed on both sides, which is a superset
+of the paths that actually conflict, and it is documented to "omit entries that
+match `<branch1>`". Measured against `master` on this host, the two disagree
+badly:
+
+| PR | real `CONFLICT` lines | 3-arg "changed in both" | overcount |
+|---|---|---|---|
+| #13 | 3 | 4 | +1 |
+| #28 | 4 | 5 | +1 |
+| #65 | 5 | **17** | +12 |
+| #66 | 1 | 1 | 0 |
+
+For #65 it reports 17 contested paths where 5 conflict. An agent sizing a
+resolution session from it would treat 12 auto-merged files as breakages.
+
+Its only advantage is that it writes no objects. That is no longer enough reason
+to prefer it over a form that answers the question. Do not pass `merge-base` as
+the first argument to "fix" it: the reordering makes the call match the
+deprecated signature properly, but it stays the deprecated mode and still
+overcounts, 4 / 5 / 17 / 1 against true counts of 3 / 4 / 5 / 1.
+
+Note also that the 3-arg form reports nothing at all when head merges cleanly
+into its **own** base, and that is true, because those pull requests do merge
+into their own base. That is a different question from the one the table above
+asks, and it is the likely reason this mistake is easy to make.
+
+Do not use `--quiet` for the verdict either. It is documented to exit early on
+conflict, but on this host it returned `0` for #13 and #65, both of which really
+do conflict, and its result also varied between two identical repositories
+depending on whether an earlier non-quiet call had already written the result
+tree.
+
+### Object writing
+
+The 2-argument form writes a tree object into the object store. Verified in a
+fresh repository where that object was definitely absent beforehand: +2 objects
+on a conflicting merge, +1 on a clean one. With `--quiet` the delta was 0, but
+that is only because it is not usable for the verdict.
+
+It touches no worktree, index, HEAD or ref, so it is safe. It does leave
+unreferenced objects behind, and the tree for #28 against `master` is
+`9536c52c5aeddd638a5ac463a3efbe4430be10ba`, which is referenced by zero refs.
+
+This form needs git 2.38 or later; this host has 2.55.0. On 2.55 the
+three-argument form is deprecated, so check `git help merge-tree` on the git you
+are using before following any of this.
 
 ## What not to do
 
