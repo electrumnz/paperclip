@@ -602,6 +602,16 @@ list_public_package_info() {
   node "$REPO_ROOT/scripts/release-package-map.mjs" list
 }
 
+# The published set of packages that declare "skills" in files[] is derived
+# from scripts/release-package-manifest.json plus each package.json, never
+# hand-listed, so a new skills-carrying package cannot ship without a skills/
+# copy. `pnpm pack` does not fail on a missing files[] entry: it silently
+# omits the directory, and the adapter then resolves zero runtime skills
+# (KEE-1129).
+list_skills_package_dirs() {
+  node "$REPO_ROOT/scripts/release-package-map.mjs" list-skills-dirs
+}
+
 set_public_package_version() {
   node "$REPO_ROOT/scripts/release-package-map.mjs" set-version "$1"
 }

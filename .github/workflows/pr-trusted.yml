@@ -366,6 +366,9 @@ jobs:
       - name: Test standalone package build concurrency
         run: node --test ./scripts/__tests__/build-standalone-concurrency.test.mjs
 
+      - name: Test release dry-run behaviour
+        run: node --test ./scripts/__tests__/release-dry-run-notes.test.mjs
+
       - name: Validate release package manifest
         run: node ./scripts/release-package-map.mjs check
 

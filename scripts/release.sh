@@ -16,6 +16,10 @@ notes_file_override=
 tag_name=""
 
 cleanup_on_exit=false
+# Package dirs this run copies the repo-root skills/ tree into. Recorded rather
+# than re-derived at cleanup time so the cleanup only ever removes what this
+# run created.
+SKILLS_COPY_DIRS=()
 
 usage() {
   cat <<'EOF'
@@ -67,9 +71,15 @@ restore_publish_artifacts() {
   rm -f "$CLI_DIR/README.md"
   rm -rf "$REPO_ROOT/server/ui-dist"
 
-  for pkg_dir in server packages/adapters/claude-local packages/adapters/codex-local; do
-    rm -rf "$REPO_ROOT/$pkg_dir/skills"
-  done
+  # Only the packages this run actually copied into are removed. A package that
+  # ships a committed skills/ directory (packages/adapters/hermes) is part of
+  # the derived set but is never copied into, so deleting it here would destroy
+  # tracked source.
+  if [ "${#SKILLS_COPY_DIRS[@]}" -gt 0 ]; then
+    for pkg_dir in "${SKILLS_COPY_DIRS[@]}"; do
+      rm -rf "$REPO_ROOT/$pkg_dir/skills"
+    done
+  fi
 }
 
 cleanup_release_state() {
@@ -286,10 +296,36 @@ cd "$REPO_ROOT"
 pnpm build
 node "$REPO_ROOT/scripts/build-standalone-public-packages.mjs"
 bash "$REPO_ROOT/scripts/prepare-server-ui-dist.sh"
-for pkg_dir in server packages/adapters/claude-local packages/adapters/codex-local; do
+# Every published package that declares "skills" in its files[] must carry a
+# copy of the repo-root skills/ tree. The set is derived from
+# scripts/release-package-manifest.json plus each package.json, so a new
+# skills-carrying package is picked up automatically instead of waiting for a
+# hand-written list to be updated. Packages that already ship a committed
+# skills/ directory keep theirs (KEE-1129).
+#
+# The derivation is captured with command substitution rather than piped into
+# the loop with process substitution. `while ... done < <(cmd)` runs cmd in a
+# subshell whose exit status the loop never sees, so a failing derivation would
+# stage nothing and let the release continue into publish. That is the exact
+# silent-failure class this change exists to remove: a missing skills/ copy
+# ships a broken package to npm on every channel. Command substitution makes
+# the failure fatal under `set -e`, and the empty check refuses to publish if
+# the derivation ever legitimately yields nothing.
+SKILLS_PACKAGE_DIRS="$(list_skills_package_dirs)"
+if [ -z "$SKILLS_PACKAGE_DIRS" ]; then
+  release_fail "skills staging derived an empty package set; refusing to publish."
+fi
+while IFS= read -r pkg_dir; do
+  [ -n "$pkg_dir" ] || continue
+  if [ -d "$REPO_ROOT/$pkg_dir/skills" ]; then
+    release_info "  → $pkg_dir already ships a skills/ directory; leaving it in place"
+    continue
+  fi
   rm -rf "$REPO_ROOT/$pkg_dir/skills"
   cp -r "$REPO_ROOT/skills" "$REPO_ROOT/$pkg_dir/skills"
-done
+  SKILLS_COPY_DIRS+=("$pkg_dir")
+  release_info "  → staged skills/ into $pkg_dir"
+done <<< "$SKILLS_PACKAGE_DIRS"
 release_info "  ✓ Workspace build complete"
 
 release_info ""

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -44,6 +44,17 @@ list_public_package_info() {
   fi
 }
 package_publish_tool() { printf 'pnpm\\n'; }
+list_skills_package_dirs() {
+  if [ -n "\${FAKE_SKILLS_DERIVATION_FAILS:-}" ]; then
+    echo "fixture: release-package-map.mjs threw while deriving the skills set" >&2
+    return 7
+  fi
+  if [ -n "\${FAKE_SKILLS_DIRS:-}" ]; then
+    printf '%b' "$FAKE_SKILLS_DIRS"
+    return 0
+  fi
+  printf 'server\\npackages/adapters/claude-local\\npackages/adapters/codex-local\\n'
+}
 next_stable_version() { printf '2026.710.0\\n'; }
 next_prerelease_version() { printf '2026.710.0-%s.0\\n' "$1"; }
 release_notes_file() { printf '%s/releases/v%s.md\\n' "$REPO_ROOT" "$1"; }
@@ -143,6 +154,14 @@ exit 0
 }
 
 function runRelease(args, extraEnv = {}, prepare = null) {
+  const result = runReleaseKeepingFixture(args, extraEnv, prepare);
+  rmSync(result.fixtureDir, { recursive: true, force: true });
+  return result;
+}
+
+// Same as runRelease but leaves the fixture on disk so a test can inspect the
+// tree the release script left behind (e.g. what the cleanup trap removed).
+function runReleaseKeepingFixture(args, extraEnv = {}, prepare = null) {
   const fixture = createReleaseFixture();
   if (prepare) {
     prepare(fixture);
@@ -158,13 +177,11 @@ function runRelease(args, extraEnv = {}, prepare = null) {
     },
   });
 
-  const calls = readFileSync(fixture.callLog, "utf8");
-  rmSync(fixture.fixtureDir, { recursive: true, force: true });
-
   return {
-    calls,
+    calls: readFileSync(fixture.callLog, "utf8"),
     output: result.stdout + result.stderr,
     status: result.status,
+    fixtureDir: fixture.fixtureDir,
   };
 }
 
@@ -358,4 +375,155 @@ test("canary dry-run fails when any concurrent payload preview fails, after repl
     );
   }
   assert.doesNotMatch(result.output, /Would create git tag/, "a failed preview must not reach tagging");
+});
+
+// --- Step 2 skills staging (KEE-1129) ---
+
+// The skills package set is derived from the release manifest, not hand-listed.
+// The fixture stubs the derivation so these tests exercise release.sh's
+// copy/skip/cleanup behaviour; scripts/release-package-map.test.mjs covers the
+// derivation itself against the real manifest and package.json files.
+function prepareSkillsFixture(fixture, { preExistingSkillsDirs = [] } = {}) {
+  const { fixtureDir } = fixture;
+  mkdirSync(join(fixtureDir, "skills", "paperclip"), { recursive: true });
+  writeFileSync(join(fixtureDir, "skills", "paperclip", "SKILL.md"), "# fixture skill\n");
+  for (const dir of [
+    "server",
+    "packages/adapters/claude-local",
+    "packages/adapters/codex-local",
+    "packages/adapters/cursor-local",
+    "packages/adapters/gemini-local",
+    "packages/adapters/opencode-local",
+    "packages/adapters/hermes",
+  ]) {
+    mkdirSync(join(fixtureDir, dir), { recursive: true });
+  }
+  for (const dir of preExistingSkillsDirs) {
+    mkdirSync(join(fixtureDir, dir, "skills", "committed"), { recursive: true });
+    writeFileSync(join(fixtureDir, dir, "skills", "committed", "SKILL.md"), "# committed skill\n");
+  }
+  writeExecutable(
+    join(fixtureDir, "scripts", "build-standalone-public-packages.mjs"),
+    "#!/usr/bin/env node\nprocess.exit(0);\n",
+  );
+  writeExecutable(join(fixtureDir, "scripts", "prepare-server-ui-dist.sh"), "#!/usr/bin/env bash\nexit 0\n");
+  writeExecutable(join(fixtureDir, "scripts", "build-npm.sh"), "#!/usr/bin/env bash\nexit 0\n");
+  mkdirSync(join(fixtureDir, "cli"), { recursive: true });
+  writeFileSync(
+    join(fixtureDir, "cli", "package.json"),
+    JSON.stringify({ name: "paperclipai", version: "2026.710.0-canary.0" }),
+  );
+  return fixture;
+}
+
+const ALL_SKILLS_DIRS =
+  "server\n" +
+  "packages/adapters/claude-local\n" +
+  "packages/adapters/codex-local\n" +
+  "packages/adapters/cursor-local\n" +
+  "packages/adapters/gemini-local\n" +
+  "packages/adapters/opencode-local\n" +
+  "packages/adapters/hermes\n";
+
+test("release stages skills into every derived package, not just the first three", () => {
+  const result = runRelease(
+    ["canary", "--skip-verify", "--dry-run"],
+    { FAKE_BUILD_OK: "1", FAKE_SKILLS_DIRS: ALL_SKILLS_DIRS },
+    (fixture) => prepareSkillsFixture(fixture),
+  );
+
+  assert.equal(result.status, 0, result.output);
+  for (const dir of [
+    "server",
+    "packages/adapters/claude-local",
+    "packages/adapters/codex-local",
+    "packages/adapters/cursor-local",
+    "packages/adapters/gemini-local",
+    "packages/adapters/opencode-local",
+  ]) {
+    assert.match(
+      result.output,
+      new RegExp(`staged skills/ into ${dir.replaceAll("/", "\\/")}`),
+      `${dir} declares "skills" in files[] and must receive a copy`,
+    );
+  }
+});
+
+test("release leaves a package's own committed skills/ directory in place", () => {
+  const result = runRelease(
+    ["canary", "--skip-verify", "--dry-run"],
+    { FAKE_BUILD_OK: "1", FAKE_SKILLS_DIRS: ALL_SKILLS_DIRS },
+    (fixture) => prepareSkillsFixture(fixture, { preExistingSkillsDirs: ["packages/adapters/hermes"] }),
+  );
+
+  assert.equal(result.status, 0, result.output);
+  assert.match(result.output, /packages\/adapters\/hermes already ships a skills\/ directory/);
+  assert.doesNotMatch(result.output, /staged skills\/ into packages\/adapters\/hermes/);
+});
+
+test("release cleanup removes copied skills/ but keeps a committed one", () => {
+  const result = runReleaseKeepingFixture(
+    ["canary", "--skip-verify", "--dry-run"],
+    { FAKE_BUILD_OK: "1", FAKE_SKILLS_DIRS: ALL_SKILLS_DIRS },
+    (fixture) => prepareSkillsFixture(fixture, { preExistingSkillsDirs: ["packages/adapters/hermes"] }),
+  );
+
+  try {
+    assert.equal(result.status, 0, result.output);
+    const { fixtureDir } = result;
+    const hermesSkill = join(fixtureDir, "packages", "adapters", "hermes", "skills", "committed", "SKILL.md");
+    assert.ok(
+      existsSync(hermesSkill),
+      "cleanup must not delete a skills/ tree the release never copied into",
+    );
+    assert.ok(
+      !existsSync(join(fixtureDir, "server", "skills")),
+      "cleanup must remove the skills/ trees this run copied in",
+    );
+  } finally {
+    rmSync(result.fixtureDir, { recursive: true, force: true });
+  }
+});
+
+test("release tolerates a trailing newline in the derived skills package list", () => {
+  const result = runRelease(
+    ["canary", "--skip-verify", "--dry-run"],
+    { FAKE_BUILD_OK: "1", FAKE_SKILLS_DIRS: "server\npackages/adapters/cursor-local\n\n" },
+    (fixture) => prepareSkillsFixture(fixture),
+  );
+
+  assert.equal(result.status, 0, result.output);
+  assert.match(result.output, /staged skills\/ into server/);
+  assert.match(result.output, /staged skills\/ into packages\/adapters\/cursor-local/);
+});
+
+// A failing derivation must abort the release, not stage nothing and continue.
+// `while ... done < <(list_skills_package_dirs)` ran the derivation in a
+// subshell whose exit status the loop never observed, so a malformed manifest,
+// an unparseable package.json or a node regression would have let the release
+// continue into publish with no skills/ staged anywhere — the exact silent
+// failure this change exists to remove.
+test("release aborts when the skills package derivation fails", () => {
+  const result = runRelease(
+    ["canary", "--skip-verify", "--dry-run"],
+    { FAKE_BUILD_OK: "1", FAKE_SKILLS_DERIVATION_FAILS: "1" },
+    (fixture) => prepareSkillsFixture(fixture),
+  );
+
+  assert.notEqual(result.status, 0, "a failed derivation must not fail the dry run open");
+  assert.doesNotMatch(result.output, /staged skills\/ into /);
+  assert.doesNotMatch(result.output, /Would create git tag/);
+  assert.doesNotMatch(result.calls, /^pnpm publish/m);
+});
+
+test("release refuses to publish when the skills package derivation is empty", () => {
+  const result = runRelease(
+    ["canary", "--skip-verify", "--dry-run"],
+    { FAKE_BUILD_OK: "1", FAKE_SKILLS_DIRS: "\n" },
+    (fixture) => prepareSkillsFixture(fixture),
+  );
+
+  assert.equal(result.status, 1, result.output);
+  assert.match(result.output, /skills staging derived an empty package set/);
+  assert.doesNotMatch(result.output, /Would create git tag/);
 });
