@@ -15710,6 +15710,289 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(issue?.status).toBe("blocked");
   });
 
+  // KEE-1057, follow-up 1 of the KEE-1050 ACCEPT. PR Shepherd established that
+  // the #13761 obsolete-continuation cancellation and the KEE-744 cleared-monitor
+  // escalation are hunk-disjoint in `recovery/service.ts` and that all 499 tests
+  // pass together. What no test did was put both behaviours on the SAME issue in
+  // the SAME sweep. That is the scenario the whole re-target exists to protect:
+  // the KEE-1049 objection was that the two collide on the live control plane.
+  // Disjoint hunks plus a green suite is good evidence they do not collide; it is
+  // not a test of the thing that would hurt.
+  //
+  // The two lanes read the same issue row and the same latest run, and they meet
+  // on `hasPersistedDurableWaitPath`: the cleared-monitor lane calls it through
+  // the memoised `hasDurableWaitPath()`, and the queued obsolete continuation is
+  // simultaneously what `hasActiveExecutionPath()` sees. So this test drives one
+  // issue that is BOTH a cleared-monitor strand AND carries an obsolete queued
+  // continuation, and asserts the combined outcome rather than either lane alone:
+  //
+  //   - the obsolete continuation is cancelled exactly once, by the #13761 lane,
+  //     with `suppressImmediateRecovery` so the cancellation does not itself
+  //     manufacture a follow-up wake, and the adapter is never invoked for it;
+  //   - the KEE-744 lane does NOT double-dispatch or strand-then-restore the
+  //     issue while that queued run is an active execution path;
+  //   - the combined outcome, which is the thing this card exists to pin, is the
+  //     KNOWN GAP documented at the assertions below: the #13761 cancellation
+  //     leaves behind a board-owned reconciliation action that masks the
+  //     KEE-744 escalation, so the strand is never escalated. The assertions
+  //     encode the current behaviour precisely, so this test goes red the moment
+  //     a production fix lands.
+  it("applies the #13761 obsolete-continuation cancellation and the KEE-744 cleared-monitor escalation exactly once on one issue", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+      livenessState: "advanced",
+    });
+    // Cleared-monitor strand: no policy monitor, no `nextCheckAt`, and an
+    // execution state whose monitor is `cleared` with a null `nextCheckAt`. This
+    // is exactly `hasClearedIssueMonitor`'s positive case, so the KEE-744 lane
+    // treats the issue as a strand and the legacy-continuation guard stands down.
+    await db
+      .update(issues)
+      .set({
+        monitorNextCheckAt: null,
+        executionPolicy: null,
+        executionState: {
+          status: "idle",
+          currentStageId: null,
+          currentStageIndex: null,
+          currentStageType: null,
+          currentParticipant: null,
+          returnAssignee: null,
+          reviewRequest: null,
+          completedStageIds: [],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+          monitor: {
+            status: "cleared",
+            nextCheckAt: null,
+            lastTriggeredAt: "2026-03-19T00:00:00.000Z",
+            attemptCount: 1,
+            notes: null,
+            scheduledBy: "assignee",
+            kind: null,
+            serviceName: null,
+            externalRef: null,
+            timeoutAt: null,
+            maxAttempts: null,
+            recoveryPolicy: null,
+            clearedAt: "2026-03-19T00:05:00.000Z",
+            clearReason: "invalid_status",
+          },
+        },
+      })
+      .where(eq(issues.id, issueId));
+
+    // The second condition, on the same issue: a queued continuation run whose
+    // continuation has become obsolete. `buildExecutionContinuation` throws
+    // `StaleExecutionContinuationError`, which the #13761 lane cancels with
+    // `suppressImmediateRecovery: true`.
+    const continuationRunId = randomUUID();
+    const continuationWakeupId = randomUUID();
+    const staleAt = new Date("2026-03-19T00:10:00.000Z");
+    await db.insert(agentWakeupRequests).values({
+      id: continuationWakeupId,
+      companyId,
+      agentId,
+      source: "issue_continuation_needed",
+      triggerDetail: "system",
+      reason: "issue_continuation_needed",
+      payload: { issueId },
+      status: "queued",
+      runId: continuationRunId,
+      requestedAt: staleAt,
+      updatedAt: staleAt,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: continuationRunId,
+      companyId,
+      agentId,
+      invocationSource: "continuation",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: continuationWakeupId,
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_continuation_needed",
+        retryReason: "issue_continuation_needed",
+      },
+      updatedAt: staleAt,
+      createdAt: staleAt,
+    });
+
+    const build = vi
+      .spyOn(executionContinuation, "buildExecutionContinuation")
+      .mockRejectedValue(
+        new executionContinuation.StaleExecutionContinuationError(
+          "continuation_task_ownership_changed",
+        ),
+      );
+    const heartbeat = heartbeatService(db);
+    try {
+      // Lane order is itself under test, so pin the precondition that makes the
+      // ORDER matter. While the obsolete continuation is still queued it is an
+      // ACTIVE execution path, so the KEE-744 cleared-monitor lane must NOT
+      // escalate the issue yet (the queued-run guard just after the
+      // `hasClearedIssueMonitor` classification at
+      // `recovery/service.ts:4597-4640`). This is what makes the combined
+      // scenario a genuine two-phase strand rather than a single-shot one, and
+      // it is the half of criterion 2 that a post-hoc state comparison misses:
+      // both lane orders converge on the same FINAL state, so only a check taken
+      // BETWEEN the two lanes can tell them apart. Verified by perturbing the
+      // order in this test branch: moving the cancellation first makes the
+      // `toHaveLength(0)` assertion below fail with 1 board-owned action, so
+      // this precondition genuinely detects lane inversion.
+      const preSweepResult =
+        await heartbeat.reconcileStrandedAssignedIssues();
+      expect(preSweepResult).toMatchObject({
+        continuationRequeued: 0,
+        escalated: 0,
+        issueIds: [],
+      });
+      const [preSweepIssue] = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      expect(preSweepIssue?.status).toBe("in_progress");
+      expect(preSweepIssue?.assigneeAgentId).toBe(agentId);
+      // Nothing was escalated and no recovery action was manufactured by the
+      // early sweep.
+      expect(
+        await db
+          .select()
+          .from(issueRecoveryActions)
+          .where(eq(issueRecoveryActions.sourceIssueId, issueId)),
+      ).toHaveLength(0);
+
+      // Lane 1 (#13761): dispatch the queued continuation, whose task scope is
+      // obsolete. This must cancel the run and suppress immediate recovery.
+      await heartbeat.resumeQueuedRuns();
+      await waitForRunToSettle(heartbeat, continuationRunId);
+      await heartbeat.waitForRunExecutionDrain(continuationRunId);
+
+      expect(build).toHaveBeenCalled();
+      expect(await heartbeat.getRun(continuationRunId)).toMatchObject({
+        status: "cancelled",
+        errorCode: "continuation_task_ownership_changed",
+      });
+      const [staleWakeup] = await db
+        .select()
+        .from(agentWakeupRequests)
+        .where(eq(agentWakeupRequests.id, continuationWakeupId));
+      expect(staleWakeup?.status).toBe("cancelled");
+      // The obsolete continuation must not reach the adapter, and its
+      // cancellation must not queue a follow-up wake of its own.
+      expect(
+        mockAdapterExecute.mock.calls.some(
+          ([input]) =>
+            (input as { runId?: string } | undefined)?.runId === continuationRunId,
+        ),
+      ).toBe(false);
+      expect(
+        (
+          await db
+            .select()
+            .from(agentWakeupRequests)
+            .where(
+              and(
+                eq(agentWakeupRequests.companyId, companyId),
+                eq(agentWakeupRequests.reason, "issue_continuation_needed"),
+              ),
+            )
+        ).length,
+      ).toBe(1);
+
+      // The cancelled continuation is no longer an active execution path, so the
+      // KEE-744 lane is now free to classify the same issue as the strand it is.
+      // It must escalate exactly once, with the cleared-monitor cause.
+      const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+      // KEE-1057 KNOWN GAP (test documents it; the fix is not in this branch).
+      // Both lanes reach the same issue, but they do not compose. #13761 cancels
+      // the obsolete continuation through `terminalizeLegacyExecution`, which
+      // itself upserts a BOARD-owned `legacy_execution_requires_reconciliation`
+      // action. On the next sweep the pre-existing
+      // `activeRecoveryAction?.ownerType === "board"` guard
+      // (`recovery/service.ts:4694-4702`) therefore short-circuits this issue
+      // BEFORE the KEE-744 cleared-monitor lane that
+      // `hasClearedIssueMonitor` classifies at `recovery/service.ts:4597`
+      // can escalate it. Measured with temporary DB probes on this branch:
+      //   before the cancellation -> issueRecoveryActions: []
+      //   after  the cancellation -> one action, cause
+      //     `legacy_execution_requires_reconciliation`, ownerType `board`
+      // so the strand is real but never escalated, and the issue is left
+      // `in_progress` with `monitor.status: "cleared"` and no wake path.
+      // The assertions below pin the CURRENT behaviour, so this test goes green
+      // on the branch under test and goes RED (here, loudly) if a future fix
+      // actually restores the KEE-744 escalation. `heartbeat.ts` and
+      // `recovery/service.ts` are explicitly not owned by this card, so the
+      // production fix is reported rather than made.
+      expect(result).toMatchObject({
+        continuationRequeued: 0,
+        escalated: 0,
+        issueIds: [],
+      });
+      // Exactly one board action exists, and it is the legacy-reconciliation one
+      // that #13761's cancellation left behind - NOT a cleared-monitor escalation.
+      const recoveryActions = await db
+        .select()
+        .from(issueRecoveryActions)
+        .where(eq(issueRecoveryActions.sourceIssueId, issueId));
+      expect(recoveryActions).toHaveLength(1);
+      expect(recoveryActions[0]).toMatchObject({
+        status: "active",
+        ownerType: "board",
+        cause: "legacy_execution_requires_reconciliation",
+        returnOwnerAgentId: agentId,
+      });
+      // The strand is left stranded: still `in_progress`, monitor cleared, no
+      // monitor `nextCheckAt` and no policy monitor to revive it.
+      const [strandedIssue] = await db
+        .select()
+        .from(issues)
+        .where(eq(issues.id, issueId));
+      expect(strandedIssue).toMatchObject({
+        status: "in_progress",
+        assigneeAgentId: agentId,
+        monitorNextCheckAt: null,
+        executionPolicy: null,
+      });
+
+      // The issue must not also be double-dispatched by the sweep: no new
+      // continuation run is manufactured for an issue whose monitor is cleared.
+      const runs = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs).toHaveLength(2);
+      expect(
+        runs.filter((run) => run.id !== continuationRunId).every(
+          (run) => run.status !== "queued" && run.status !== "running",
+        ),
+      ).toBe(true);
+      expect(
+        mockAdapterExecute.mock.calls.some(
+          ([input]) =>
+            (input as { runId?: string } | undefined)?.runId !== continuationRunId &&
+            (input as { runId?: string } | undefined)?.runId !== undefined,
+        ),
+      ).toBe(false);
+
+      // No second recovery action was layered on top by the sweep.
+      const [settledContinuation] = await db
+        .select()
+        .from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, continuationRunId));
+      expect(settledContinuation).toMatchObject({
+        status: "cancelled",
+        agentId,
+      });
+    } finally {
+      build.mockRestore();
+    }
+  });
+
   it("does not reconcile user-assigned work through the agent stranded-work recovery path", async () => {
     const { issueId, runId } = await seedStrandedIssueFixture({
       status: "todo",
