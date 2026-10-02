@@ -1,6 +1,6 @@
 import express from "express";
 import request from "supertest";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The cheap host-local authentication-signal route. It reads no sandbox and
 // runs no shell command or model process, so every test drives it through a
@@ -144,6 +144,25 @@ const authSignalPath = (companyId: string, type: string, environmentId?: string)
   `/api/companies/${companyId}/adapters/${type}/auth-signal${environmentId ? `?environmentId=${environmentId}` : ""}`;
 
 describe("adapter auth-signal route", () => {
+
+  // Transform/import cost for src/routes/agents.ts (7455 lines) and its dependency
+  // graph is a one-time cost that vitest otherwise charges to whichever test runs
+  // first. On a loaded serial runner that cost can cross the 15s testTimeout and fail
+  // the first test, and it also lets a fire-and-forget wake land inside the *next*
+  // test, after that test's beforeEach has cleared mocks, so the leaked call surfaces
+  // as a bogus assertion. Warming in beforeAll moves the cost onto the 30s hookTimeout
+  // budget instead. See KEE-1004 / KEE-1019 / KEE-1034 / KEE-1063.
+  //
+  // Hazard check, not assumed: this file does not use
+  // __tests__/helpers/hoist-module-graph.ts, whose beforeAll calls registerMocks()
+  // before loading the graph and which is why 2 of KEE-1019's 18 files went 19/19
+  // green to 0/19 with a naive warm. The mocks here are registered by hoisted
+  // vi.mock() blocks at file scope, so they are already in place when this hook runs
+  // and the import below evaluates the route module against the mocked graph.
+  beforeAll(async () => {
+    await import("../routes/agents.js");
+  });
+
   beforeEach(() => {
     vi.resetModules();
     vi.clearAllMocks();
