@@ -12,6 +12,21 @@ import { isSupersededConversationRun } from "./agent-conversations.js";
 type Run = typeof heartbeatRuns.$inferSelect;
 export const LEGACY_RECOVERY_CAUSE = "legacy_execution_requires_reconciliation";
 
+/**
+ * How long a board-owned legacy-execution watchdog may stay unsettled before it
+ * stops being a live hold and starts being a silent deadlock.
+ *
+ * The deadline is only meaningful because `settleExpiredRecoveryActionDeadlines`
+ * compares it on the periodic sweep. A watchdog whose run died at 04:49 with
+ * no reconciliation stayed `active` for 2h+ and the card read as a slow
+ * reviewer rather than a dead execution.
+ */
+export const LEGACY_WATCHDOG_DEADLINE_MS = 60 * 60 * 1000;
+
+/** Names the live consumer of `timeoutAt`, so the action is self-describing. */
+export const LEGACY_WATCHDOG_TIMEOUT_SETTLER =
+  "recovery.settleExpiredRecoveryActionDeadlines" as const;
+
 /** Error families describe availability, not whether earlier actions happened. */
 export function legacyExecutionNeedsReconciliation(
   run: Pick<Run, "runtimeMode" | "status" | "errorCode" | "resultJson"> & Partial<Pick<Run, "scheduledRetryAttempt" | "scheduledRetryReason" | "contextSnapshot">>,
@@ -136,6 +151,12 @@ export async function terminalizeLegacyExecution(input: {
           ),
         )).limit(1);
       if (reconciled) return updated;
+      // Settling the board-owned reconciliation decision is not an automatic
+      // step, so a watchdog only describes an expired deadline when one exists.
+      // A second pass over the same terminal run is idempotent by construction:
+      // the run's own id anchors both the fingerprint and the deadline, so
+      // repeated finalizer writes cannot slide the window forward.
+      const watchdogDeadline = new Date(Date.now() + LEGACY_WATCHDOG_DEADLINE_MS);
       await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
         companyId: run.companyId,
         sourceIssueId: task.id,
@@ -151,13 +172,28 @@ export async function terminalizeLegacyExecution(input: {
           ...(hasWorkspaceRestoreFailure(updated.resultJson) ? { workspaceRestoreFailure: updated.resultJson!.workspaceRestoreFailure } : {}),
           adapterRecovery: "unsupported_or_unknown",
           attempt: executionFailureRetryCount(run) + 1,
+          watchdogDeadline: {
+            deadlineAt: watchdogDeadline.toISOString(),
+            settler: LEGACY_WATCHDOG_TIMEOUT_SETTLER,
+          },
         },
         nextAction: hasWorkspaceRestoreFailure(updated.resultJson)
           ? "Verify safe workspace staging or repair, then reconcile the stopped run before continuing. Saved work and approval decisions remain in force."
           : "Inspect the stopped provider and recorded actions, then reconcile their outcomes before continuing. This adapter has not established a safe resume checkpoint.",
-        maxAttempts: 3,
+        // A second pass over an already-terminal run cannot happen, so no retry
+        // budget is spendable here. Advertise none rather than a cap of 3 that
+        // reads as "three chances" while the first pass is terminal in practice.
+        // `attemptCount` is pinned explicitly so repeated writes stay at 1.
+        maxAttempts: null,
+        attemptCount: 1,
         wakePolicy: null,
         supersedeOnIdentityChange: true,
+        timeoutAt: watchdogDeadline,
+        timeoutSettler: LEGACY_WATCHDOG_TIMEOUT_SETTLER,
+        // First writer fixes the deadline; a later pass over the same identity
+        // must not slide the window forward, or a repeatedly-rewritten action
+        // would never actually expire.
+        preserveExistingTimeout: true,
       });
     }
     return updated;

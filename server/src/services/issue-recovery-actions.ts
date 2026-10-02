@@ -30,6 +30,37 @@ function isRecoveryBudgetExhausted(evidence: Record<string, unknown>) {
   );
 }
 
+/**
+ * True once a deadline settler has already spent this action's expiry.
+ *
+ * The settler writes this token itself and is its only writer, but this service
+ * is a second writer of the same row: a same-identity re-write replaces
+ * `evidence` wholesale and resets `status` to "active". Without a short-circuit
+ * here, any later writer that does not preserve the evidence (the watchdog
+ * finalizer deliberately does not) would wipe the token, revert the escalation
+ * and hand the row back to the sweep — so one expiry would be reported to the
+ * board twice. Treat a settled deadline the way an exhausted budget is treated:
+ * the identity is spent, and only a genuinely new identity may supersede it.
+ */
+function isDeadlineSettled(evidence: Record<string, unknown>) {
+  return typeof evidence.deadlineSettledAt === "string" && evidence.deadlineSettledAt.length > 0;
+}
+
+/**
+ * A deadline with no live consumer is a deadlock with a date printed on it, so
+ * refuse the write at authoring time rather than persisting one that nothing
+ * will ever move. Name the consumer that actually settles the action.
+ */
+function assertTimeoutHasSettler(input: UpsertIssueRecoveryActionInput) {
+  if (input.timeoutAt && !input.timeoutSettler) {
+    throw new Error(
+      `Recovery action ${input.kind} (${input.cause}) sets timeoutAt without a timeoutSettler. ` +
+        "Name the live consumer that settles this action; a deadline that no settler reads " +
+        "never expires, which is the same deadlock with a date printed on it.",
+    );
+  }
+}
+
 export type UpsertIssueRecoveryActionInput = {
   companyId: string;
   sourceIssueId: string;
@@ -50,6 +81,18 @@ export type UpsertIssueRecoveryActionInput = {
   monitorPolicy?: Record<string, unknown> | null;
   maxAttempts?: number | null;
   timeoutAt?: Date | null;
+  /**
+   * Names the live consumer that will actually move this action when
+   * `timeoutAt` passes. A `timeoutAt` with no settler is a printed date on a
+   * deadlock: nothing in the expiry paths compares this column, so the action
+   * would stay `active` forever. Requiring a settler by name makes the missing
+   * consumer fail at authoring time instead of in production.
+   */
+  timeoutSettler?: string | null;
+  // Keep the deadline already recorded on the active action instead of
+  // replacing it. A deadline that slides forward on every write is a deadline
+  // that never expires.
+  preserveExistingTimeout?: boolean;
   lastAttemptAt?: Date | null;
   attemptCount?: number;
   // When true, a change of (cause, fingerprint) does not overwrite the active
@@ -286,6 +329,7 @@ export function issueRecoveryActionService(db: Db) {
     input: UpsertIssueRecoveryActionInput,
     retryCount = 0,
   ): Promise<IssueRecoveryAction> {
+    assertTimeoutHasSettler(input);
     const existing = await getActiveForIssue(input.companyId, input.sourceIssueId);
     const now = new Date();
     const ownerType = input.ownerType ?? (input.ownerAgentId ? "agent" : "board");
@@ -306,6 +350,12 @@ export function issueRecoveryActionService(db: Db) {
       // beyond the advertised cap. A distinct identity can still supersede the
       // exhausted action through the branch above.
       if (isRecoveryBudgetExhausted(existing.evidence ?? {})) {
+        return existing;
+      }
+      // A deadline the settler has already spent is the same kind of spent
+      // identity. Re-writing it would erase the claim token and the escalation,
+      // which hands the row back to the sweep and reports one expiry twice.
+      if (isDeadlineSettled(existing.evidence ?? {})) {
         return existing;
       }
       const nextAttemptCount =
@@ -418,7 +468,7 @@ export function issueRecoveryActionService(db: Db) {
             : input.maxAttempts === undefined
               ? existing.maxAttempts
               : input.maxAttempts,
-          timeoutAt: input.preserveExistingOwner
+          timeoutAt: input.preserveExistingOwner || input.preserveExistingTimeout
             ? asDatabaseDate(existing.timeoutAt)
             : input.timeoutAt ?? null,
           lastAttemptAt: input.preserveExistingOwner

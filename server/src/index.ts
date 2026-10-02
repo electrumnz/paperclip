@@ -1824,6 +1824,17 @@ async function startServerWithDatabaseTeardown(
               }
             })
             .then(async () => {
+              // Nothing else reads issue_recovery_actions.timeout_at. This sweep
+              // is the consumer that turns a reconciliation deadline into an
+              // escalation instead of leaving a board-owned action `active`
+              // forever. It surfaces the expiry; it does not decide the
+              // reconciliation.
+              const settled = await heartbeat.settleExpiredRecoveryActionDeadlines();
+              if (settled.expired > 0) {
+                logger.warn({ ...settled }, "periodic recovery-deadline sweep escalated expired recovery actions");
+              }
+            })
+            .then(async () => {
               const swept = await heartbeat.sweepStaleIssueLocks();
               if (swept.cleared > 0) {
                 logger.warn({ ...swept }, "periodic stale-lock sweeper cleared issue locks");
